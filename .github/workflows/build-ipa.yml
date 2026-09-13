@@ -179,19 +179,89 @@ jobs:
       # --- UNVERIFIED: don't know Madeira's required LLVM branch/cmake
       # flags for the DXMT airconv shader compiler. This will take real
       # time (~1-3h) even once the flags are right.
-      - name: Clone + build LLVM for iOS
+      - name: Install ninja/meson and fetch llvm-mingw
+        shell: bash
         run: |
-          git clone --depth 1 https://github.com/llvm/llvm-project.git toolchains/llvm-project
-          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+          brew install ninja meson
+          mkdir -p toolchains
+          curl -L https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
+            | tar -xJ -C toolchains/ || echo "::error::llvm-mingw download failed"
+          ls toolchains/
+
+      - name: Cache LLVM 15.0.7 iOS build
+        id: llvmcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchains/llvm-ios-build
+            toolchains/llvm-project
+          key: llvm-15.0.7-ios-v1
+
+      - name: Build LLVM 15.0.7 for iOS (two-stage, per build/dxmt-ios/README.md)
+        if: steps.llvmcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone --depth 1 --branch llvmorg-15.0.7 \
+            https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          # README: Apple ld rejects --gc-sections; make the Darwin branch cover iOS
+          sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
+            toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake
+          grep -n 'Darwin|iOS' toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake | head
+
+          # stage 1: host llvm-tblgen only (use Xcode clang, not brew's newer one)
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_TARGETS_TO_BUILD=AArch64 \
-            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DLLVM_TARGETS_TO_BUILD="" -DLLVM_INCLUDE_TESTS=Off \
+            -DLLVM_INCLUDE_EXAMPLES=Off -DLLVM_INCLUDE_BENCHMARKS=Off \
+            > "$GITHUB_WORKSPACE/llvm-host-cfg.log" 2>&1
+          cmake --build toolchains/llvm-host-build --target llvm-tblgen \
+            -j"$(sysctl -n hw.ncpu)" > "$GITHUB_WORKSPACE/llvm-host-build.log" 2>&1
+
+          # stage 2: iOS target libs, reusing host tblgen
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
-          cmake --build toolchains/llvm-ios-build -j$(sysctl -n hw.ncpu)
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DLLVM_TABLEGEN="$GITHUB_WORKSPACE/toolchains/llvm-host-build/bin/llvm-tblgen" \
+            -DLLVM_BUILD_UTILS=Off -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_INCLUDE_TESTS=Off -DLLVM_INCLUDE_EXAMPLES=Off \
+            -DLLVM_INCLUDE_BENCHMARKS=Off -DLLVM_INCLUDE_UTILS=Off \
+            -DLLVM_ENABLE_TERMINFO=Off -DLLVM_ENABLE_LIBXML2=Off \
+            -DLLVM_ENABLE_ZSTD=Off -DLLVM_ENABLE_ZLIB=Off \
+            > "$GITHUB_WORKSPACE/llvm-ios-cfg.log" 2>&1
+          cmake --build toolchains/llvm-ios-build -j"$(sysctl -n hw.ncpu)" \
+            > "$GITHUB_WORKSPACE/llvm-ios-build.log" 2>&1
+
+      - name: Verify LLVM iOS build
+        shell: bash
+        run: |
+          N=$(ls toolchains/llvm-ios-build/lib/*.a 2>/dev/null | wc -l | tr -d ' ')
+          echo "::notice::llvm-ios-build has $N static libs"
+          if [ "$N" -lt 5 ]; then
+            for L in llvm-host-cfg llvm-host-build llvm-ios-cfg llvm-ios-build; do
+              if [ -f "$L.log" ]; then
+                T=$(tail -n 25 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+                echo "::error::$L.log tail :: $T"
+              fi
+            done
+            exit 1
+          fi
 
       - name: Build dxmt-ios
         run: bash build/dxmt-ios/build.sh
+
+      - name: Combine DXMT + LLVM into libdxmt_combined.a
+        shell: bash
+        run: |
+          cd build/dxmt-ios
+          xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
+            obj/*.o "$GITHUB_WORKSPACE"/toolchains/llvm-ios-build/lib/*.a
+          cp libdxmt_combined.a "$GITHUB_WORKSPACE/app/Madeira/"
+          echo "::notice::libdxmt_combined.a $(wc -c < libdxmt_combined.a | tr -d ' ') bytes"
 
       - name: vcruntime reminder
         run: cat tools/fetch-vcruntime.md
