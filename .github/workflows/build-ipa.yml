@@ -41,10 +41,12 @@ jobs:
             echo "::notice::config.h EXISTS, $(wc -l < wine/build-macos/include/config.h) lines"
           else
             echo "::error::config.h MISSING at wine/build-macos/include/config.h -- configure did not actually produce it"
-            echo "-- tail of wine-configure.log --"
-            tail -80 wine-configure.log 2>&1 || echo "no wine-configure.log found"
-            TAIL=$(tail -c 1800 wine-configure.log 2>/dev/null | sed ':a;N;$!ba;s/\n/%0A/g')
-            echo "::error::configure log tail :: $TAIL"
+            LINES=$(wc -l < wine-configure.log 2>/dev/null || echo 0)
+            echo "::error::wine-configure.log has $LINES lines total"
+            HEAD=$(head -n 25 wine-configure.log 2>/dev/null | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error::configure HEAD :: $HEAD"
+            TAIL=$(tail -n 40 wine-configure.log 2>/dev/null | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error::configure TAIL :: $TAIL"
           fi
 
       - name: Clone freetype 2.13.3
