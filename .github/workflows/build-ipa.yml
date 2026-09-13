@@ -194,14 +194,16 @@ jobs:
       # The Xcode project links 7 archives out of FEX/build-ios/ -- FEXCore,
       # FEXCore_Base, JemallocLibs plus the External deps. Nothing built them
       # before, so archiving could never have linked.
-      - name: Cache FEX iOS build
+      # Split restore/save: plain actions/cache only saves when the whole job
+      # succeeds, so a later failure discarded the FEX and LLVM builds and they
+      # were recompiled every iteration. Saving right after each verify step
+      # keeps them once they are known good.
+      - name: Restore FEX iOS build
         id: fexcache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: FEX/build-ios
           key: fex-ios-053c385-v1
-          # Without this a later failing step throws away the build we just did.
-          save-always: true
 
       # Upstream bug in the ios-port branch: the [ffs-bypass] and [cb-entry]
       # diagnostic blocks sit AFTER the #endif that closes the FEX_IOS_HOST
@@ -310,18 +312,21 @@ jobs:
           fi
           echo "::notice::all 7 FEX archives present"
 
-      # --- UNVERIFIED: don't know Madeira's required LLVM branch/cmake
-      # flags for the DXMT airconv shader compiler. This will take real
-      # time (~1-3h) even once the flags are right.
-      - name: Cache LLVM 15.0.7 iOS build
+      - name: Save FEX iOS build
+        if: steps.fexcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: FEX/build-ios
+          key: fex-ios-053c385-v1
+
+      - name: Restore LLVM 15.0.7 iOS build
         id: llvmcache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             toolchains/llvm-ios-build
             toolchains/llvm-project
           key: llvm-15.0.7-ios-v2
-          save-always: true
 
       - name: Build LLVM 15.0.7 for iOS (two-stage, per build/dxmt-ios/README.md)
         if: steps.llvmcache.outputs.cache-hit != 'true'
@@ -390,10 +395,30 @@ jobs:
             exit 1
           fi
 
-      # Needed to compile the .metal shaders below, so it has to happen before
-      # dxmt-ios rather than just before xcodebuild.
-      - name: Download Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain
+      - name: Save LLVM 15.0.7 iOS build
+        if: steps.llvmcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/llvm-ios-build
+            toolchains/llvm-project
+          key: llvm-15.0.7-ios-v2
+
+      # The .metal shaders below need a Metal compiler. `xcodebuild
+      # -downloadComponent` only exists on Xcode 16+; on older Xcode it exits 64
+      # with a usage dump, and the compiler ships with the toolchain anyway. So
+      # probe first and only try to download when it is actually missing.
+      - name: Ensure Metal compiler
+        shell: bash
+        run: |
+          xcodebuild -version
+          if xcrun -sdk macosx metal --version 2>&1 | head -3; then
+            echo "::notice::metal compiler already present"
+          else
+            echo "metal missing -- attempting download"
+            xcodebuild -downloadComponent MetalToolchain \
+              || echo "::warning::-downloadComponent unsupported on this Xcode"
+          fi
 
       # build/dxmt-ios/shader-headers/ is gitignored and nothing generated it,
       # so airconv_context.cpp could not find air_msad.h / air_samplepos.h.
