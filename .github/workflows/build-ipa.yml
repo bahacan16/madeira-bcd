@@ -646,10 +646,10 @@ jobs:
           rm -rf /tmp/vcx; mkdir -p /tmp/vcx/a /tmp/vcx/carve
           cabextract -q -d /tmp/vcx/a /tmp/vcr.exe 2>&1 | tail -3
 
-          # Belt and braces: carve every cabinet out by its MSCF header and
-          # its own declared length, in case cabextract's scan stops at the
-          # first container.
-          python3 - <<'PYEOF'
+          # Only if the scan came up empty: carve every cabinet out by its
+          # MSCF header and its own declared length.
+          if [ "$(find /tmp/vcx/a -type f | wc -l | tr -d ' ')" -lt 2 ]; then
+            python3 - <<'PYEOF'
           import struct
           d = open('/tmp/vcr.exe', 'rb').read()
           n = off = 0
@@ -666,14 +666,47 @@ jobs:
                   off = i + 4
           print('carved %d cabinet(s) by MSCF header' % n)
           PYEOF
+          fi
 
-          # Peel what came out: a Burn container holds MSIs and further cabs,
-          # and the DLLs sit one level below those. Skip PE files -- unpacking
-          # a DLL into its sections would keep the walk going forever.
+          # The payloads are named <name>.dll_amd64 and <name>.dll_arm64 --
+          # not <name>.dll, and not the F_CENTRAL_<name>_x64 an MSI cab would
+          # use. Rather than chase the spelling, read each candidate's PE
+          # header and take the one whose machine field is AMD64 (0x8664).
+          # Picking up the arm64 build by mistake would fail silently: FEX
+          # emulates x86-64, so an ARM64 DLL is the wrong binary in a file
+          # with the right name.
+          is_x64() {
+            python3 -c "
+          import struct, sys
+          d = open(sys.argv[1], 'rb').read()
+          pe = struct.unpack_from('<I', d, 0x3c)[0] if len(d) > 0x40 else 0
+          ok = d[pe:pe+4] == b'PE\\0\\0' and struct.unpack_from('<H', d, pe+4)[0] == 0x8664
+          sys.exit(0 if ok else 1)" "$1" 2>/dev/null
+          }
+
+          collect() {
+            FOUND=0; MISSING=""
+            for d in $WANT; do
+              base="${d%.dll}"
+              src=""
+              while IFS= read -r cand; do
+                if is_x64 "$cand"; then src="$cand"; break; fi
+              done < <(find /tmp/vcx -type f \
+                         \( -iname "$base.dll*" -o -iname "F_CENTRAL_${base}_*" \) \
+                         -print 2>/dev/null)
+              if [ -n "$src" ]; then
+                cp "$src" "$DEST/$d" && FOUND=$((FOUND+1))
+              else
+                MISSING="$MISSING $d"
+              fi
+            done
+          }
+
+          # Peel containers until all twelve turn up, or nothing new appears.
           for pass in 1 2 3 4; do
             BEFORE=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
             find /tmp/vcx -type f -size +20k 2>/dev/null | while IFS= read -r f; do
-              case "${f##*/}" in *.dll|*.DLL|*.exe|*.EXE) continue ;; esac
+              case "${f##*/}" in *.dll|*.DLL|*.exe|*.EXE|*_amd64|*_arm64|*_x86) continue ;; esac
               [ -d "$f.d" ] && continue
               mkdir -p "$f.d"
               cabextract -q -d "$f.d" "$f" > /dev/null 2>&1 \
@@ -681,23 +714,12 @@ jobs:
                 || rmdir "$f.d" 2>/dev/null
             done
             AFTER=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
-            echo "pass $pass: $BEFORE -> $AFTER files"
+            collect
+            echo "pass $pass: $BEFORE -> $AFTER files, $FOUND of 12 recovered"
+            [ "$FOUND" -eq 12 ] && break
             [ "$BEFORE" = "$AFTER" ] && break
           done
 
-          # Inside the cab the payloads are named F_CENTRAL_<base>_x64 rather
-          # than <base>.dll, so accept either spelling.
-          FOUND=0; MISSING=""
-          for d in $WANT; do
-            base="${d%.dll}"
-            src=$(find /tmp/vcx \( -iname "$d" -o -iname "F_CENTRAL_${base}_x64*" \) \
-                    -type f -print 2>/dev/null | head -1)
-            if [ -n "$src" ]; then
-              cp "$src" "$DEST/$d" && FOUND=$((FOUND+1))
-            else
-              MISSING="$MISSING $d"
-            fi
-          done
           echo "::notice::vcruntime :: recovered $FOUND of 12$([ -n "$MISSING" ] && echo " -- missing:$MISSING")"
 
           if [ "$FOUND" -lt 12 ]; then
