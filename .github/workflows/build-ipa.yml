@@ -117,6 +117,23 @@ jobs:
             echo "#ifndef D_TTY"
             echo "#define D_TTY 3"
             echo "#endif"
+            echo ""
+            echo "/* Wine configure runs --without-gnutls here (the host has no"
+            echo " * gnutls for the iOS sysroot), so config.h defines neither of"
+            echo " * these. But dlls/bcrypt/gnutls.c is wrapped head-to-toe in"
+            echo " * #ifdef HAVE_GNUTLS_CIPHER_INIT and dlls/secur32/schannel_gnutls.c"
+            echo " * in #ifdef SONAME_LIBGNUTLS -- undefined, both compile to an"
+            echo " * EMPTY object, __wine_unix_call_funcs is never emitted, and the"
+            echo " * app link dies on _bcrypt_unix_call_funcs / _secur32_unix_call_funcs."
+            echo " * We link toolchains/gnutls-ios statically and ios_gnutls_shim.h"
+            echo " * rewrites dlopen/dlsym onto a static symtab, so the soname string"
+            echo " * is only ever pattern-matched, never actually dlopen()ed. */"
+            echo "#ifndef SONAME_LIBGNUTLS"
+            echo "#define SONAME_LIBGNUTLS \"libgnutls.so.30\""
+            echo "#endif"
+            echo "#ifndef HAVE_GNUTLS_CIPHER_INIT"
+            echo "#define HAVE_GNUTLS_CIPHER_INIT 1"
+            echo "#endif"
           } >> "$CFG"
           if [ -f wine/build-macos/include/dwrite.h ]; then
             echo "::notice::dwrite.h present in cross tree"
@@ -195,19 +212,44 @@ jobs:
         run: bash build/ntdll-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ntdll.log"; exit ${PIPESTATUS[0]}
 
       # The link failure showed up only at xcodebuild time; catch it here.
+      # nm without -U also matches the UNDEFINED references virtual_ios.o
+      # makes to these same names, which is why the first version of this
+      # check passed while the linker still failed. -gU = external AND
+      # defined only.
       - name: Verify ntdll-unix exports the crypto call tables
         shell: bash
         run: |
           set +e
+          OBJ=build/ntdll-unix/obj
           MISSING=""
-          for s in bcrypt_unix_call_funcs secur32_unix_call_funcs crypt32_unix_call_funcs; do
-            if nm app/Madeira/libntdll_unix.a 2>/dev/null | grep -q "_$s"; then
-              echo "  OK   $s"
+          for s in bcrypt_unix_call_funcs secur32_unix_call_funcs crypt32_unix_call_funcs \
+                   ws2_32_unix_call_funcs dwrite_unix_call_funcs; do
+            if nm -gU app/Madeira/libntdll_unix.a 2>/dev/null | grep -qE "^[0-9a-f]* [A-Z] _$s$"; then
+              echo "  OK   $s (defined)"
             else
               echo "  MISS $s"; MISSING="$MISSING $s"
             fi
           done
-          [ -z "$MISSING" ] || echo "::error::libntdll_unix.a is missing ::$MISSING"
+          echo "-- object sizes (an empty object means its #ifdef guard was off) --"
+          for o in ws2_32_unixlib bcrypt_unixlib secur32_unixlib crypt32_unixlib dwrite_unixlib; do
+            if [ -f "$OBJ/$o.o" ]; then
+              printf '  %-18s %8s bytes, %s external defs\n' "$o" \
+                "$(wc -c < "$OBJ/$o.o" | tr -d ' ')" \
+                "$(nm -gU "$OBJ/$o.o" 2>/dev/null | wc -l | tr -d ' ')"
+            else
+              echo "  $o.o ABSENT"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::libntdll_unix.a defines none of ::$MISSING"
+            for o in bcrypt_unixlib secur32_unixlib crypt32_unixlib; do
+              if [ -s "$OBJ/$o.err" ]; then
+                E=$(grep -m4 -B1 -A4 "error:" "$OBJ/$o.err" | head -c 1500 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+                echo "::error::$o compile errors :: $E"
+              fi
+            done
+            exit 1
+          fi
 
       - name: Build base libwineserver.a from wine/server sources
         shell: bash
