@@ -1,0 +1,91 @@
+name: Build Madeira IPA (unsigned)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          clang --version
+
+      # --- UNVERIFIED: exact configure invocation for the wine fork's
+      # iOS/arm64 cross target isn't documented anywhere in the repo.
+      # This is a best guess and will likely need correcting once we see
+      # the real error.
+      - name: Configure wine (build-macos)
+        run: |
+          cd wine
+          mkdir -p build-macos
+          cd build-macos
+          ../configure --enable-win64 --disable-tests \
+            CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
+            CROSSCC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
+            --host=aarch64-apple-darwin --build=x86_64-apple-darwin || true
+          # if configure itself doesn't produce include/config.h the way
+          # the build/*/build.sh scripts expect, this is the step to fix
+          # from the actual log
+
+      - name: Clone freetype 2.13.3
+        run: git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+
+      - name: Build freetype-ios
+        run: bash build/freetype-ios/build.sh
+
+      - name: Build ntdll-unix
+        run: bash build/ntdll-unix/build.sh
+
+      - name: Build wineserver
+        run: bash build/wineserver/build.sh
+
+      - name: Build win32u-unix
+        run: bash build/win32u-unix/build.sh
+
+      # --- UNVERIFIED: don't know Madeira's required LLVM branch/cmake
+      # flags for the DXMT airconv shader compiler. This will take real
+      # time (~1-3h) even once the flags are right.
+      - name: Clone + build LLVM for iOS
+        run: |
+          git clone --depth 1 https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          cmake --build toolchains/llvm-ios-build -j$(sysctl -n hw.ncpu)
+
+      - name: Build dxmt-ios
+        run: bash build/dxmt-ios/build.sh
+
+      - name: vcruntime reminder
+        run: cat tools/fetch-vcruntime.md
+
+      - name: Archive (unsigned)
+        run: |
+          xcodebuild -project app/Madeira.xcodeproj \
+            -scheme Madeira -sdk iphoneos -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            archive -archivePath build-out/Madeira.xcarchive
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p build-out/Payload
+          cp -R build-out/Madeira.xcarchive/Products/Applications/Madeira.app build-out/Payload/
+          cd build-out && ditto -c -k --keepParent Payload Madeira-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: madeira-unsigned-ipa
+          path: build-out/Madeira-unsigned.ipa
+          if-no-files-found: ignore
