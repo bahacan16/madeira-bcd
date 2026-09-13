@@ -35,6 +35,16 @@ jobs:
           # the build/*/build.sh scripts expect, this is the step to fix
           # from the actual log
 
+      - name: Diagnose wine build-macos state
+        run: |
+          echo "-- listing wine/build-macos (depth 2) --"
+          find wine/build-macos -maxdepth 2 2>&1 | head -60 || echo "wine/build-macos missing entirely"
+          if [ -f wine/build-macos/include/config.h ]; then
+            echo "::notice::config.h EXISTS, $(wc -l < wine/build-macos/include/config.h) lines"
+          else
+            echo "::error::config.h MISSING at wine/build-macos/include/config.h -- configure did not actually produce it"
+          fi
+
       - name: Clone freetype 2.13.3
         run: git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
 
@@ -89,3 +99,17 @@ jobs:
           name: madeira-unsigned-ipa
           path: build-out/Madeira-unsigned.ipa
           if-no-files-found: ignore
+
+      - name: Dump first build errors (on failure)
+        if: failure()
+        run: |
+          echo "::error::config.h present: $( [ -f wine/build-macos/include/config.h ] && echo yes || echo no )"
+          COUNT=0
+          for f in $(find build toolchains -name "*.err" -size +0c 2>/dev/null | head -3); do
+            COUNT=$((COUNT+1))
+            MSG=$(head -c 1800 "$f" | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error::$f :: $MSG"
+          done
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::no .err files found under build/ or toolchains/ -- failure came from elsewhere (xcodebuild, cmake config, or a script's own explicit exit)"
+          fi
