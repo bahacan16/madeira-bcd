@@ -150,8 +150,64 @@ jobs:
       - name: Build freetype-ios
         run: bash build/freetype-ios/build.sh
 
+      # ntdll-unix compiles Wine's bcrypt/secur32/crypt32 unix sides against
+      # toolchains/gnutls-ios, and without them the app link fails on
+      # bcrypt_unix_call_funcs / secur32_unix_call_funcs. Nothing built that
+      # prefix, so do it here: GMP -> nettle/hogweed -> GnuTLS, all static.
+      - name: Restore GnuTLS iOS stack
+        id: gnutlscache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains/gnutls-ios
+            build/gnutls-ios/obj
+            build/gnutls-ios/src
+          key: gnutls-ios-gmp6.3.0-nettle3.10.1-gnutls3.8.9-v1
+
+      - name: Build GnuTLS stack for iOS
+        if: steps.gnutlscache.outputs.cache-hit != 'true'
+        run: bash build/gnutls-ios/build.sh
+
+      - name: Verify GnuTLS iOS headers and libs
+        shell: bash
+        run: |
+          set +e
+          shopt -s nullglob
+          LIBS=(toolchains/gnutls-ios/lib/*.a)
+          echo "gnutls-ios libs: ${#LIBS[@]}"
+          ls toolchains/gnutls-ios/include/gnutls/gnutls.h 2>&1
+          if [ ! -f toolchains/gnutls-ios/include/gnutls/gnutls.h ]; then
+            echo "::error::gnutls headers missing -- bcrypt/secur32 unixlibs will not link"
+            exit 1
+          fi
+
+      - name: Save GnuTLS iOS stack
+        if: steps.gnutlscache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains/gnutls-ios
+            build/gnutls-ios/obj
+            build/gnutls-ios/src
+          key: gnutls-ios-gmp6.3.0-nettle3.10.1-gnutls3.8.9-v1
+
       - name: Build ntdll-unix
         run: bash build/ntdll-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ntdll.log"; exit ${PIPESTATUS[0]}
+
+      # The link failure showed up only at xcodebuild time; catch it here.
+      - name: Verify ntdll-unix exports the crypto call tables
+        shell: bash
+        run: |
+          set +e
+          MISSING=""
+          for s in bcrypt_unix_call_funcs secur32_unix_call_funcs crypt32_unix_call_funcs; do
+            if nm app/Madeira/libntdll_unix.a 2>/dev/null | grep -q "_$s"; then
+              echo "  OK   $s"
+            else
+              echo "  MISS $s"; MISSING="$MISSING $s"
+            fi
+          done
+          [ -z "$MISSING" ] || echo "::error::libntdll_unix.a is missing ::$MISSING"
 
       - name: Build base libwineserver.a from wine/server sources
         shell: bash
