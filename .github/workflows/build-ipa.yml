@@ -208,8 +208,13 @@ jobs:
         run: |
           # Apple builds skip Source/ (Linux-only tools) via `if (NOT APPLE)`,
           # so only the libraries Xcode links get built.
+          # CMAKE_SYSTEM_NAME=iOS puts CMake in cross mode, where it does not
+          # infer CMAKE_SYSTEM_PROCESSOR -- FEX's CMakeLists.txt:89 then does
+          # string(TOLOWER) on an empty value and aborts with "Unsupported
+          # processor type ." Its regex accepts ^aarch64.
           cmake -S FEX -B FEX/build-ios -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
             -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
@@ -217,8 +222,8 @@ jobs:
             -DCMAKE_MACOSX_BUNDLE=OFF \
             -DBUILD_TESTING=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_THUNKS=OFF \
             -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF \
-            -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
             -DTUNE_CPU=generic -DTUNE_ARCH=generic \
+            -DCMAKE_DISABLE_FIND_PACKAGE_fmt=ON \
             > "$GITHUB_WORKSPACE/fex-cfg.log" 2>&1
           # Explicit targets: `all` would also build FEXCore_shared, which we
           # don't link and which needs dylib settings iOS won't give us.
