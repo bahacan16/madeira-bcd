@@ -35,6 +35,28 @@ jobs:
           brew install llvm
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
 
+      - name: Diagnose clang/lld aarch64-windows target
+        run: |
+          export PATH="$(brew --prefix llvm)/bin:$PATH"
+          echo "-- which/version --"
+          which clang
+          clang --version
+          echo "-- brew llvm prefix contents (bin) --"
+          ls "$(brew --prefix llvm)/bin" | head -30
+          echo "-- direct target test --"
+          echo 'int main(){return 0;}' > /tmp/t.c
+          if clang -target aarch64-windows -fuse-ld=lld -Wl,-subsystem:console -Wl,-WX --no-default-config /tmp/t.c -o /tmp/t.exe 2>/tmp/t.err; then
+            echo "::notice::direct clang test SUCCEEDED"
+          else
+            echo "::error::direct clang test FAILED"
+            MSG=$(cat /tmp/t.err | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::clang test stderr :: $MSG"
+            WHICH=$(which clang)
+            echo "::error::which clang :: $WHICH"
+            VER=$(clang --version | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::clang --version :: $VER"
+          fi
+
       - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
         run: |
           cd wine
