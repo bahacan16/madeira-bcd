@@ -21,10 +21,25 @@ jobs:
         with:
           submodules: recursive
 
+      # ContentView.swift uses glassEffect(.regular, in:), which needs the
+      # iOS 26 SDK. The runner defaults to Xcode 16.4 (iOS 18.5), so pick the
+      # newest Xcode installed rather than whatever xcode-select points at.
+      - name: Select newest Xcode
+        shell: bash
+        run: |
+          echo "-- installed Xcodes --"
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "(none beyond the default)"
+          NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$NEWEST" ]; then
+            sudo xcode-select -s "$NEWEST/Contents/Developer"
+            echo "::notice::selected $NEWEST"
+          fi
+
       - name: Toolchain versions
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
           clang --version
 
       # --- UNVERIFIED: exact configure invocation for the wine fork's
@@ -518,11 +533,25 @@ jobs:
           echo "::notice::all 15 linked archives present"
 
       - name: Archive (unsigned)
+        shell: bash
         run: |
+          set +e
           xcodebuild -project app/Madeira.xcodeproj \
             -scheme Madeira -sdk iphoneos -configuration Release \
             CODE_SIGNING_ALLOWED=NO \
-            archive -archivePath build-out/Madeira.xcarchive
+            archive -archivePath build-out/Madeira.xcarchive \
+            > "$GITHUB_WORKSPACE/archive.log" 2>&1
+          rc=$?
+          # A failing xcodebuild buries the diagnostic under a multi-kilobyte
+          # swift-frontend invocation, so surface just the errors.
+          if [ "$rc" -ne 0 ]; then
+            echo "===== compiler errors ====="
+            grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | head -30
+            echo "===== failing build commands ====="
+            sed -n '/The following build commands failed/,/failures)/p' \
+              "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -15
+          fi
+          exit "$rc"
 
       - name: Package unsigned IPA
         run: |
