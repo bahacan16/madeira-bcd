@@ -25,6 +25,11 @@ jobs:
       # iOS/arm64 cross target isn't documented anywhere in the repo.
       # This is a best guess and will likely need correcting once we see
       # the real error.
+      - name: Install newer bison (macOS ships an ancient 2.3)
+        run: |
+          brew install bison
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
       - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
         run: |
           cd wine
