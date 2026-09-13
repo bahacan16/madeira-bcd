@@ -30,6 +30,11 @@ jobs:
           brew install bison
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
 
+      - name: Install llvm (need lld/llvm-dlltool for aarch64-windows PE cross target)
+        run: |
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
       - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
         run: |
           cd wine
