@@ -22,7 +22,7 @@ jobs:
       # iOS/arm64 cross target isn't documented anywhere in the repo.
       # This is a best guess and will likely need correcting once we see
       # the real error.
-      - name: Build native wine (for host-side tools: widl/wrc/wmc)
+      - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
         run: |
           cd wine
           mkdir -p build-native
