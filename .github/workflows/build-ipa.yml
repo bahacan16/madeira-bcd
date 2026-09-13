@@ -30,10 +30,8 @@ jobs:
           ../configure --enable-win64 --disable-tests \
             CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
             CROSSCC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
-            --host=aarch64-apple-darwin --build=x86_64-apple-darwin || true
-          # if configure itself doesn't produce include/config.h the way
-          # the build/*/build.sh scripts expect, this is the step to fix
-          # from the actual log
+            --host=aarch64-apple-darwin --build=x86_64-apple-darwin \
+            > "$GITHUB_WORKSPACE/wine-configure.log" 2>&1 || true
 
       - name: Diagnose wine build-macos state
         run: |
@@ -43,6 +41,10 @@ jobs:
             echo "::notice::config.h EXISTS, $(wc -l < wine/build-macos/include/config.h) lines"
           else
             echo "::error::config.h MISSING at wine/build-macos/include/config.h -- configure did not actually produce it"
+            echo "-- tail of wine-configure.log --"
+            tail -80 wine-configure.log 2>&1 || echo "no wine-configure.log found"
+            TAIL=$(tail -c 1800 wine-configure.log 2>/dev/null | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::error::configure log tail :: $TAIL"
           fi
 
       - name: Clone freetype 2.13.3
