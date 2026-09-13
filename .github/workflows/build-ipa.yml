@@ -77,6 +77,36 @@ jobs:
             --without-netapi --without-sdl --without-udev --without-unwind \
             > "$GITHUB_WORKSPACE/wine-configure.log" 2>&1 || true
 
+      - name: Generate cross-tree headers and patch config.h for iOS SDK
+        shell: bash
+        run: |
+          make -C wine/build-macos include -j"$(sysctl -n hw.ncpu)" > "$GITHUB_WORKSPACE/make-include.log" 2>&1 || true
+          cp -n wine/build-native/include/*.h wine/build-macos/include/ 2>/dev/null || true
+          CFG=wine/build-macos/include/config.h
+          {
+            echo ""
+            echo "/* iOS SDK fixups appended by CI */"
+            echo "#undef HAVE_GETATTRLIST"
+            echo "#ifndef D_TAPE"
+            echo "#define D_TAPE 1"
+            echo "#endif"
+            echo "#ifndef D_DISK"
+            echo "#define D_DISK 2"
+            echo "#endif"
+            echo "#ifndef D_TTY"
+            echo "#define D_TTY 3"
+            echo "#endif"
+          } >> "$CFG"
+          if [ -f wine/build-macos/include/dwrite.h ]; then
+            echo "::notice::dwrite.h present in cross tree"
+          else
+            echo "::error::dwrite.h STILL MISSING"
+            LS=$(ls wine/build-native/include/ 2>&1 | head -40 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::native include dir :: $LS"
+            T=$(tail -n 20 "$GITHUB_WORKSPACE/make-include.log" 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::make include tail :: $T"
+          fi
+
       - name: Diagnose wine build-macos state
         run: |
           echo "-- listing wine/build-macos (depth 2) --"
