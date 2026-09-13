@@ -6,6 +6,12 @@ on:
     branches: [main]
     paths: [".github/workflows/build-ipa.yml"]
 
+# A push and a manual dispatch seconds apart used to start two parallel
+# multi-hour macOS jobs on the same commit.
+concurrency:
+  group: build-ipa
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-15
@@ -176,9 +182,6 @@ jobs:
       - name: Build win32u-unix
         run: bash build/win32u-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/win32u.log"; exit ${PIPESTATUS[0]}
 
-      # --- UNVERIFIED: don't know Madeira's required LLVM branch/cmake
-      # flags for the DXMT airconv shader compiler. This will take real
-      # time (~1-3h) even once the flags are right.
       - name: Install ninja/meson and fetch llvm-mingw
         shell: bash
         run: |
@@ -188,6 +191,74 @@ jobs:
             | tar -xJ -C toolchains/ || echo "::error::llvm-mingw download failed"
           ls toolchains/
 
+      # The Xcode project links 7 archives out of FEX/build-ios/ -- FEXCore,
+      # FEXCore_Base, JemallocLibs plus the External deps. Nothing built them
+      # before, so archiving could never have linked.
+      - name: Cache FEX iOS build
+        id: fexcache
+        uses: actions/cache@v4
+        with:
+          path: FEX/build-ios
+          key: fex-ios-053c385-v1
+
+      - name: Build FEX for iOS
+        if: steps.fexcache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          # Apple builds skip Source/ (Linux-only tools) via `if (NOT APPLE)`,
+          # so only the libraries Xcode links get built.
+          cmake -S FEX -B FEX/build-ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DBUILD_TESTING=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_THUNKS=OFF \
+            -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF \
+            -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
+            -DTUNE_CPU=generic -DTUNE_ARCH=generic \
+            > "$GITHUB_WORKSPACE/fex-cfg.log" 2>&1
+          # Explicit targets: `all` would also build FEXCore_shared, which we
+          # don't link and which needs dylib settings iOS won't give us.
+          cmake --build FEX/build-ios -j"$(sysctl -n hw.ncpu)" \
+            --target FEXCore FEXCore_Base JemallocLibs \
+                     cephes_128bit softfloat_3e fmt xxhash \
+            > "$GITHUB_WORKSPACE/fex-build.log" 2>&1
+
+      - name: Verify FEX iOS archives
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          OK=1
+          for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \
+                   FEXCore/Source/libJemallocLibs.a External/cephes/libcephes_128bit.a \
+                   External/fmt/libfmt.a External/SoftFloat-3e/libsoftfloat_3e.a \
+                   External/xxhash/cmake_unofficial/libxxhash.a; do
+            if [ -f "FEX/build-ios/$a" ]; then
+              echo "  OK   $a ($(wc -c < "FEX/build-ios/$a" | tr -d ' ') bytes)"
+            else
+              echo "  MISS $a"; OK=0
+            fi
+          done
+          if [ "$OK" -eq 0 ]; then
+            for L in fex-cfg fex-build; do
+              if [ -f "$L.log" ]; then
+                T=$(tail -n 40 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+                echo "::error::$L.log tail :: $T"
+              else
+                echo "::error::$L.log MISSING"
+              fi
+            done
+            exit 1
+          fi
+          echo "::notice::all 7 FEX archives present"
+
+      # --- UNVERIFIED: don't know Madeira's required LLVM branch/cmake
+      # flags for the DXMT airconv shader compiler. This will take real
+      # time (~1-3h) even once the flags are right.
       - name: Cache LLVM 15.0.7 iOS build
         id: llvmcache
         uses: actions/cache@v4
@@ -276,47 +347,51 @@ jobs:
           cp libdxmt_combined.a "$GITHUB_WORKSPACE/app/Madeira/"
           echo "::notice::libdxmt_combined.a $(wc -c < libdxmt_combined.a | tr -d ' ') bytes"
 
-      - name: Build DXMT PE side (d3d11/dxgi/winemetal/d3d10core)
+      # The PE-side DXMT DLLs (d3d11/dxgi/winemetal/d3d10core) are committed
+      # under app/Madeira/aarch64-windows/ despite the README calling them
+      # gitignored, so there is nothing to build here -- just confirm they
+      # are present before we try to archive.
+      - name: Verify committed PE DLLs
         shell: bash
         run: |
-          ln -sfn ../../toolchains research/dxmt/toolchains
-          MINGW_BIN="$GITHUB_WORKSPACE/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
-          cd research/dxmt
-          SDKROOT=$(xcrun --sdk macosx --show-sdk-path) \
-            PATH="$MINGW_BIN:/usr/bin:/opt/homebrew/bin:$PATH" \
-            meson setup --cross-file build-aarch64-win.txt --native-file build-osx.txt \
-                        -Dwine_build_path=../../wine/build-macos build-pe \
-            > "$GITHUB_WORKSPACE/dxmt-pe-setup.log" 2>&1
-          SDKROOT=$(xcrun --sdk macosx --show-sdk-path) \
-            PATH="$MINGW_BIN:/usr/bin:/opt/homebrew/bin:$PATH" \
-            meson compile -C build-pe \
-            > "$GITHUB_WORKSPACE/dxmt-pe-compile.log" 2>&1
-          mkdir -p "$GITHUB_WORKSPACE/app/Madeira/aarch64-windows"
-          cp build-pe/src/d3d11/d3d11.dll \
-             build-pe/src/dxgi/dxgi.dll \
-             build-pe/src/winemetal/winemetal.dll \
-             build-pe/src/d3d10/d3d10core.dll \
-             "$GITHUB_WORKSPACE/app/Madeira/aarch64-windows/"
-          ls -la "$GITHUB_WORKSPACE/app/Madeira/aarch64-windows/"
-
-      - name: Diagnose DXMT PE build (on failure)
-        if: failure()
-        shell: bash
-        run: |
-          for L in dxmt-pe-setup dxmt-pe-compile; do
-            if [ -f "$L.log" ]; then
-              T=$(tail -n 40 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
-              echo "::error::$L.log tail :: $T"
-            else
-              echo "::error::$L.log MISSING"
-            fi
+          MISSING=""
+          for d in d3d11.dll dxgi.dll winemetal.dll d3d10core.dll; do
+            [ -f "app/Madeira/aarch64-windows/$d" ] || MISSING="$MISSING $d"
           done
+          if [ -n "$MISSING" ]; then
+            echo "::error::PE DLLs missing from app/Madeira/aarch64-windows/ ::$MISSING"
+            exit 1
+          fi
+          echo "::notice::all four PE DLLs present"
 
       - name: Download Metal Toolchain
         run: xcodebuild -downloadComponent MetalToolchain
 
       - name: vcruntime reminder
         run: cat tools/fetch-vcruntime.md
+
+      # Fail here with a clear list rather than deep inside a linker error.
+      - name: Verify all linked archives exist
+        shell: bash
+        run: |
+          set +e
+          MISSING=""
+          for a in libgmp.a libgnutls.a libhogweed.a libnettle.a \
+                   libntdll_unix.a libwin32u_unix.a libwineserver.a \
+                   libdxmt_combined.a; do
+            [ -f "app/Madeira/$a" ] || MISSING="$MISSING app/Madeira/$a"
+          done
+          for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \
+                   FEXCore/Source/libJemallocLibs.a External/cephes/libcephes_128bit.a \
+                   External/fmt/libfmt.a External/SoftFloat-3e/libsoftfloat_3e.a \
+                   External/xxhash/cmake_unofficial/libxxhash.a; do
+            [ -f "FEX/build-ios/$a" ] || MISSING="$MISSING FEX/build-ios/$a"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::archives missing before archive step ::$MISSING"
+            exit 1
+          fi
+          echo "::notice::all 15 linked archives present"
 
       - name: Archive (unsigned)
         run: |
