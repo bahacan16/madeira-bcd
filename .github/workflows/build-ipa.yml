@@ -604,6 +604,64 @@ jobs:
           fi
           echo "::notice::all four PE DLLs present"
 
+      # tools/fetch-vcruntime.md: the twelve VC++ runtime DLLs are Microsoft's
+      # and are not redistributable under this project's license, so they are
+      # gitignored and "you supply them yourself". Fetching them straight from
+      # Microsoft at build time honours that -- nothing Microsoft-authored ever
+      # enters this repository or its history -- and it is the same recipe the
+      # doc gives for doing it by hand. The files are copied byte-for-byte;
+      # nothing is repacked or re-signed.
+      - name: Fetch the VC++ runtime DLLs from Microsoft
+        shell: bash
+        run: |
+          set +e
+          shopt -s nullglob
+          DEST="$GITHUB_WORKSPACE/app/Madeira/x86_64-vcruntime"
+          WANT="concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll
+                msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll vcamp140.dll
+                vccorlib140.dll vcomp140.dll vcruntime140.dll vcruntime140_1.dll
+                vcruntime140_threads.dll"
+          brew list sevenzip >/dev/null 2>&1 || brew install sevenzip
+          curl -fL --retry 3 --retry-delay 2 -o /tmp/VC_redist.x64.exe \
+            https://aka.ms/vs/17/release/vc_redist.x64.exe
+          if [ ! -s /tmp/VC_redist.x64.exe ]; then
+            echo "::warning::VC_redist.x64.exe download failed -- MSVC games will not start"
+            exit 0
+          fi
+          echo "downloaded $(wc -c < /tmp/VC_redist.x64.exe | tr -d ' ') bytes"
+          7zz x /tmp/VC_redist.x64.exe -o/tmp/vcredist -y > /dev/null 2>&1
+          # The cab path (.rsrc/1033/CABINET) moves between redistributable
+          # versions, so find every cab rather than hard-coding one path.
+          find /tmp/vcredist -iname "*.cab" -print0 2>/dev/null | while IFS= read -r -d "" cab; do
+            7zz x "$cab" -o/tmp/vcdlls -y > /dev/null 2>&1
+          done
+          # Inside the cab the payloads are often named F_CENTRAL_<base>_x64
+          # rather than <base>.dll -- accept either spelling.
+          FOUND=0; MISSING=""
+          for d in $WANT; do
+            base="${d%.dll}"
+            src=$(find /tmp/vcdlls /tmp/vcredist \
+                    \( -iname "$d" -o -iname "F_CENTRAL_${base}_x64" \) \
+                    -type f -print 2>/dev/null | head -1)
+            if [ -n "$src" ]; then
+              cp "$src" "$DEST/$d" && FOUND=$((FOUND+1))
+            else
+              MISSING="$MISSING $d"
+            fi
+          done
+          echo "::notice::vcruntime :: recovered $FOUND of 12$([ -n "$MISSING" ] && echo " -- missing:$MISSING")"
+          # tools/fetch-vcruntime.md: a truncated certificate table means the
+          # file is no longer an unmodified Microsoft binary.
+          python3 - "$DEST"/*.dll <<'PYEOF' || true
+          import struct, sys
+          for path in sys.argv[1:]:
+              d = open(path, 'rb').read()
+              pe = struct.unpack_from('<I', d, 0x3c)[0]
+              off, size = struct.unpack_from('<II', d, pe + 24 + 112 + 4*8)
+              ok = size and off + size <= len(d)
+              print(('  signed  ' if ok else '  UNSIGNED'), path.split('/')[-1])
+          PYEOF
+
       # The directory has to exist or xcodebuild fails the archive outright,
       # but the DLLs themselves are Microsoft's and cannot be committed.
       - name: Report vcruntime contents
