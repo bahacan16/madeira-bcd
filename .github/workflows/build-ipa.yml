@@ -210,23 +210,39 @@ jobs:
       # `if (NOT APPLE)` excludes from this build, so we would trade compile
       # errors for undefined symbols. These blocks only print debug logs, so
       # move them inside the #ifdef where their declarations live.
-      - name: Patch FEX Core.cpp diagnostic blocks
+      - name: Patch FEX diagnostic probes for the iOS static-lib target
         if: steps.fexcache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           python3 - <<'PYEOF'
           import pathlib, sys
-          p = pathlib.Path("FEX/FEXCore/Source/Interface/Core/Core.cpp")
-          s = p.read_text()
-          start = "  {\n    static uint64_t FfsLastCount = 0;"
-          end = "IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);\n    }\n  }\n"
-          if "#ifdef FEX_IOS_HOST\n" + start in s:
-              print("already patched"); sys.exit(0)
-          if s.count(start) != 1 or s.count(end) != 1:
-              print("::error::Core.cpp patch anchors not unique -- upstream changed, patch needs review")
-              sys.exit(1)
-          p.write_text(s.replace(start, "#ifdef FEX_IOS_HOST\n" + start).replace(end, end + "#endif\n"))
-          print("patched Core.cpp")
+
+          def patch(path, start, end, guard, label):
+              p = pathlib.Path(path)
+              s = p.read_text()
+              if guard + "\n" + start in s:
+                  print(f"{label}: already patched"); return
+              if s.count(start) != 1 or s.count(end) != 1:
+                  print(f"::error::{label}: patch anchors not unique -- upstream changed, review needed")
+                  sys.exit(1)
+              s = s.replace(start, guard + "\n" + start)
+              s = s.replace(end, end + ("#endif\n" if end.endswith("\n") else "\n#endif"))
+              p.write_text(s)
+              print(f"{label}: patched")
+
+          # [ffs-bypass] / [cb-entry] probes sit after the #endif that closes the
+          # FEX_IOS_HOST section, but read buffers declared only inside it.
+          patch("FEX/FEXCore/Source/Interface/Core/Core.cpp",
+                "  {\n    static uint64_t FfsLastCount = 0;",
+                "IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);\n    }\n  }\n",
+                "#ifdef FEX_IOS_HOST", "Core.cpp")
+
+          # [caspal128] probe calls VirtualQuery/MEMORY_BASIC_INFORMATION with no
+          # guard at all. Those exist on the ARM64EC/PE target, not on iOS.
+          patch("FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp",
+                "  MEMORY_BASIC_INFORMATION mbi {};",
+                "                    mbi.Protect, type, mbi.State);",
+                "#ifndef __APPLE__", "Arm64.cpp")
           PYEOF
 
       - name: Build FEX for iOS
