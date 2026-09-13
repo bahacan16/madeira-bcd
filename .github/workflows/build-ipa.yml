@@ -241,13 +241,22 @@ jobs:
         if: always()
         shell: bash
         run: |
-          N=$(ls toolchains/llvm-ios-build/lib/*.a 2>/dev/null | wc -l | tr -d ' ')
+          set +e
+          shopt -s nullglob
+          LIBS=(toolchains/llvm-ios-build/lib/*.a)
+          N=${#LIBS[@]}
+          echo "llvm-ios-build static libs: $N"
           echo "::notice::llvm-ios-build has $N static libs"
+          echo "-- toolchains tree --"
+          ls -la toolchains 2>&1 | head -20
+          ls -la toolchains/llvm-ios-build 2>&1 | head -20
           if [ "$N" -lt 5 ]; then
             for L in llvm-host-cfg llvm-host-build llvm-ios-cfg llvm-ios-build; do
               if [ -f "$L.log" ]; then
-                T=$(tail -n 25 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+                T=$(tail -n 30 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
                 echo "::error::$L.log tail :: $T"
+              else
+                echo "::error::$L.log MISSING"
               fi
             done
             exit 1
