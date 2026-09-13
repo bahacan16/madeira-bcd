@@ -611,12 +611,17 @@ jobs:
       # enters this repository or its history. The files are copied
       # byte-for-byte; nothing is repacked or re-signed.
       #
-      # The doc's one-liner (7zz the cab at .rsrc/1033/CABINET/*.cab) recovered
-      # 0 of 12 here: inside the installer's resources the payloads carry no
-      # .cab extension at all, so matching on one is guaranteed to find
-      # nothing. Unpack whatever 7zz will take, repeatedly, and look for the
-      # DLLs by name -- and print the layout either way so a future change in
-      # the redistributable is visible rather than inferred.
+      # Not with 7zz, though, whatever the doc says. It reports the download as
+      #   Type = PE   CPU = x86   Image Size = 495616   InternalName: setup
+      # for a 25 MB file: this is a WiX Burn bundle, a half-megabyte setup stub
+      # with the real payload appended after the PE image as an attached
+      # container. 7zz only ever sees the stub, so it unpacks 40 files of
+      # sections and resources and none of the DLLs -- and the doc's
+      # .rsrc/1033/CABINET path belongs to the pre-2015 layout, which this
+      # package no longer has at all.
+      #
+      # cabextract is built for exactly this: it scans a file for embedded
+      # cabinet headers rather than trusting its container format.
       - name: Fetch the VC++ runtime DLLs from Microsoft
         shell: bash
         run: |
@@ -627,8 +632,8 @@ jobs:
                 msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll vcamp140.dll
                 vccorlib140.dll vcomp140.dll vcruntime140.dll vcruntime140_1.dll
                 vcruntime140_threads.dll"
-          command -v 7zz >/dev/null 2>&1 || brew install sevenzip
-          echo "7zz: $(command -v 7zz) $(7zz 2>/dev/null | head -2 | tail -1)"
+          command -v cabextract >/dev/null 2>&1 || brew install cabextract
+          command -v msiextract >/dev/null 2>&1 || brew install msitools
 
           curl -fL --retry 3 --retry-delay 2 -o /tmp/vcr.exe \
             https://aka.ms/vs/17/release/vc_redist.x64.exe
@@ -637,29 +642,51 @@ jobs:
             exit 0
           fi
           echo "downloaded $(wc -c < /tmp/vcr.exe | tr -d ' ') bytes"
-          echo "-- 7zz listing of the installer --"
-          7zz l /tmp/vcr.exe 2>&1 | head -40
 
-          mkdir -p /tmp/vcx
-          7zz x /tmp/vcr.exe -o/tmp/vcx/L0 -y > /dev/null 2>&1
+          rm -rf /tmp/vcx; mkdir -p /tmp/vcx/a /tmp/vcx/carve
+          cabextract -q -d /tmp/vcx/a /tmp/vcr.exe 2>&1 | tail -3
 
-          # Peel containers until nothing new appears. Skip the DLLs
-          # themselves -- 7zz would happily take a PE apart into sections and
-          # the walk would never settle.
+          # Belt and braces: carve every cabinet out by its MSCF header and
+          # its own declared length, in case cabextract's scan stops at the
+          # first container.
+          python3 - <<'PYEOF'
+          import struct
+          d = open('/tmp/vcr.exe', 'rb').read()
+          n = off = 0
+          while True:
+              i = d.find(b'MSCF', off)
+              if i < 0:
+                  break
+              cb = struct.unpack_from('<I', d, i + 8)[0] if i + 36 <= len(d) else 0
+              if 1000 < cb <= len(d) - i:
+                  open('/tmp/vcx/carve/c%d.cab' % n, 'wb').write(d[i:i + cb])
+                  n += 1
+                  off = i + cb
+              else:
+                  off = i + 4
+          print('carved %d cabinet(s) by MSCF header' % n)
+          PYEOF
+
+          # Peel what came out: a Burn container holds MSIs and further cabs,
+          # and the DLLs sit one level below those. Skip PE files -- unpacking
+          # a DLL into its sections would keep the walk going forever.
           for pass in 1 2 3 4; do
             BEFORE=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
-            find /tmp/vcx -type f -size +40k 2>/dev/null | while IFS= read -r f; do
+            find /tmp/vcx -type f -size +20k 2>/dev/null | while IFS= read -r f; do
               case "${f##*/}" in *.dll|*.DLL|*.exe|*.EXE) continue ;; esac
               [ -d "$f.d" ] && continue
-              7zz x "$f" -o"$f.d" -y > /dev/null 2>&1
+              mkdir -p "$f.d"
+              cabextract -q -d "$f.d" "$f" > /dev/null 2>&1 \
+                || msiextract -C "$f.d" "$f" > /dev/null 2>&1 \
+                || rmdir "$f.d" 2>/dev/null
             done
             AFTER=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
             echo "pass $pass: $BEFORE -> $AFTER files"
             [ "$BEFORE" = "$AFTER" ] && break
           done
 
-          # Inside a cab the payloads are usually named F_CENTRAL_<base>_x64
-          # rather than <base>.dll, so accept either spelling.
+          # Inside the cab the payloads are named F_CENTRAL_<base>_x64 rather
+          # than <base>.dll, so accept either spelling.
           FOUND=0; MISSING=""
           for d in $WANT; do
             base="${d%.dll}"
@@ -675,7 +702,7 @@ jobs:
 
           if [ "$FOUND" -lt 12 ]; then
             echo "-- what the installer actually unpacked to (biggest 40) --"
-            find /tmp/vcx -type f -size +40k -exec ls -S {} + 2>/dev/null \
+            find /tmp/vcx -type f -size +20k -exec ls -S {} + 2>/dev/null \
               | head -40 | sed "s|/tmp/vcx/||"
           fi
 
