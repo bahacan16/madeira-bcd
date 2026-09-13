@@ -2,6 +2,9 @@ name: Build Madeira IPA (unsigned)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/build-ipa.yml"]
 
 jobs:
   build:
