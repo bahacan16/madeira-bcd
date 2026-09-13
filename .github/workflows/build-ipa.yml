@@ -22,7 +22,29 @@ jobs:
       # iOS/arm64 cross target isn't documented anywhere in the repo.
       # This is a best guess and will likely need correcting once we see
       # the real error.
-      - name: Configure wine (build-macos)
+      - name: Build native wine (for host-side tools: widl/wrc/wmc)
+        run: |
+          cd wine
+          mkdir -p build-native
+          cd build-native
+          ../configure > "$GITHUB_WORKSPACE/wine-native-configure.log" 2>&1 || true
+          make -j"$(sysctl -n hw.ncpu)" > "$GITHUB_WORKSPACE/wine-native-make.log" 2>&1 || true
+
+      - name: Diagnose native wine tools build
+        run: |
+          echo "-- looking for widl (proof the native tools built) --"
+          find wine/build-native/tools -maxdepth 2 -name "widl*" 2>&1 || echo "not found"
+          if [ ! -x wine/build-native/tools/widl/widl ]; then
+            echo "::error::native widl NOT built -- dumping tails"
+            NCTAIL=$(tail -n 30 wine-native-configure.log 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::native configure TAIL :: $NCTAIL"
+            NMTAIL=$(tail -n 40 wine-native-make.log 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::native make TAIL :: $NMTAIL"
+          else
+            echo "::notice::native widl built OK"
+          fi
+
+      - name: Configure wine (build-macos, cross)
         run: |
           cd wine
           mkdir -p build-macos
@@ -31,6 +53,7 @@ jobs:
             CC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
             CROSSCC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
             --host=aarch64-apple-darwin --build=x86_64-apple-darwin \
+            --with-wine-tools="$GITHUB_WORKSPACE/wine/build-native" \
             > "$GITHUB_WORKSPACE/wine-configure.log" 2>&1 || true
 
       - name: Diagnose wine build-macos state
