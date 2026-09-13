@@ -547,6 +547,11 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             echo "===== compiler errors ====="
             grep -E "^[^ ].*: (error|fatal error):" "$GITHUB_WORKSPACE/archive.log" | head -30
+            # Linker diagnostics carry no "error:" prefix, so the undefined
+            # symbol list needs matching on its own terms.
+            echo "===== linker diagnostics ====="
+            grep -E "Undefined symbol|^ld: |symbol\(s\) not found|referenced from|duplicate symbol" \
+              "$GITHUB_WORKSPACE/archive.log" | head -40
             echo "===== failing build commands ====="
             sed -n '/The following build commands failed/,/failures)/p' \
               "$GITHUB_WORKSPACE/archive.log" | cut -c1-200 | head -15
