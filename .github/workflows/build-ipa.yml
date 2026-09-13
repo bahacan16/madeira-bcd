@@ -200,6 +200,8 @@ jobs:
         with:
           path: FEX/build-ios
           key: fex-ios-053c385-v1
+          # Without this a later failing step throws away the build we just did.
+          save-always: true
 
       # Upstream bug in the ios-port branch: the [ffs-bypass] and [cb-entry]
       # diagnostic blocks sit AFTER the #endif that closes the FEX_IOS_HOST
@@ -319,6 +321,7 @@ jobs:
             toolchains/llvm-ios-build
             toolchains/llvm-project
           key: llvm-15.0.7-ios-v2
+          save-always: true
 
       - name: Build LLVM 15.0.7 for iOS (two-stage, per build/dxmt-ios/README.md)
         if: steps.llvmcache.outputs.cache-hit != 'true'
@@ -387,8 +390,45 @@ jobs:
             exit 1
           fi
 
+      # Needed to compile the .metal shaders below, so it has to happen before
+      # dxmt-ios rather than just before xcodebuild.
+      - name: Download Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      # build/dxmt-ios/shader-headers/ is gitignored and nothing generated it,
+      # so airconv_context.cpp could not find air_msad.h / air_samplepos.h.
+      # Mirrors the metalir + hexdump generators in research/dxmt/meson.build.
+      - name: Generate DXMT shader headers
+        shell: bash
+        run: |
+          SHADERS="$GITHUB_WORKSPACE/research/dxmt/src/airconv/shaders"
+          OUT="$GITHUB_WORKSPACE/build/dxmt-ios/shader-headers"
+          mkdir -p "$OUT"
+          cd "$OUT"
+          for s in air_msad air_samplepos air_tessellation; do
+            xcrun -sdk macosx metal -o "$s.air" -c "$SHADERS/$s.metal" \
+              -std=metal3.1 --target=air64-apple-macos14.0
+            # meson passes `xxd -n <basename>`; that flag is not in every xxd,
+            # so rename the symbols instead (air_msad_air -> air_msad).
+            xxd -i "$s.air" | sed "s/${s}_air/${s}/g" > "$s.h"
+          done
+          ls -la
+
       - name: Build dxmt-ios
-        run: bash build/dxmt-ios/build.sh
+        shell: bash
+        run: |
+          set +e
+          bash build/dxmt-ios/build.sh
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            for f in build/dxmt-ios/obj/*.err; do
+              [ -s "$f" ] || continue
+              grep -q "error:" "$f" || continue
+              echo "===== $f ====="
+              grep -m 10 -B2 -A6 "error:" "$f"
+            done
+          fi
+          exit "$rc"
 
       - name: Combine DXMT + LLVM into libdxmt_combined.a
         shell: bash
@@ -415,9 +455,6 @@ jobs:
             exit 1
           fi
           echo "::notice::all four PE DLLs present"
-
-      - name: Download Metal Toolchain
-        run: xcodebuild -downloadComponent MetalToolchain
 
       - name: vcruntime reminder
         run: cat tools/fetch-vcruntime.md
