@@ -38,24 +38,18 @@ jobs:
       - name: Diagnose clang/lld aarch64-windows target
         run: |
           export PATH="$(brew --prefix llvm)/bin:$PATH"
-          echo "-- which/version --"
-          which clang
-          clang --version
-          echo "-- brew llvm prefix contents (bin) --"
-          ls "$(brew --prefix llvm)/bin" | head -30
-          echo "-- direct target test --"
+          LLVMBIN="$(brew --prefix llvm)/bin"
+          LSOUT=$(ls "$LLVMBIN" | grep -i "lld\|link" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+          echo "::error::lld/link binaries in $LLVMBIN :: $LSOUT"
           echo 'int main(){return 0;}' > /tmp/t.c
-          if clang -target aarch64-windows -fuse-ld=lld -Wl,-subsystem:console -Wl,-WX --no-default-config /tmp/t.c -o /tmp/t.exe 2>/tmp/t.err; then
-            echo "::notice::direct clang test SUCCEEDED"
-          else
-            echo "::error::direct clang test FAILED"
-            MSG=$(cat /tmp/t.err | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
-            echo "::error::clang test stderr :: $MSG"
-            WHICH=$(which clang)
-            echo "::error::which clang :: $WHICH"
-            VER=$(clang --version | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
-            echo "::error::clang --version :: $VER"
-          fi
+          for LDOPT in "-fuse-ld=lld" "-fuse-ld=lld-link" "--ld-path=$LLVMBIN/lld-link" "--ld-path=$LLVMBIN/ld.lld"; do
+            if clang -target aarch64-windows $LDOPT -Wl,-subsystem:console -Wl,-WX --no-default-config /tmp/t.c -o /tmp/t.exe 2>/tmp/t.err; then
+              echo "::notice::SUCCEEDED with $LDOPT"
+            else
+              MSG=$(cat /tmp/t.err | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+              echo "::error::FAILED with $LDOPT :: $MSG"
+            fi
+          done
 
       - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
         run: |
