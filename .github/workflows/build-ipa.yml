@@ -221,10 +221,18 @@ jobs:
         run: |
           set +e
           OBJ=build/ntdll-unix/obj
+          # nm's own flags do the filtering -- -g external, -U defined-only --
+          # so match on the symbol name alone. Anchoring the whole line
+          # against "addr TYPE _name" is what made this check report every
+          # table missing even when the objects plainly defined them: the
+          # archive-member output format does not match that shape.
+          nm -gU app/Madeira/libntdll_unix.a 2>/dev/null \
+            | awk '{print $NF}' | sort -u > defined-syms.txt
+          echo "defined external symbols in libntdll_unix.a: $(wc -l < defined-syms.txt | tr -d ' ')"
           MISSING=""
           for s in bcrypt_unix_call_funcs secur32_unix_call_funcs crypt32_unix_call_funcs \
                    ws2_32_unix_call_funcs dwrite_unix_call_funcs; do
-            if nm -gU app/Madeira/libntdll_unix.a 2>/dev/null | grep -qE "^[0-9a-f]* [A-Z] _$s$"; then
+            if grep -qx "_$s" defined-syms.txt; then
               echo "  OK   $s (defined)"
             else
               echo "  MISS $s"; MISSING="$MISSING $s"
@@ -241,6 +249,8 @@ jobs:
             fi
           done
           if [ -n "$MISSING" ]; then
+            echo "-- raw nm shape for bcrypt_unixlib.o --"
+            nm -gU "$OBJ/bcrypt_unixlib.o" 2>&1 | head -5 | cat -A | head -5
             echo "::error::libntdll_unix.a defines none of ::$MISSING"
             for o in bcrypt_unixlib secur32_unixlib crypt32_unixlib; do
               if [ -s "$OBJ/$o.err" ]; then
