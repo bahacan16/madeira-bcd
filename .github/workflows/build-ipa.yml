@@ -100,13 +100,13 @@ jobs:
         run: bash build/freetype-ios/build.sh
 
       - name: Build ntdll-unix
-        run: bash build/ntdll-unix/build.sh
+        run: bash build/ntdll-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ntdll.log"; exit ${PIPESTATUS[0]}
 
       - name: Build wineserver
-        run: bash build/wineserver/build.sh
+        run: bash build/wineserver/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/wineserver.log"; exit ${PIPESTATUS[0]}
 
       - name: Build win32u-unix
-        run: bash build/win32u-unix/build.sh
+        run: bash build/win32u-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/win32u.log"; exit ${PIPESTATUS[0]}
 
       # --- UNVERIFIED: don't know Madeira's required LLVM branch/cmake
       # flags for the DXMT airconv shader compiler. This will take real
@@ -150,14 +150,26 @@ jobs:
 
       - name: Dump first build errors (on failure)
         if: failure()
+        shell: bash
         run: |
-          echo "::error::config.h present: $( [ -f wine/build-macos/include/config.h ] && echo yes || echo no )"
-          COUNT=0
-          for f in $(find build toolchains -name "*.err" -size +0c 2>/dev/null | head -3); do
-            COUNT=$((COUNT+1))
-            MSG=$(head -c 1800 "$f" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
-            echo "::error::$f :: $MSG"
+          for L in ntdll wineserver win32u; do
+            if [ -f "$L.log" ]; then
+              T=$(grep -E "^(Results:|Failed:|ERROR)" "$L.log" | head -5 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+              echo "::error::$L.log summary :: $T"
+            fi
           done
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::error::no .err files found under build/ or toolchains/ -- failure came from elsewhere (xcodebuild, cmake config, or a script's own explicit exit)"
+          N=0
+          for f in $(grep -rl "error:" build --include="*.err" 2>/dev/null | head -4); do
+            N=$((N+1))
+            MSG=$(grep -A4 -m3 "error:" "$f" | head -c 1500 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::REAL ERROR in $f :: $MSG"
+          done
+          if [ "$N" -eq 0 ]; then
+            echo "::error::no .err file contains 'error:' -- failure is from a script exit or ar/link stage"
+            for L in ntdll wineserver win32u; do
+              if [ -f "$L.log" ]; then
+                T=$(tail -n 25 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+                echo "::error::$L.log tail :: $T"
+              fi
+            done
           fi
