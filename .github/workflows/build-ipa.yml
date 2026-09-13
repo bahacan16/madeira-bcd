@@ -481,8 +481,18 @@ jobs:
           fi
           echo "::notice::all four PE DLLs present"
 
-      - name: vcruntime reminder
-        run: cat tools/fetch-vcruntime.md
+      # The directory has to exist or xcodebuild fails the archive outright,
+      # but the DLLs themselves are Microsoft's and cannot be committed.
+      - name: Report vcruntime contents
+        shell: bash
+        run: |
+          shopt -s nullglob
+          DLLS=(app/Madeira/x86_64-vcruntime/*.dll)
+          echo "x86_64-vcruntime DLLs present: ${#DLLS[@]} of 12"
+          if [ "${#DLLS[@]}" -lt 12 ]; then
+            echo "::warning::IPA will build, but games built with MSVC will not \
+          start until the VC++ runtime DLLs are added -- see tools/fetch-vcruntime.md"
+          fi
 
       # Fail here with a clear list rather than deep inside a linker error.
       - name: Verify all linked archives exist

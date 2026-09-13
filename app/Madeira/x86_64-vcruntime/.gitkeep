@@ -1,0 +1,8 @@
+The twelve Microsoft Visual C++ runtime DLLs belong in this directory.
+They are not redistributable under this project's license, so they are
+not committed -- see tools/fetch-vcruntime.md for how to obtain them.
+
+The directory itself must exist: Madeira.xcodeproj copies it as a bundle
+resource, and xcodebuild fails the archive outright when it is missing.
+Without the DLLs the app still builds and runs, but games built with
+MSVC will not start.
