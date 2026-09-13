@@ -32,17 +32,19 @@ jobs:
 
       - name: Install llvm (need lld/llvm-dlltool for aarch64-windows PE cross target)
         run: |
-          brew install llvm
+          brew install llvm lld
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
 
       - name: Diagnose clang/lld aarch64-windows target
         run: |
-          export PATH="$(brew --prefix llvm)/bin:$PATH"
+          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
           LLVMBIN="$(brew --prefix llvm)/bin"
-          LSOUT=$(ls "$LLVMBIN" | grep -i "lld\|link" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
-          echo "::error::lld/link binaries in $LLVMBIN :: $LSOUT"
+          LLDBIN="$(brew --prefix lld)/bin"
+          LSOUT=$(ls "$LLDBIN" 2>&1 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+          echo "::error::contents of $LLDBIN :: $LSOUT"
           echo 'int main(){return 0;}' > /tmp/t.c
-          for LDOPT in "-fuse-ld=lld" "-fuse-ld=lld-link" "--ld-path=$LLVMBIN/lld-link" "--ld-path=$LLVMBIN/ld.lld"; do
+          for LDOPT in "-fuse-ld=lld" "--ld-path=$LLDBIN/lld-link" "--ld-path=$LLDBIN/ld64.lld"; do
             if clang -target aarch64-windows $LDOPT -Wl,-subsystem:console -Wl,-WX --no-default-config /tmp/t.c -o /tmp/t.exe 2>/tmp/t.err; then
               echo "::notice::SUCCEEDED with $LDOPT"
             else
