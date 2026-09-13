@@ -195,7 +195,7 @@ jobs:
           path: |
             toolchains/llvm-ios-build
             toolchains/llvm-project
-          key: llvm-15.0.7-ios-v1
+          key: llvm-15.0.7-ios-v2
 
       - name: Build LLVM 15.0.7 for iOS (two-stage, per build/dxmt-ios/README.md)
         if: steps.llvmcache.outputs.cache-hit != 'true'
@@ -228,7 +228,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
             -DLLVM_TABLEGEN="$GITHUB_WORKSPACE/toolchains/llvm-host-build/bin/llvm-tblgen" \
-            -DLLVM_BUILD_UTILS=Off -DLLVM_TARGETS_TO_BUILD="" \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DLLVM_BUILD_UTILS=Off -DLLVM_BUILD_TOOLS=Off \
+            -DLLVM_TARGETS_TO_BUILD="" \
             -DLLVM_INCLUDE_TESTS=Off -DLLVM_INCLUDE_EXAMPLES=Off \
             -DLLVM_INCLUDE_BENCHMARKS=Off -DLLVM_INCLUDE_UTILS=Off \
             -DLLVM_ENABLE_TERMINFO=Off -DLLVM_ENABLE_LIBXML2=Off \
