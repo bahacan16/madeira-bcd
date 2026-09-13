@@ -132,6 +132,44 @@ jobs:
       - name: Build ntdll-unix
         run: bash build/ntdll-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ntdll.log"; exit ${PIPESTATUS[0]}
 
+      - name: Build base libwineserver.a from wine/server sources
+        shell: bash
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          BD="$GITHUB_WORKSPACE/build/wineserver"
+          OBJ="$BD/obj"
+          mkdir -p "$OBJ/base"
+          FLAGS=(-arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
+            -I"$GITHUB_WORKSPACE/wine/include" -I"$GITHUB_WORKSPACE/wine/include/wine"
+            -I"$GITHUB_WORKSPACE/wine/build-macos/include"
+            -I"$BD" -I"$GITHUB_WORKSPACE/wine/server"
+            -I"$GITHUB_WORKSPACE/build/ntdll-unix/shims"
+            -include "$BD/config_ios.h" -include stdarg.h
+            -include "$BD/unicode_fix.h" -include "$BD/wineserver_ios_kill.h"
+            -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\"
+            -D__WINESRC__ -DWINE_IOS=1 -Dmain=wineserver_main
+            -Wno-implicit-function-declaration)
+          OK=0; BAD=0; BADLIST=""
+          for src in "$GITHUB_WORKSPACE"/wine/server/*.c; do
+            n=$(basename "$src" .c)
+            if xcrun -sdk iphoneos clang "${FLAGS[@]}" -c "$src" -o "$OBJ/base/$n.o" 2>"$OBJ/base/$n.err"; then
+              OK=$((OK+1))
+            else
+              BAD=$((BAD+1)); BADLIST="$BADLIST $n"
+            fi
+          done
+          echo "base compile: $OK ok, $BAD failed:$BADLIST"
+          echo "::notice::base wineserver compile :: $OK ok, $BAD failed:$BADLIST"
+          ar rcs "$OBJ/libwineserver.a" "$OBJ"/base/*.o
+          echo "::notice::base libwineserver.a $(wc -c < "$OBJ/libwineserver.a" | tr -d ' ') bytes"
+          # surface the first few real failures so we can judge if any matter
+          M=0
+          for f in $(grep -rl "error:" "$OBJ/base" --include="*.err" 2>/dev/null | head -3); do
+            M=$((M+1))
+            MSG=$(grep -m3 -A3 "error:" "$f" | head -c 1200 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::base compile error in $f :: $MSG"
+          done
+
       - name: Build wineserver
         run: bash build/wineserver/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/wineserver.log"; exit ${PIPESTATUS[0]}
 
