@@ -276,6 +276,45 @@ jobs:
           cp libdxmt_combined.a "$GITHUB_WORKSPACE/app/Madeira/"
           echo "::notice::libdxmt_combined.a $(wc -c < libdxmt_combined.a | tr -d ' ') bytes"
 
+      - name: Build DXMT PE side (d3d11/dxgi/winemetal/d3d10core)
+        shell: bash
+        run: |
+          ln -sfn ../../toolchains research/dxmt/toolchains
+          MINGW_BIN="$GITHUB_WORKSPACE/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin"
+          cd research/dxmt
+          SDKROOT=$(xcrun --sdk macosx --show-sdk-path) \
+            PATH="$MINGW_BIN:/usr/bin:/opt/homebrew/bin:$PATH" \
+            meson setup --cross-file build-aarch64-win.txt --native-file build-osx.txt \
+                        -Dwine_build_path=../../wine/build-macos build-pe \
+            > "$GITHUB_WORKSPACE/dxmt-pe-setup.log" 2>&1
+          SDKROOT=$(xcrun --sdk macosx --show-sdk-path) \
+            PATH="$MINGW_BIN:/usr/bin:/opt/homebrew/bin:$PATH" \
+            meson compile -C build-pe \
+            > "$GITHUB_WORKSPACE/dxmt-pe-compile.log" 2>&1
+          mkdir -p "$GITHUB_WORKSPACE/app/Madeira/aarch64-windows"
+          cp build-pe/src/d3d11/d3d11.dll \
+             build-pe/src/dxgi/dxgi.dll \
+             build-pe/src/winemetal/winemetal.dll \
+             build-pe/src/d3d10/d3d10core.dll \
+             "$GITHUB_WORKSPACE/app/Madeira/aarch64-windows/"
+          ls -la "$GITHUB_WORKSPACE/app/Madeira/aarch64-windows/"
+
+      - name: Diagnose DXMT PE build (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          for L in dxmt-pe-setup dxmt-pe-compile; do
+            if [ -f "$L.log" ]; then
+              T=$(tail -n 40 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+              echo "::error::$L.log tail :: $T"
+            else
+              echo "::error::$L.log MISSING"
+            fi
+          done
+
+      - name: Download Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
       - name: vcruntime reminder
         run: cat tools/fetch-vcruntime.md
 
