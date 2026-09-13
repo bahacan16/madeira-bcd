@@ -43,9 +43,9 @@ jobs:
             echo "::error::config.h MISSING at wine/build-macos/include/config.h -- configure did not actually produce it"
             LINES=$(wc -l < wine-configure.log 2>/dev/null || echo 0)
             echo "::error::wine-configure.log has $LINES lines total"
-            HEAD=$(head -n 25 wine-configure.log 2>/dev/null | sed ':a;N;$!ba;s/\n/%0A/g')
+            HEAD=$(head -n 25 wine-configure.log 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
             echo "::error::configure HEAD :: $HEAD"
-            TAIL=$(tail -n 40 wine-configure.log 2>/dev/null | sed ':a;N;$!ba;s/\n/%0A/g')
+            TAIL=$(tail -n 40 wine-configure.log 2>/dev/null | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
             echo "::error::configure TAIL :: $TAIL"
           fi
 
@@ -111,7 +111,7 @@ jobs:
           COUNT=0
           for f in $(find build toolchains -name "*.err" -size +0c 2>/dev/null | head -3); do
             COUNT=$((COUNT+1))
-            MSG=$(head -c 1800 "$f" | sed ':a;N;$!ba;s/\n/%0A/g')
+            MSG=$(head -c 1800 "$f" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
             echo "::error::$f :: $MSG"
           done
           if [ "$COUNT" -eq 0 ]; then
