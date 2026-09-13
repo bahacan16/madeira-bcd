@@ -608,9 +608,15 @@ jobs:
       # and are not redistributable under this project's license, so they are
       # gitignored and "you supply them yourself". Fetching them straight from
       # Microsoft at build time honours that -- nothing Microsoft-authored ever
-      # enters this repository or its history -- and it is the same recipe the
-      # doc gives for doing it by hand. The files are copied byte-for-byte;
-      # nothing is repacked or re-signed.
+      # enters this repository or its history. The files are copied
+      # byte-for-byte; nothing is repacked or re-signed.
+      #
+      # The doc's one-liner (7zz the cab at .rsrc/1033/CABINET/*.cab) recovered
+      # 0 of 12 here: inside the installer's resources the payloads carry no
+      # .cab extension at all, so matching on one is guaranteed to find
+      # nothing. Unpack whatever 7zz will take, repeatedly, and look for the
+      # DLLs by name -- and print the layout either way so a future change in
+      # the redistributable is visible rather than inferred.
       - name: Fetch the VC++ runtime DLLs from Microsoft
         shell: bash
         run: |
@@ -621,27 +627,43 @@ jobs:
                 msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll vcamp140.dll
                 vccorlib140.dll vcomp140.dll vcruntime140.dll vcruntime140_1.dll
                 vcruntime140_threads.dll"
-          brew list sevenzip >/dev/null 2>&1 || brew install sevenzip
-          curl -fL --retry 3 --retry-delay 2 -o /tmp/VC_redist.x64.exe \
+          command -v 7zz >/dev/null 2>&1 || brew install sevenzip
+          echo "7zz: $(command -v 7zz) $(7zz 2>/dev/null | head -2 | tail -1)"
+
+          curl -fL --retry 3 --retry-delay 2 -o /tmp/vcr.exe \
             https://aka.ms/vs/17/release/vc_redist.x64.exe
-          if [ ! -s /tmp/VC_redist.x64.exe ]; then
+          if [ ! -s /tmp/vcr.exe ]; then
             echo "::warning::VC_redist.x64.exe download failed -- MSVC games will not start"
             exit 0
           fi
-          echo "downloaded $(wc -c < /tmp/VC_redist.x64.exe | tr -d ' ') bytes"
-          7zz x /tmp/VC_redist.x64.exe -o/tmp/vcredist -y > /dev/null 2>&1
-          # The cab path (.rsrc/1033/CABINET) moves between redistributable
-          # versions, so find every cab rather than hard-coding one path.
-          find /tmp/vcredist -iname "*.cab" -print0 2>/dev/null | while IFS= read -r -d "" cab; do
-            7zz x "$cab" -o/tmp/vcdlls -y > /dev/null 2>&1
+          echo "downloaded $(wc -c < /tmp/vcr.exe | tr -d ' ') bytes"
+          echo "-- 7zz listing of the installer --"
+          7zz l /tmp/vcr.exe 2>&1 | head -40
+
+          mkdir -p /tmp/vcx
+          7zz x /tmp/vcr.exe -o/tmp/vcx/L0 -y > /dev/null 2>&1
+
+          # Peel containers until nothing new appears. Skip the DLLs
+          # themselves -- 7zz would happily take a PE apart into sections and
+          # the walk would never settle.
+          for pass in 1 2 3 4; do
+            BEFORE=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
+            find /tmp/vcx -type f -size +40k 2>/dev/null | while IFS= read -r f; do
+              case "${f##*/}" in *.dll|*.DLL|*.exe|*.EXE) continue ;; esac
+              [ -d "$f.d" ] && continue
+              7zz x "$f" -o"$f.d" -y > /dev/null 2>&1
+            done
+            AFTER=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
+            echo "pass $pass: $BEFORE -> $AFTER files"
+            [ "$BEFORE" = "$AFTER" ] && break
           done
-          # Inside the cab the payloads are often named F_CENTRAL_<base>_x64
-          # rather than <base>.dll -- accept either spelling.
+
+          # Inside a cab the payloads are usually named F_CENTRAL_<base>_x64
+          # rather than <base>.dll, so accept either spelling.
           FOUND=0; MISSING=""
           for d in $WANT; do
             base="${d%.dll}"
-            src=$(find /tmp/vcdlls /tmp/vcredist \
-                    \( -iname "$d" -o -iname "F_CENTRAL_${base}_x64" \) \
+            src=$(find /tmp/vcx \( -iname "$d" -o -iname "F_CENTRAL_${base}_x64*" \) \
                     -type f -print 2>/dev/null | head -1)
             if [ -n "$src" ]; then
               cp "$src" "$DEST/$d" && FOUND=$((FOUND+1))
@@ -650,6 +672,13 @@ jobs:
             fi
           done
           echo "::notice::vcruntime :: recovered $FOUND of 12$([ -n "$MISSING" ] && echo " -- missing:$MISSING")"
+
+          if [ "$FOUND" -lt 12 ]; then
+            echo "-- what the installer actually unpacked to (biggest 40) --"
+            find /tmp/vcx -type f -size +40k -exec ls -S {} + 2>/dev/null \
+              | head -40 | sed "s|/tmp/vcx/||"
+          fi
+
           # tools/fetch-vcruntime.md: a truncated certificate table means the
           # file is no longer an unmodified Microsoft binary.
           python3 - "$DEST"/*.dll <<'PYEOF' || true
