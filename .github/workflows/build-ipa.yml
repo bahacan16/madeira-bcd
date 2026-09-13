@@ -36,23 +36,6 @@ jobs:
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
 
-      - name: Diagnose clang/lld aarch64-windows target
-        run: |
-          export PATH="$(brew --prefix llvm)/bin:$(brew --prefix lld)/bin:$PATH"
-          LLVMBIN="$(brew --prefix llvm)/bin"
-          LLDBIN="$(brew --prefix lld)/bin"
-          LSOUT=$(ls "$LLDBIN" 2>&1 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
-          echo "::error::contents of $LLDBIN :: $LSOUT"
-          echo 'int main(){return 0;}' > /tmp/t.c
-          for LDOPT in "-fuse-ld=lld" "--ld-path=$LLDBIN/lld-link" "--ld-path=$LLDBIN/ld64.lld"; do
-            if clang -target aarch64-windows $LDOPT -Wl,-subsystem:console -Wl,-WX --no-default-config /tmp/t.c -o /tmp/t.exe 2>/tmp/t.err; then
-              echo "::notice::SUCCEEDED with $LDOPT"
-            else
-              MSG=$(cat /tmp/t.err | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
-              echo "::error::FAILED with $LDOPT :: $MSG"
-            fi
-          done
-
       - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
         run: |
           cd wine
@@ -85,6 +68,13 @@ jobs:
             CROSSCC="xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0" \
             --host=aarch64-apple-darwin --build=x86_64-apple-darwin \
             --with-wine-tools="$GITHUB_WORKSPACE/wine/build-native" \
+            --without-freetype --without-fontconfig \
+            --without-x --without-opengl --without-vulkan \
+            --without-gnutls --without-pcsclite --without-usb \
+            --without-v4l2 --without-gphoto --without-inotify \
+            --without-sane --without-pulse --without-alsa --without-oss \
+            --without-capi --without-cups --without-krb5 --without-ldap \
+            --without-netapi --without-sdl --without-udev --without-unwind \
             > "$GITHUB_WORKSPACE/wine-configure.log" 2>&1 || true
 
       - name: Diagnose wine build-macos state
