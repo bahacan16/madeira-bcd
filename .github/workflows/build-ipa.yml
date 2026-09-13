@@ -201,6 +201,34 @@ jobs:
           path: FEX/build-ios
           key: fex-ios-053c385-v1
 
+      # Upstream bug in the ios-port branch: the [ffs-bypass] and [cb-entry]
+      # diagnostic blocks sit AFTER the #endif that closes the FEX_IOS_HOST
+      # section, but the buffers they read (IosCbEntryLog, IosFfsBypassLog)
+      # are only declared inside it -- 14 "undeclared identifier" errors.
+      # Defining FEX_IOS_HOST is not the fix: IosJitReverseTranslate and
+      # IosFfsBypassLog are defined under Source/Windows/ARM64EC/, which
+      # `if (NOT APPLE)` excludes from this build, so we would trade compile
+      # errors for undefined symbols. These blocks only print debug logs, so
+      # move them inside the #ifdef where their declarations live.
+      - name: Patch FEX Core.cpp diagnostic blocks
+        if: steps.fexcache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import pathlib, sys
+          p = pathlib.Path("FEX/FEXCore/Source/Interface/Core/Core.cpp")
+          s = p.read_text()
+          start = "  {\n    static uint64_t FfsLastCount = 0;"
+          end = "IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);\n    }\n  }\n"
+          if "#ifdef FEX_IOS_HOST\n" + start in s:
+              print("already patched"); sys.exit(0)
+          if s.count(start) != 1 or s.count(end) != 1:
+              print("::error::Core.cpp patch anchors not unique -- upstream changed, patch needs review")
+              sys.exit(1)
+          p.write_text(s.replace(start, "#ifdef FEX_IOS_HOST\n" + start).replace(end, end + "#endif\n"))
+          print("patched Core.cpp")
+          PYEOF
+
       - name: Build FEX for iOS
         if: steps.fexcache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -251,8 +279,11 @@ jobs:
           if [ "$OK" -eq 0 ]; then
             for L in fex-cfg fex-build; do
               if [ -f "$L.log" ]; then
-                T=$(tail -n 40 "$L.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
-                echo "::error::$L.log tail :: $T"
+                # Compiler errors beat a blind tail: the real cause is usually
+                # hundreds of lines above the end of a ninja log.
+                E=$(grep -E "error:|CMake Error" "$L.log" | head -20)
+                [ -n "$E" ] || E=$(tail -n 40 "$L.log")
+                echo "::error::$L.log :: $(printf '%s' "$E" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")"
               else
                 echo "::error::$L.log MISSING"
               fi
@@ -416,6 +447,15 @@ jobs:
         with:
           name: madeira-unsigned-ipa
           path: build-out/Madeira-unsigned.ipa
+          if-no-files-found: ignore
+
+      # Full logs as an artifact -- the annotations above are truncated, and
+      # digging them out of the raw job log is painful.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: "*.log"
           if-no-files-found: ignore
 
       - name: Dump first build errors (on failure)
