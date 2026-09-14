@@ -74,6 +74,8 @@ struct FPSOverlay: View {
     /// footprint + available IS the limit. 4096 stays as the fallback for
     /// when the call reports nothing.
     @State private var limitMB: Int = 4096
+    @State private var logTicks = 0
+    @State private var lastLoggedPresent: UInt64 = .max
 
     private func readLimitMB(footprintMB: Int) -> Int {
         let avail = os_proc_available_memory()
@@ -233,6 +235,22 @@ struct FPSOverlay: View {
             // task_info per 250ms and no additional SwiftUI invalidation.
             memMB = readFootprintMB()
             limitMB = readLimitMB(footprintMB: memMB)
+            // The present counter answers "did a frame ever reach the screen",
+            // and it only lived on the HUD -- which switches to its compact
+            // form (FPS only) exactly when a title starts drawing, so the
+            // number is gone at the moment it matters, and a run that renders
+            // nothing is indistinguishable from one that renders black. Put it
+            // in the log too: every 2s, and only when it changes or is still
+            // zero, so a steady run costs one line and a dead one is obvious.
+            logTicks += 1
+            if logTicks % 8 == 0 {
+                let c = presentCount
+                if c != lastLoggedPresent || c == 0 {
+                    LogStore.shared.log("[present] count=\(c) fps=\(String(format: "%.1f", fps)) mem=\(memMB)/\(limitMB)MB",
+                                        level: c == 0 ? .debug : .info)
+                    lastLoggedPresent = c
+                }
+            }
         }
     }
 

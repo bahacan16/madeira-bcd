@@ -1557,11 +1557,17 @@ struct ContentView: View {
     }
 
     private func runTriangleTest() {
-        logStore.log("D3D11 triangle test: full sequence", level: .info)
-        // Reuse the existing full Wine sequence but target triangle.exe.
-        // WineProcessBridge has the program baked in for now — to flip it
-        // requires a signature change. For this iteration we rely on the
-        // build's WineProcessBridge.m pointing at triangle.exe.
+        // This used to set nothing and rely on WineProcessBridge's built-in
+        // default, with a comment claiming that default was triangle.exe. It
+        // is cube.exe, and the button depended on no earlier press having left
+        // MADEIRA_EXE, MADEIRA_ARGS or MADEIRA_DESKTOP set -- press Wine
+        // Virtual Desktop first and this button would have relaunched
+        // explorer.exe under a desktop while reporting a cube test. Say what
+        // it runs, and clear what it does not want, like every other button.
+        logStore.log("arm64 DX11 cube: full sequence", level: .info)
+        setenv("MADEIRA_EXE", "cube.exe", 1)
+        unsetenv("MADEIRA_ARGS")
+        unsetenv("MADEIRA_DESKTOP")
         runWineFullSequence()
     }
 
