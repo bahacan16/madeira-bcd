@@ -823,6 +823,15 @@ jobs:
           fi
           echo "binary: $BIN"
           xcrun dyld_info -exports "$BIN" > exports.txt 2>&1
+          # Show that the tool produced a listing at all. Reading "MISS" off an
+          # exports.txt that actually holds an error message would look exactly
+          # like a stripped symbol, and the whole point of this step is to tell
+          # those two apart.
+          echo "-- dyld_info output: $(wc -l < exports.txt | tr -d ' ') lines --"
+          head -5 exports.txt
+          echo "-- are the definitions even in the binary? (nm) --"
+          nm -gU "$BIN" 2>&1 | grep -i "macdrv\|win_data" | head -10 \
+            || echo "  (nm finds no macdrv symbol -- they are not in the binary at all)"
           echo "-- every macdrv symbol in the export trie --"
           grep -i "macdrv\|win_data" exports.txt | head -20
           MISSING=""
