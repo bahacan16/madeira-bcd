@@ -33,12 +33,14 @@ struct EntitlementStatus {
     let jitAllowed: Bool
     let increasedMemory: Bool
     let extendedVA: Bool
+    let increasedDebugMemory: Bool
 
     static func check() -> EntitlementStatus {
         EntitlementStatus(
             jitAllowed: checkAppEntitlement("com.apple.security.cs.allow-jit"),
             increasedMemory: checkAppEntitlement("com.apple.developer.kernel.increased-memory-limit"),
-            extendedVA: checkAppEntitlement("com.apple.developer.kernel.extended-virtual-addressing")
+            extendedVA: checkAppEntitlement("com.apple.developer.kernel.extended-virtual-addressing"),
+            increasedDebugMemory: checkAppEntitlement("com.apple.developer.kernel.increased-debugging-memory-limit")
         )
     }
 }

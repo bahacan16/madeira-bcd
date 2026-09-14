@@ -1123,9 +1123,14 @@ struct ContentView: View {
     private func logEntitlementStatus() {
         guard let ents = entitlements else { return }
         logStore.log("Checking entitlements...")
-        logStore.log("  allow-jit: \(ents.jitAllowed)", level: ents.jitAllowed ? .success : .error)
+        // allow-jit is a macOS entitlement and is never granted on iOS, so
+        // false is the expected reading -- logging it as an error made a
+        // healthy run look broken. What JIT actually rides on is
+        // get-task-allow -> CS_DEBUGGED, which the JIT badge now reports.
+        logStore.log("  allow-jit: \(ents.jitAllowed) (macOS-only, inert on iOS)", level: .debug)
         logStore.log("  increased-memory-limit: \(ents.increasedMemory)", level: ents.increasedMemory ? .success : .debug)
         logStore.log("  extended-virtual-addressing: \(ents.extendedVA)", level: ents.extendedVA ? .success : .debug)
+        logStore.log("  increased-debugging-memory-limit: \(ents.increasedDebugMemory)", level: ents.increasedDebugMemory ? .success : .debug)
         if !ents.extendedVA {
             logStore.log("  Tip: Use GetMoreRam to inject extended-virtual-addressing", level: .info)
         }

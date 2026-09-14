@@ -2,7 +2,20 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Present only because the signing tool injects the profile's
+	     entitlements: the app never asked for it, so it worked by accident
+	     and would vanish if that tool changed. Ask for it. -->
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<!-- Raises the jetsam cap further, for development-signed builds only.
+	     The provisioning profile in use authorises it (and get-task-allow,
+	     which is the condition it is honoured under), so asking costs
+	     nothing; an entitlement the profile did NOT carry would stop the
+	     app launching. Whether it actually moves the cap is readable off
+	     the HUD: the ceiling there is measured, not assumed. -->
+	<key>com.apple.developer.kernel.increased-debugging-memory-limit</key>
 	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
