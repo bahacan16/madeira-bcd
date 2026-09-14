@@ -1774,11 +1774,32 @@ struct ContentView: View {
     /// Full sequence: allocate JIT pool, start wineserver, start Wine.
     /// Debugger stays attached during PE loading so mprotect_exec can use BRK
     /// to prepare code pages. Detach happens after Wine finishes + recovery.
+    // The JIT pool can only be placed once per launch. StikJITHelper's own
+    // ml596 note says so: the guest window the second pool needs is already
+    // held by the first, the kernel hands back the same address every time,
+    // so "the three retries are three identical attempts" and allocatePool
+    // gives up -- then kills the app ten seconds later.
+    //
+    // Ten seconds is long enough that the death lands nowhere near the button
+    // that caused it, so starting a second game after the desktop reads as
+    // "the app crashed at random" rather than "one Wine session per launch".
+    // It cost a debugging session to find that out from a log. Refuse at the
+    // button, immediately, and say what to do instead.
+    private static var wineSequenceStarted = false
+
     private func runWineFullSequence() {
         guard jit_check_debugged() else {
             logStore.log("JIT not enabled. Press 'Enable JIT' first.", level: .error)
             return
         }
+        if Self.wineSequenceStarted {
+            logStore.log("A Wine session already ran in this launch, and the JIT pool can only "
+                       + "be placed once -- a second one would abort and kill the app 10s later. "
+                       + "Quit Madeira, relaunch it, enable JIT, and start this one first.",
+                         level: .error)
+            return
+        }
+        Self.wineSequenceStarted = true
 
         logStore.log("Running full Wine sequence...")
 
