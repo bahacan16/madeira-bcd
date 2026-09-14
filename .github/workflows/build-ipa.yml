@@ -517,8 +517,8 @@ jobs:
             -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
             -DFEX_IOS_HOST_BUILD=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_C_FLAGS="-DFEX_IOS_HOST" \
-            -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST" \
+            -DCMAKE_C_FLAGS="-DFEX_IOS_HOST -ffixed-x18" \
+            -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST -ffixed-x18" \
             -DBUILD_TESTING=OFF -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF \
             -DBUILD_FEXCONFIG=OFF -DBUILD_THUNKS=OFF \
             -DTUNE_CPU=generic -DTUNE_ARCH=generic \
@@ -546,6 +546,7 @@ jobs:
           else
             DLL=$(find "$GITHUB_WORKSPACE/FEX/build-arm64ec" -name "libarm64ecfex.dll" | head -1)
             SHIPPED=app/Madeira/arm64ec-windows/xtajit64.dll
+            cp "$SHIPPED" "$GITHUB_WORKSPACE/committed-xtajit64.dll"
             if [ -n "$DLL" ]; then
               echo "::notice::arm64ecfex BUILT :: $(wc -c < "$DLL" | tr -d ' ') bytes -- committed xtajit64.dll is $(wc -c < "$SHIPPED" | tr -d ' ')"
               # Ship ours. The committed DLL stays in git untouched -- this only
@@ -554,6 +555,14 @@ jobs:
               cp "$DLL" "$SHIPPED"
               echo "::notice::xtajit64.dll REPLACED with our build ($(wc -c < "$SHIPPED" | tr -d ' ') bytes)"
               python3 tools/check-pe-align.py "$SHIPPED"
+              # x18 is reserved on iOS, so virtual_ios.c rewrites every
+              # instruction naming it into a trampoline that reads the TEB from
+              # TPIDR_EL0. Our build dies inside one of those (tramp+0x64c);
+              # the committed DLL never enters one, though it contains 115 such
+              # instructions itself. -ffixed-x18 should take ours to zero and
+              # remove the path entirely. Print both so the claim is measured.
+              python3 tools/count-x18.py "$SHIPPED" "$GITHUB_WORKSPACE/committed-xtajit64.dll" 2>/dev/null \
+                || python3 tools/count-x18.py "$SHIPPED"
             else
               echo "::error::build reported success but no libarm64ecfex.dll was produced -- keeping the committed xtajit64.dll"
             fi
