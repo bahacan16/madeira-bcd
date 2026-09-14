@@ -1157,6 +1157,53 @@ void ios_reclaim_pages_report( const char *when, unsigned long long fault_addr )
                  (ios_rr_pages[i] >= 0x7C00000000ULL && ios_rr_pages[i] < 0x8000000000ULL) ? "  <== FEX heap" : "" );
 }
 
+/* iOS-Madeira: name the JIT block when a fault PC lands in block metadata.
+ *
+ * FEXCore appends a JITCodeTail to every block it compiles, and the guest-RIP
+ * reconstruction table immediately after it (JIT.cpp ~1178):
+ *
+ *   struct JITCodeTail {              // sizeof == 40 == 0x28
+ *       size_t   Size;                // +0   whole block, [BlockBegin, +Size)
+ *       uint64_t RIP;                 // +8   guest RIP this block came from
+ *       size_t   GuestSize;           // +16  how much x86 it covers
+ *       uint32_t NumberOfRIPEntries;  // +24
+ *       uint32_t OffsetToRIPEntries;  // +28  == sizeof(JITCodeTail) == 0x28
+ *       uint32_t SpinLockFutex;       // +32
+ *       uint8_t  SingleInst, _Pad[3]; // +36
+ *   };                                // +40  vl64pair RIP entries start here
+ *
+ * The x64 cube's c000001d printed
+ *
+ *   insn_stream PC-12..PC+8: 00000028 00000000 00000001 [05800180] d503201f d503201f
+ *
+ * which is that struct's last three fields -- OffsetToRIPEntries == 0x28, an
+ * unheld futex, SingleInst == 1 -- followed by the first vl64pair entry. So the
+ * branch did not land in unwritten memory: it landed exactly on a block's RIP
+ * table, PC == tail + 0x28, and vl64pair data does not decode as AArch64. The
+ * NOPs after it are the block's end padding, not prefill.
+ *
+ * tail = PC - 0x28 therefore names the block, which is the question the fault
+ * itself cannot answer: which guest code was this, and how far along. Gated on
+ * the OffsetToRIPEntries signature so a coincidental hex pattern is not
+ * reported as a block, and on the tail not crossing below the page whose
+ * mapping the caller already proved by reading PC-12. */
+static void ios_probe_jit_block_tail( const void *pc )
+{
+    const uint32_t *w = (const uint32_t *)pc;
+    const uint64_t *t;
+
+    if (((uintptr_t)pc & 0xfff) < 0x28) return;  /* tail crosses into a page we have not proven mapped */
+    if (w[-3] != 0x28) return;                   /* not OffsetToRIPEntries -- not a tail */
+
+    t = (const uint64_t *)((const char *)pc - 0x28);
+    dprintf( STDERR_FILENO,
+             "[jit-tail] PC is a JIT block's RIP-entry table -- tail=%p guest_rip=0x%llx "
+             "block_size=%llu guest_size=%llu rip_entries=%u single_inst=%u\n",
+             (const void *)t,
+             (unsigned long long)t[1], (unsigned long long)t[0], (unsigned long long)t[2],
+             (unsigned)((const uint32_t *)t)[6], (unsigned)(((const uint32_t *)t)[9] & 0xff) );
+}
+
 /* ml369 (#63): defined after setup_exception (needs save_context and
  * struct exc_stack_layout); used by the exception loop below. */
 static int ios_mach_deliver_guest_exception( thread_t thread, arm_thread_state64_t *state,
@@ -4278,6 +4325,7 @@ skip_reclaim_band: ;
                         uint32_t *p = (uint32_t*)(uintptr_t)fault_pc;
                         dprintf(STDERR_FILENO, "[mach_exc] insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                             p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                        ios_probe_jit_block_tail( (const void *)p );
                     }
                     /* iOS-Madeira: symbolize pc/lr via dladdr — works for
                      * dyld-cache addresses in-process. Names the native
@@ -8425,6 +8473,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                 }
                 ERR("  insn_stream PC-12..PC+8: %08x %08x %08x [%08x] %08x %08x %08x\n",
                     p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
+                ios_probe_jit_block_tail( (const void *)p );
             }
             else
                 ERR("  insn=<unmappable PC, skipping read>\n");
