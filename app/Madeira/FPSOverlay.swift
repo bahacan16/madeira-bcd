@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import QuartzCore
+import os
 
 /// Keeps the ProMotion panel promoted to 120Hz while MAX mode is on.
 /// CAMetalLayer presents alone don't express frame-rate intent — iOS
@@ -59,11 +60,26 @@ struct FPSOverlay: View {
     /// ml606: live phys_footprint in MB, refreshed on the 250ms display tick.
     @State private var memMB: Int = 0
 
-    /// iOS jetsams this app at EXACTLY 4096MB of phys_footprint (memory:
-    /// "Jetsam = EXACTLY 4096MB"). task_info(TASK_VM_INFO) reports the very
-    /// same counter the kernel judges us on, so this is the real number and
-    /// not an approximation from resident size.
-    private static let jetsamLimitMB = 4096
+    /// The ceiling jetsam enforces ON THIS DEVICE, measured rather than
+    /// assumed. 4096 was written down from one machine ("Jetsam = EXACTLY
+    /// 4096MB"), but iOS grants the increased-memory-limit allowance per
+    /// device class, so on other hardware that constant is simply wrong --
+    /// and a wrong ceiling misplaces every colour threshold below. Too low
+    /// is merely pessimistic; too high is dangerous, because the bar would
+    /// still read green while the app is about to be killed without warning
+    /// (ml605 died at 4080MB with nothing in the log).
+    ///
+    /// os_proc_available_memory() reports the bytes left before that kill,
+    /// against the same phys_footprint counter readFootprintMB() reads, so
+    /// footprint + available IS the limit. 4096 stays as the fallback for
+    /// when the call reports nothing.
+    @State private var limitMB: Int = 4096
+
+    private func readLimitMB(footprintMB: Int) -> Int {
+        let avail = os_proc_available_memory()
+        guard avail > 0 else { return limitMB }
+        return footprintMB + Int(avail / (1024 * 1024))
+    }
 
     private func readFootprintMB() -> Int {
         var info = task_vm_info_data_t()
@@ -80,7 +96,7 @@ struct FPSOverlay: View {
     /// Headroom-based, because the absolute number means nothing without the
     /// ceiling: green >768MB free, yellow >384MB, orange >128MB, red below.
     private var memColor: Color {
-        let free = Self.jetsamLimitMB - memMB
+        let free = limitMB - memMB
         if memMB == 0 { return .secondary }
         if free > 768 { return .green }
         if free > 384 { return .yellow }
@@ -106,9 +122,9 @@ struct FPSOverlay: View {
                     // ml605 died at 4080MB against a 4096MB limit with no warning
                     // of any kind in the log, so having it on screen turns "it
                     // vanished" into "we watched it climb".
-                    Text("\(memMB)MB")
+                    Text("\(memMB)/\(limitMB)MB")
                         .foregroundColor(memColor)
-                        .frame(width: 56, alignment: .trailing)
+                        .frame(width: 92, alignment: .trailing)
                     Text("|")
                         .foregroundColor(.secondary)
                     Text("Present:")
@@ -205,11 +221,13 @@ struct FPSOverlay: View {
 
         // 250ms display refresh — computes adaptive-window FPS
         memMB = readFootprintMB()
+        limitMB = readLimitMB(footprintMB: memMB)
         displayTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
             fps = computeAdaptiveFPS()
             // ml606: piggybacks on the existing tick, so it costs one extra
             // task_info per 250ms and no additional SwiftUI invalidation.
             memMB = readFootprintMB()
+            limitMB = readLimitMB(footprintMB: memMB)
         }
     }
 
