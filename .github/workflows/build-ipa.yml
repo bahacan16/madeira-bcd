@@ -305,14 +305,53 @@ jobs:
       - name: Build win32u-unix
         run: bash build/win32u-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/win32u.log"; exit ${PIPESTATUS[0]}
 
+      - name: Restore llvm-mingw
+        id: mingwcache
+        uses: actions/cache/restore@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          key: llvm-mingw-20260421-ucrt-macos-universal
+
       - name: Install ninja/meson and fetch llvm-mingw
         shell: bash
         run: |
           brew install ninja meson
           mkdir -p toolchains
-          curl -L https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
-            | tar -xJ -C toolchains/ || echo "::error::llvm-mingw download failed"
+          MINGW=toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          if [ -x "$MINGW/bin/arm64ec-w64-mingw32-clang++" ]; then
+            echo "::notice::llvm-mingw restored from cache"
+            echo "MINGW_OK=1" >> "$GITHUB_ENV"
+          else
+            # Piping curl into tar hid a failed download. Run 71 received 92
+            # bytes of error page, tar said "Unrecognized archive format", the
+            # step exited 0, and the IPA shipped the committed xtajit64.dll
+            # instead of ours -- with the job green throughout. Download to a
+            # file, retry, and check what arrived before unpacking.
+            URL=https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz
+            for try in 1 2 3; do
+              curl -fL --retry 3 --retry-delay 5 -o /tmp/mingw.tar.xz "$URL" && break
+              echo "download attempt $try failed"
+              sleep $((try * 5))
+            done
+            SZ=$(wc -c < /tmp/mingw.tar.xz 2>/dev/null || echo 0)
+            echo "downloaded $SZ bytes"
+            if [ "$SZ" -lt 10000000 ]; then
+              echo "::error::llvm-mingw download failed -- $SZ bytes is not an archive; \
+          the IPA will carry the COMMITTED xtajit64.dll, not the one we build"
+            else
+              tar -xJf /tmp/mingw.tar.xz -C toolchains/
+              echo "::notice::llvm-mingw unpacked ($SZ bytes)"
+              echo "MINGW_OK=1" >> "$GITHUB_ENV"
+            fi
+          fi
           ls toolchains/
+
+      - name: Save llvm-mingw
+        if: env.MINGW_OK == '1' && steps.mingwcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          key: llvm-mingw-20260421-ucrt-macos-universal
 
       # The Xcode project links 7 archives out of FEX/build-ios/ -- FEXCore,
       # FEXCore_Base, JemallocLibs plus the External deps. Nothing built them
