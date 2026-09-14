@@ -1190,18 +1190,43 @@ void ios_reclaim_pages_report( const char *when, unsigned long long fault_addr )
 static void ios_probe_jit_block_tail( const void *pc )
 {
     const uint32_t *w = (const uint32_t *)pc;
-    const uint64_t *t;
+    int i;
 
-    if (((uintptr_t)pc & 0xfff) < 0x28) return;  /* tail crosses into a page we have not proven mapped */
-    if (w[-3] != 0x28) return;                   /* not OffsetToRIPEntries -- not a tail */
+    /* The PC can land anywhere in the tail, not just on the RIP-entry table.
+     * The first version only checked PC-12 and stayed silent on the very fault
+     * it was written for, which landed 16 bytes earlier, on NumberOfRIPEntries:
+     *
+     *   00000071 0000000e 00000000 [00000005] 00000028 00000000 00000000
+     *                                          ^^^^^^^^ OffsetToRIPEntries
+     *
+     * So scan a window around the PC for the OffsetToRIPEntries signature and
+     * derive the tail from wherever it sits. Two extra fields have to be sane
+     * before anything is reported, since 0x28 on its own is a common word. */
+    for (i = -8; i <= 8; i++)
+    {
+        const char *cand;
+        const uint64_t *t;
+        unsigned long long size, rip;
 
-    t = (const uint64_t *)((const char *)pc - 0x28);
-    dprintf( STDERR_FILENO,
-             "[jit-tail] PC is a JIT block's RIP-entry table -- tail=%p guest_rip=0x%llx "
-             "block_size=%llu guest_size=%llu rip_entries=%u single_inst=%u\n",
-             (const void *)t,
-             (unsigned long long)t[1], (unsigned long long)t[0], (unsigned long long)t[2],
-             (unsigned)((const uint32_t *)t)[6], (unsigned)(((const uint32_t *)t)[9] & 0xff) );
+        if (w[i] != 0x28) continue;                 /* not OffsetToRIPEntries */
+
+        cand = (const char *)(w + i) - 28;          /* tail start */
+        if (((uintptr_t)cand & 0xfff) > 0xfc0) continue;   /* fields would cross a page */
+        t = (const uint64_t *)cand;
+
+        size = (unsigned long long)t[0];
+        rip = (unsigned long long)t[1];
+        if (!size || size > 0x100000) continue;     /* JIT blocks are not this big */
+        if (!rip) continue;                         /* every block records its guest RIP */
+
+        dprintf( STDERR_FILENO,
+                 "[jit-tail] PC is inside a JIT block's tail (PC = tail+%d) -- tail=%p "
+                 "guest_rip=0x%llx block_size=%llu guest_size=%llu rip_entries=%u single_inst=%u\n",
+                 (int)((const char *)pc - cand), (const void *)t, rip, size,
+                 (unsigned long long)t[2], (unsigned)((const uint32_t *)t)[6],
+                 (unsigned)(((const uint32_t *)t)[9] & 0xff) );
+        return;
+    }
 }
 
 /* ml369 (#63): defined after setup_exception (needs save_context and
