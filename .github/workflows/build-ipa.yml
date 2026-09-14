@@ -516,8 +516,6 @@ jobs:
             else
               echo "::error::build reported success but no libarm64ecfex.dll was produced -- keeping the committed xtajit64.dll"
             fi
-          else
-            echo "::warning::arm64ec build failed -- keeping the committed xtajit64.dll, the IPA is still usable"
           fi
           exit 0
 
