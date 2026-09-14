@@ -434,6 +434,14 @@ bool jit_check_debugged(void) {
     return debugged;
 }
 
+// Same check without the log line, for callers that poll (the JIT badge
+// re-reads this every 2s and jit_check_debugged would flood the log).
+bool jit_is_debugged_quiet(void) {
+    uint32_t flags = 0;
+    if (csops(getpid(), CS_OPS_STATUS, &flags, sizeof(flags)) != 0) return false;
+    return (flags & CS_DEBUGGED) != 0;
+}
+
 bool jit_test_mapping(void) {
     jit_log("=== JIT Mapping Test (non-executing) ===");
 

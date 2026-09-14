@@ -49,6 +49,17 @@ struct EntitlementStatus {
  * ENTITLEMENT is macOS-only and never granted on iOS, so the old badge
  * built on it was permanently ✗ no matter what StikDebug did. */
 func isDebuggerAttached() -> Bool {
+    // CS_DEBUGGED first, because that is what JIT actually rides on.
+    // StikDebug attaches, sets CS_DEBUGGED, and then DETACHES; P_TRACED
+    // goes back to false at that moment while CS_DEBUGGED persists, and
+    // CS_DEBUGGED is the flag the kernel consults before allowing an RX
+    // mapping. Asking P_TRACED alone made the badge sit orange through a
+    // run where JIT was demonstrably working -- the 896MB pool allocated,
+    // Wine up, desktop drawing -- which is worse than no badge, since it
+    // says "broken" about the one thing the user came to check.
+    if jit_is_debugged_quiet() { return true }
+    // Keep P_TRACED as the second term: it is true during the brief window
+    // while the debugger is still attached, before CS_DEBUGGED is set.
     var info = kinfo_proc()
     var size = MemoryLayout<kinfo_proc>.stride
     var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()]

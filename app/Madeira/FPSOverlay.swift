@@ -122,7 +122,12 @@ struct FPSOverlay: View {
                     // ml605 died at 4080MB against a 4096MB limit with no warning
                     // of any kind in the log, so having it on screen turns "it
                     // vanished" into "we watched it climb".
-                    Text("\(memMB)/\(limitMB)MB")
+                    // verbatim: SwiftUI's Text("\(Int)") goes through
+                    // LocalizedStringKey, which applies the locale's grouping
+                    // separator -- a 6655MB ceiling rendered as "6.655MB" on a
+                    // Turkish device, i.e. it reads as 6.6MB, the opposite of
+                    // the headroom it is reporting.
+                    Text(verbatim: "\(memMB)/\(limitMB)MB")
                         .foregroundColor(memColor)
                         .frame(width: 92, alignment: .trailing)
                     Text("|")
