@@ -442,6 +442,77 @@ jobs:
           path: FEX/build-ios
           key: fex-ios-053c385-v1
 
+      # xtajit64.dll is the x86-64 emulator, and it is the one binary in this
+      # stack nobody builds: it ships committed under arm64ec-windows/. The
+      # arm64 cube renders now, so the graphics path is proven -- but the x64
+      # cube still dies with c000001d, the JIT branching 0x2024 bytes past its
+      # own emitted code into data. That bug lives inside this DLL, so while it
+      # stays prebuilt the fault can be observed and never fixed.
+      #
+      # FEX can build it: the arm64ecfex target, FEX_IOS_HOST_BUILD for the
+      # link rules and -DFEX_IOS_HOST for the ~100 iOS blocks in FEXCore. The
+      # CMakeLists comment says this path was taken on a macOS host with
+      # llvm-mingw 22.1.4, which is what this runner already fetches.
+      #
+      # This step only answers "does it build". It does not replace the shipped
+      # DLL, and it cannot fail the job -- the IPA that renders is worth more
+      # than this experiment until the experiment works.
+      - name: "Try building xtajit64.dll (arm64ecfex) -- experiment, non-fatal"
+        shell: bash
+        run: |
+          set +e
+          MINGW=$(find "$GITHUB_WORKSPACE/toolchains" -maxdepth 1 -type d -name "llvm-mingw-*" | head -1)
+          if [ -z "$MINGW" ]; then
+            echo "::warning::llvm-mingw not unpacked -- skipping the arm64ec experiment"
+            exit 0
+          fi
+          echo "llvm-mingw: $MINGW"
+          export PATH="$MINGW/bin:$PATH"
+          echo "-- is there an arm64ec compiler? --"
+          ls "$MINGW/bin" | grep -i "^arm64ec" | head -10 \
+            || echo "  (no arm64ec-prefixed tools -- this toolchain may not support it)"
+          command -v arm64ec-w64-mingw32-clang++ || echo "  arm64ec-w64-mingw32-clang++ NOT on PATH"
+
+          cmake -S "$GITHUB_WORKSPACE/FEX" -B "$GITHUB_WORKSPACE/FEX/build-arm64ec" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/FEX/Data/CMake/toolchain_mingw.cmake" \
+            -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+            -DFEX_IOS_HOST_BUILD=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-DFEX_IOS_HOST" \
+            -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST" \
+            -DBUILD_TESTING=OFF -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF \
+            -DBUILD_FEXCONFIG=OFF -DBUILD_THUNKS=OFF \
+            -DTUNE_CPU=generic -DTUNE_ARCH=generic \
+            > "$GITHUB_WORKSPACE/arm64ec-cfg.log" 2>&1
+          cfg=$?
+          echo "configure exit=$cfg"
+          if [ "$cfg" -ne 0 ]; then
+            T=$(tail -n 30 "$GITHUB_WORKSPACE/arm64ec-cfg.log" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::arm64ec CONFIGURE failed :: $T"
+            exit 0
+          fi
+
+          cmake --build "$GITHUB_WORKSPACE/FEX/build-arm64ec" --target arm64ecfex \
+            -j"$(sysctl -n hw.ncpu)" > "$GITHUB_WORKSPACE/arm64ec-build.log" 2>&1
+          bld=$?
+          echo "build exit=$bld"
+          echo "-- what came out --"
+          find "$GITHUB_WORKSPACE/FEX/build-arm64ec" -name "*arm64ecfex*" -o -name "*.dll" \
+            | head -10 | sed "s|$GITHUB_WORKSPACE/||"
+          if [ "$bld" -ne 0 ]; then
+            E=$(grep -E "error:|FAILED:" "$GITHUB_WORKSPACE/arm64ec-build.log" | head -8 \
+                 | cut -c1-220 | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")
+            echo "::error::arm64ec BUILD failed :: $E"
+          else
+            DLL=$(find "$GITHUB_WORKSPACE/FEX/build-arm64ec" -name "libarm64ecfex.dll" | head -1)
+            if [ -n "$DLL" ]; then
+              echo "::notice::arm64ecfex BUILT :: $(wc -c < "$DLL" | tr -d ' ') bytes -- shipped xtajit64.dll is $(wc -c < app/Madeira/arm64ec-windows/xtajit64.dll | tr -d ' ')"
+            else
+              echo "::error::build reported success but no libarm64ecfex.dll was produced"
+            fi
+          fi
+          exit 0
+
       - name: Restore LLVM 15.0.7 iOS build
         id: llvmcache
         uses: actions/cache/restore@v4
