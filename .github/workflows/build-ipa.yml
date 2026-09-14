@@ -851,6 +851,11 @@ jobs:
           done
           if [ -n "$MISSING" ]; then
             echo "::error::main binary does not export ::$MISSING -- DXMT's dlsym will fail and every D3D11 title renders black"
+            # Was a warning while the cause was unknown. Now that a build with
+            # all six renders, shipping one without them is a regression, and
+            # its only symptom is a black screen that says nothing -- three
+            # days were spent reaching that conclusion once.
+            exit 1
           else
             echo "::notice::all six macdrv symbols are exported"
           fi
