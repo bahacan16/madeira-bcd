@@ -522,6 +522,7 @@ jobs:
             -DBUILD_TESTING=OFF -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF \
             -DBUILD_FEXCONFIG=OFF -DBUILD_THUNKS=OFF \
             -DTUNE_CPU=generic -DTUNE_ARCH=generic \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--section-alignment=0x4000" \
             > "$GITHUB_WORKSPACE/arm64ec-cfg.log" 2>&1
           cfg=$?
           echo "configure exit=$cfg"
@@ -552,6 +553,7 @@ jobs:
               # and a failed build below still falls back to the committed one.
               cp "$DLL" "$SHIPPED"
               echo "::notice::xtajit64.dll REPLACED with our build ($(wc -c < "$SHIPPED" | tr -d ' ') bytes)"
+              python3 tools/check-pe-align.py "$SHIPPED"
             else
               echo "::error::build reported success but no libarm64ecfex.dll was produced -- keeping the committed xtajit64.dll"
             fi
