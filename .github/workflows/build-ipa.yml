@@ -457,7 +457,7 @@ jobs:
       # This step only answers "does it build". It does not replace the shipped
       # DLL, and it cannot fail the job -- the IPA that renders is worth more
       # than this experiment until the experiment works.
-      - name: "Try building xtajit64.dll (arm64ecfex) -- experiment, non-fatal"
+      - name: "Build xtajit64.dll (arm64ecfex) and ship ours"
         shell: bash
         run: |
           set +e
@@ -505,11 +505,19 @@ jobs:
             echo "::error::arm64ec BUILD failed :: $E"
           else
             DLL=$(find "$GITHUB_WORKSPACE/FEX/build-arm64ec" -name "libarm64ecfex.dll" | head -1)
+            SHIPPED=app/Madeira/arm64ec-windows/xtajit64.dll
             if [ -n "$DLL" ]; then
-              echo "::notice::arm64ecfex BUILT :: $(wc -c < "$DLL" | tr -d ' ') bytes -- shipped xtajit64.dll is $(wc -c < app/Madeira/arm64ec-windows/xtajit64.dll | tr -d ' ')"
+              echo "::notice::arm64ecfex BUILT :: $(wc -c < "$DLL" | tr -d ' ') bytes -- committed xtajit64.dll is $(wc -c < "$SHIPPED" | tr -d ' ')"
+              # Ship ours. The committed DLL stays in git untouched -- this only
+              # replaces it in the workspace, so reverting is deleting one line,
+              # and a failed build below still falls back to the committed one.
+              cp "$DLL" "$SHIPPED"
+              echo "::notice::xtajit64.dll REPLACED with our build ($(wc -c < "$SHIPPED" | tr -d ' ') bytes)"
             else
-              echo "::error::build reported success but no libarm64ecfex.dll was produced"
+              echo "::error::build reported success but no libarm64ecfex.dll was produced -- keeping the committed xtajit64.dll"
             fi
+          else
+            echo "::warning::arm64ec build failed -- keeping the committed xtajit64.dll, the IPA is still usable"
           fi
           exit 0
 
