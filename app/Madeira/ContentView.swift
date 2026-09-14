@@ -1483,6 +1483,39 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.pink)
 
+                // Every game so far needed its own hard-coded button, so trying
+                // anything new meant a rebuild. The exe path is just a string;
+                // read it from Documents the way the pool size, the W^X switch
+                // and Stray's args already are, and any title can be tried
+                // between runs with no build at all. Args come from the same
+                // madeira-args.txt those buttons use.
+                Button("Custom exe (madeira-exe.txt)") {
+                    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                    let exe = docs
+                        .flatMap { try? String(contentsOf: $0.appendingPathComponent("madeira-exe.txt"), encoding: .utf8) }?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    guard !exe.isEmpty else {
+                        logStore.log("No Documents/madeira-exe.txt -- put the Windows path of the .exe in it, "
+                                   + "e.g. C:\\Program Files\\Crysis\\Bin64\\Crysis64.exe", level: .error)
+                        return
+                    }
+                    setenv("MADEIRA_EXE", exe, 1)
+                    let args = docs
+                        .flatMap { try? String(contentsOf: $0.appendingPathComponent("madeira-args.txt"), encoding: .utf8) }?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if args.isEmpty {
+                        unsetenv("MADEIRA_ARGS")
+                    } else {
+                        setenv("MADEIRA_ARGS", args, 1)
+                    }
+                    unsetenv("MADEIRA_DESKTOP")
+                    logStore.log("Custom: exe = \(exe)")
+                    logStore.log("Custom: args = \(args.isEmpty ? "(none)" : args)")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+
                 Button("x64 DX11 cube") {
                     setenv("MADEIRA_EXE", "cube-x64.exe", 1)
                     unsetenv("MADEIRA_ARGS")
