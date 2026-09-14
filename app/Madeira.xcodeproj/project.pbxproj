@@ -430,6 +430,10 @@
 					"$(SRCROOT)/Madeira",
 				);
 				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-Wl,-export_dynamic",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.mythicemu;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -481,6 +485,10 @@
 					"$(SRCROOT)/Madeira",
 				);
 				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-Wl,-export_dynamic",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.mythicemu;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
