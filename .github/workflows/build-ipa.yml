@@ -802,6 +802,45 @@ jobs:
           fi
           exit "$rc"
 
+      # A device run reached DXMT and died there:
+      #   err: Failed to create metal view, it seems like your Wine has no
+      #        exported symbols needed by DXMT.
+      # DXMT resolves the macdrv entry points with dlsym(RTLD_DEFAULT, ...)
+      # against the main binary, so they have to survive into its export trie.
+      # IOSDisplayShim.m marks all six __attribute__((used, visibility("default")))
+      # precisely because they were dead-stripped once before, and its comment
+      # records the check to confirm it -- which was never actually run. Run it.
+      # A binary that ships without these renders a black screen and says
+      # nothing until the log is read, so surface it at build time.
+      - name: Verify the macdrv symbols DXMT resolves at runtime
+        shell: bash
+        run: |
+          set +e
+          BIN=$(find build-out/Madeira.xcarchive -type f -path "*/Madeira.app/Madeira" | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::warning::app binary not found in the archive -- skipping export check"
+            exit 0
+          fi
+          echo "binary: $BIN"
+          xcrun dyld_info -exports "$BIN" > exports.txt 2>&1
+          echo "-- every macdrv symbol in the export trie --"
+          grep -i "macdrv\|win_data" exports.txt | head -20
+          MISSING=""
+          for sym in macdrv_functions get_win_data release_win_data \
+                     macdrv_view_create_metal_view macdrv_view_get_metal_layer \
+                     macdrv_view_release_metal_view; do
+            if grep -qE "_$sym\$" exports.txt; then
+              echo "  OK   $sym"
+            else
+              echo "  MISS $sym"; MISSING="$MISSING $sym"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::main binary does not export ::$MISSING -- DXMT's dlsym will fail and every D3D11 title renders black"
+          else
+            echo "::notice::all six macdrv symbols are exported"
+          fi
+
       - name: Package unsigned IPA
         run: |
           mkdir -p build-out/Payload
