@@ -430,15 +430,8 @@
 					"$(SRCROOT)/Madeira",
 				);
 				MARKETING_VERSION = 0.1.0;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"-Wl,-exported_symbol,_macdrv_functions",
-					"-Wl,-exported_symbol,_get_win_data",
-					"-Wl,-exported_symbol,_release_win_data",
-					"-Wl,-exported_symbol,_macdrv_view_create_metal_view",
-					"-Wl,-exported_symbol,_macdrv_view_get_metal_layer",
-					"-Wl,-exported_symbol,_macdrv_view_release_metal_view",
-				);
+				EXPORTED_SYMBOLS_FILE = "Madeira/madeira-exports.txt";
+				STRIP_INSTALLED_PRODUCT = NO;
 				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.mythicemu;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -490,15 +483,8 @@
 					"$(SRCROOT)/Madeira",
 				);
 				MARKETING_VERSION = 0.1.0;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"-Wl,-exported_symbol,_macdrv_functions",
-					"-Wl,-exported_symbol,_get_win_data",
-					"-Wl,-exported_symbol,_release_win_data",
-					"-Wl,-exported_symbol,_macdrv_view_create_metal_view",
-					"-Wl,-exported_symbol,_macdrv_view_get_metal_layer",
-					"-Wl,-exported_symbol,_macdrv_view_release_metal_view",
-				);
+				EXPORTED_SYMBOLS_FILE = "Madeira/madeira-exports.txt";
+				STRIP_INSTALLED_PRODUCT = NO;
 				PRODUCT_BUNDLE_IDENTIFIER = com.willfaust.mythicemu;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";

@@ -1,0 +1,10 @@
+# Symbols DXMT resolves with dlsym(RTLD_DEFAULT, ...) against the main
+# binary; see IOSDisplayShim.m and winemetal_unix.c's _CreateMetalViewFromHWND.
+# Listing them here is what puts them in the export trie -- which is also
+# what keeps the archive's strip pass from deleting them outright.
+_macdrv_functions
+_get_win_data
+_release_win_data
+_macdrv_view_create_metal_view
+_macdrv_view_get_metal_layer
+_macdrv_view_release_metal_view

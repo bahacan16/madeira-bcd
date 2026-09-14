@@ -829,6 +829,11 @@ jobs:
           # those two apart.
           echo "-- dyld_info output: $(wc -l < exports.txt | tr -d ' ') lines --"
           head -5 exports.txt
+          # Did the setting reach the link at all? Two rounds were lost to
+          # flags that silently never arrived.
+          echo "-- did the linker see the export list? --"
+          grep -c "madeira-exports\|exported_symbol" archive.log 2>/dev/null \
+            | sed "s/^/  archive.log mentions it this many times: /"
           echo "-- are the definitions even in the binary? (nm) --"
           nm -gU "$BIN" 2>&1 | grep -i "macdrv\|win_data" | head -10 \
             || echo "  (nm finds no macdrv symbol -- they are not in the binary at all)"
