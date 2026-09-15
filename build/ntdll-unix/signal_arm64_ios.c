@@ -4337,6 +4337,67 @@ skip_reclaim_band: ;
                             (void*)(uintptr_t)state.__x[10], (void*)(uintptr_t)state.__x[11],
                             (void*)(uintptr_t)state.__x[0], (void*)(uintptr_t)state.__x[2],
                             (void *)thread_teb, peb_p, peb_ecbm);
+
+                        /* ml562: the 2026-09-15 [jit-code] dump identified the block's
+                         * exit exactly -- BranchOps.cpp:82-87, the ARM64EC native path:
+                         *
+                         *   str  x17, [x28,#0xb0]      State.callret_sp
+                         *   mov  sp,  x23              guest RSP
+                         *   movz/movk x9 = 0x71fe7a45d8   EC_CALL_CHECKER_PC_REG
+                         *   ldr  x11, [x28,#0x660]     Pointers.ExitFunctionEC
+                         *   br   x11
+                         *
+                         * `br` is unconditional, so the PC landing 20 bytes past it, on
+                         * the block's own tail+8, can only mean the loaded pointer is
+                         * that address. Read the two function-pointer slots the JIT and
+                         * the dispatcher branch through and say what is in them. */
+                        /* ml563: the decoded block proves x9 must hold 0x71fe7a45d8 and
+                         * sp must equal x23 by the time the br runs -- yet x9=0 and sp is
+                         * a stack no TEB owns. So the tail instructions did not run in the
+                         * order the fall-through story needs, and the host GPRs are the
+                         * only record of what actually did. Print all of them once. */
+                        {
+                            char rl[640]; int rn = 0, ri;
+                            rn += snprintf( rl + rn, sizeof(rl) - rn, "[host-gpr]" );
+                            for (ri = 0; ri <= 30 && rn < (int)sizeof(rl) - 24; ri++)
+                                rn += snprintf( rl + rn, sizeof(rl) - rn, " x%d=%llx", ri,
+                                                (unsigned long long)state.__x[ri] );
+                            dprintf( STDERR_FILENO, "%s sp=%llx lr=%llx\n", rl,
+                                     (unsigned long long)state.__sp, (unsigned long long)state.__lr );
+                        }
+
+                        {
+                            uint64_t st = (uint64_t)state.__x[28];
+                            struct { unsigned off; const char *name; } slots[] = {
+                                { 0x638, "ExitFunctionLink" },
+                                { 0x660, "ExitFunctionEC" },
+                            };
+                            unsigned i;
+                            for (i = 0; i < 2; i++)
+                            {
+                                uint64_t val = 0; uint32_t head[4] = {0,0,0,0};
+                                vm_size_t got = 0;
+                                if (vm_read_overwrite( mach_task_self(), (vm_address_t)(st + slots[i].off),
+                                                       sizeof(val), (vm_address_t)&val, &got ) != KERN_SUCCESS)
+                                {
+                                    dprintf(STDERR_FILENO, "[ec-ptr] [x28+0x%x] %s: SLOT UNREADABLE\n",
+                                            slots[i].off, slots[i].name);
+                                    continue;
+                                }
+                                if (val)
+                                    (void)vm_read_overwrite( mach_task_self(), (vm_address_t)val,
+                                                             sizeof(head), (vm_address_t)head, &got );
+                                dprintf(STDERR_FILENO,
+                                        "[ec-ptr] [x28+0x%x] %s = %p  first4: %08x %08x %08x %08x  %s\n",
+                                        slots[i].off, slots[i].name, (void *)(uintptr_t)val,
+                                        head[0], head[1], head[2], head[3],
+                                        !val                              ? "-- NULL"
+                                        : val == (uint64_t)(uintptr_t)fault_pc
+                                              ? "-- EQUALS THE FAULTING PC: this slot is what branched us here"
+                                        : (head[0] >> 16) == 0            ? "-- target is not ARM64 code (data)"
+                                                                          : "-- looks like real code");
+                            }
+                        }
                     }
                     /* Read instruction at LR-4 to identify the BL/BLR */
                     if (cnt <= 3 && (uintptr_t)state.__lr >= 0x100000000ULL)
@@ -4420,8 +4481,8 @@ skip_reclaim_band: ;
                                                             sizeof(entry), (vm_address_t)&entry, &got ) == KERN_SUCCESS;
                                     dprintf(STDERR_FILENO,
                                             "[dispatch-src] the call target came from x%u = literal @%p -> %s%p "
-                                            "-- this is the dispatcher entering a JIT block, so PC-entry=%lld "
-                                            "bytes is how far the block ran\n",
+                                            "-- dispatcher call site; PC-target=%lld (only meaningful if small; "
+                                            "a huge value means LR is from an earlier call, not this block's entry)\n",
                                             rt, (void *)(uintptr_t)lit_at,
                                             ok ? "" : "<unreadable> ", (void *)(uintptr_t)entry,
                                             (long long)((uint64_t)(uintptr_t)fault_pc - entry));
