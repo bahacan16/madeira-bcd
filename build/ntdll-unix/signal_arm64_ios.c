@@ -1256,6 +1256,76 @@ static void ios_probe_jit_block_tail( const void *pc )
                 n += snprintf( line + n, sizeof(line) - n, " %02x", ripe[k] );
             dprintf( STDERR_FILENO, "%s\n", line );
         }
+
+        /* ml564: this block is an ARM64EC fast-forward sequence and its exit is
+         * BranchOps.cpp:82-87 -- x9 = the FFS jmp target, br Pointers.ExitFunctionEC.
+         * Both pointer slots read back as real code, so the failure is downstream,
+         * inside ExitFunctionEC (Module.S:241). That routine makes exactly one
+         * decision, and it is decidable from here:
+         *
+         *   x9 <- PE->pool via IosAliasEntries          (ios_ec_xlate_loop)
+         *   ldursw x23, [x9, #-4]
+         *   cmp  w23, #0xd63f0200 (`blr x16`)
+         *   beq  ret_sp_aligned                          -> br x9
+         *   and  x23, x23, #-4 ; add x17, x9, x23        -> br x17  (entry thunk)
+         *
+         * The second arm treats whatever sits 4 bytes before the target as a SIGNED
+         * 32-bit offset. Replay it: read the FFS, compute the jmp target, translate
+         * it, and print the word ExitFunctionEC would load and the address it would
+         * branch to. A nonsense word here lands the br anywhere in the 0x38000000
+         * pool band -- which is the size of the jump we are trying to explain. */
+        {
+            extern void *ios_jit_translate_addr( void *addr );
+            unsigned char ffs[16];
+            uint64_t pool_rip = (uint64_t)(uintptr_t)ios_jit_translate_addr( (void *)(uintptr_t)rip );
+            vm_size_t g2 = 0;
+
+            if (pool_rip &&
+                vm_read_overwrite( mach_task_self(), (vm_address_t)pool_rip,
+                                   sizeof(ffs), (vm_address_t)ffs, &g2 ) == KERN_SUCCESS &&
+                ffs[0] == 0x48 && ffs[1] == 0x8b && ffs[2] == 0xc4 &&
+                ffs[3] == 0x48 && ffs[4] == 0x89 && ffs[5] == 0x58 && ffs[6] == 0x20 &&
+                ffs[7] == 0x55 && ffs[8] == 0x5d && ffs[9] == 0xe9)
+            {
+                int32_t rel = (int32_t)((uint32_t)ffs[10] | ((uint32_t)ffs[11] << 8) |
+                                        ((uint32_t)ffs[12] << 16) | ((uint32_t)ffs[13] << 24));
+                uint64_t tgt_pe = rip + 14 + (int64_t)rel;
+                uint64_t tgt_pool = (uint64_t)(uintptr_t)ios_jit_translate_addr( (void *)(uintptr_t)tgt_pe );
+                uint32_t pre_pe = 0, pre_pool = 0;
+                int ok_pe, ok_pool;
+
+                ok_pe = tgt_pe >= 4 &&
+                        vm_read_overwrite( mach_task_self(), (vm_address_t)(tgt_pe - 4),
+                                           sizeof(pre_pe), (vm_address_t)&pre_pe, &g2 ) == KERN_SUCCESS;
+                ok_pool = tgt_pool && tgt_pool >= 4 &&
+                          vm_read_overwrite( mach_task_self(), (vm_address_t)(tgt_pool - 4),
+                                             sizeof(pre_pool), (vm_address_t)&pre_pool, &g2 ) == KERN_SUCCESS;
+
+                dprintf( STDERR_FILENO,
+                         "[ffs] FFS confirmed: jmp rel32=%d -> target PE %p, pool %p%s\n",
+                         (int)rel, (void *)(uintptr_t)tgt_pe, (void *)(uintptr_t)tgt_pool,
+                         (!tgt_pool || tgt_pool == tgt_pe)
+                             ? "  -- NO POOL ALIAS: ios_ec_xlate_loop would MISS and br to PE space"
+                             : "" );
+
+                if (ok_pe || ok_pool)
+                {
+                    uint32_t w = ok_pool ? pre_pool : pre_pe;
+                    int32_t off = (int32_t)w & ~3;
+                    uint64_t base = ok_pool ? tgt_pool : tgt_pe;
+                    dprintf( STDERR_FILENO,
+                             "[ffs] word@target-4: PE=%s%08x pool=%s%08x -- %s\n",
+                             ok_pe ? "" : "?", pre_pe, ok_pool ? "" : "?", pre_pool,
+                             w == 0xd63f0200u
+                                 ? "== `blr x16`: ExitFunctionEC returns to an exit thunk (br x9)"
+                                 : "entry-thunk offset path" );
+                    if (w != 0xd63f0200u)
+                        dprintf( STDERR_FILENO,
+                                 "[ffs] ExitFunctionEC would branch to %p  (target %+d)\n",
+                                 (void *)(uintptr_t)(base + (int64_t)off), (int)off );
+                }
+            }
+        }
         return;
     }
 }
