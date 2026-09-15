@@ -4352,6 +4352,37 @@ skip_reclaim_band: ;
                             p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3]);
                         ios_probe_jit_block_tail( (const void *)p );
                     }
+                    else
+                    {
+                        /* A branch to a bad target leaves nothing to read at the PC,
+                         * so the whole instruction-stream probe above goes silent
+                         * exactly when the fault is most interesting. LR still points
+                         * into the caller, and when that caller is JIT code its block
+                         * tail names the guest RIP we were executing.
+                         *
+                         * The 2026-09-15 cube-x64 run branched to 0 with `blr x2`
+                         * (caller_insn 0xd63f0040) from lr=0x158f742c8, inside a JIT
+                         * code buffer the same log reports as rx=0x158f74000+0x4000.
+                         * Thirteen faults at pc=0 and not one line saying which block
+                         * issued the call. */
+                        uint64_t lr_v = (uint64_t)state.__lr;
+                        if (lr_v >= 0x100000000ULL + 4)
+                        {
+                            uint32_t insn = 0, before[3] = {0, 0, 0};
+                            vm_size_t got = 0;
+                            if (vm_read_overwrite( mach_task_self(), (vm_address_t)(lr_v - 16),
+                                                   sizeof(before), (vm_address_t)before, &got ) == KERN_SUCCESS &&
+                                vm_read_overwrite( mach_task_self(), (vm_address_t)(lr_v - 4),
+                                                   sizeof(insn), (vm_address_t)&insn, &got ) == KERN_SUCCESS)
+                            {
+                                dprintf(STDERR_FILENO,
+                                        "[mach_exc] PC unreadable (0x%llx) -- LR stream LR-16..LR-4: %08x %08x %08x [%08x]\n",
+                                        (unsigned long long)(uintptr_t)fault_pc,
+                                        before[0], before[1], before[2], insn);
+                                ios_probe_jit_block_tail( (const void *)(uintptr_t)(lr_v - 4) );
+                            }
+                        }
+                    }
                     /* iOS-Madeira: symbolize pc/lr via dladdr — works for
                      * dyld-cache addresses in-process. Names the native
                      * subsystem when a fault lands in system frameworks
