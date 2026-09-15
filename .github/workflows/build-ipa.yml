@@ -563,6 +563,8 @@ jobs:
           # real fix has a target. The cost is that a thread cannot be
           # cooperatively suspended mid-block -- acceptable while every x64 run
           # dies in seconds anyway.
+          python3 tools/patch-fex-link-log.py "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
+
           JITCPP="$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
           python3 - "$JITCPP" <<'PYSUSPEND'
           import sys
