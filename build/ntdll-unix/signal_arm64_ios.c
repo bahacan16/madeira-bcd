@@ -1225,6 +1225,37 @@ static void ios_probe_jit_block_tail( const void *pc )
                  (int)((const char *)pc - cand), (const void *)t, rip, size,
                  (unsigned long long)t[2], (unsigned)((const uint32_t *)t)[6],
                  (unsigned)(((const uint32_t *)t)[9] & 0xff) );
+
+        /* ml560: the tail alone cannot say WHY the PC reached it.  Landing in
+         * the tail means the block ran off the end of its own code -- the last
+         * guest instruction emitted no exit.  The 2026-09-15 cube-x64 run ends
+         * a 14-byte ucrtbase block on `e9 rel32`, and the reconstructed RIP is
+         * guest+9, i.e. exactly that jmp.  So print the last 24 host words
+         * before the tail: an exit is `br`/`blr`/`b`, and anything else names
+         * what FEX emitted instead.  Print the RIP-entry bytes too -- the last
+         * vl64pair's HostPCOffset is the host offset FEX recorded for the jmp,
+         * and if it equals the end of the code the jmp emitted nothing. */
+        {
+            const uint32_t *code = (const uint32_t *)cand;
+            const unsigned char *ripe = (const unsigned char *)cand + 40;
+            char line[512];
+            int n = 0, k;
+
+            /* Never walk off the low end of the block's page: the handler
+             * runs on the Mach thread and a fault here would be silent. */
+            if (((uintptr_t)cand & 0x3fff) < 96) return;
+
+            n += snprintf( line + n, sizeof(line) - n, "[jit-code] tail-96..tail-4:" );
+            for (k = -24; k < 0 && n < (int)sizeof(line) - 16; k++)
+                n += snprintf( line + n, sizeof(line) - n, " %08x", code[k] );
+            dprintf( STDERR_FILENO, "%s\n", line );
+
+            n = snprintf( line, sizeof(line), "[jit-ripent] %u entries @tail+40:",
+                          (unsigned)((const uint32_t *)t)[6] );
+            for (k = 0; k < 24 && n < (int)sizeof(line) - 8; k++)
+                n += snprintf( line + n, sizeof(line) - n, " %02x", ripe[k] );
+            dprintf( STDERR_FILENO, "%s\n", line );
+        }
         return;
     }
 }
@@ -4358,13 +4389,48 @@ skip_reclaim_band: ;
                                             : val == 0    ? "-- TABLE ENTRY IS NULL (never filled in)"
                                             : val == (uint64_t)state.__x[2]
                                                           ? "-- table matches x2: the ENTRY is wrong, not the load"
-                                                          : "-- table does NOT match x2: the LOAD is wrong");
+                                                          : "-- differs from the FAULT-TIME x2; x2 may have been "
+                                                            "reused since the load, so this is not proof either way");
+                                }
+                                /* ml561: the 2026-09-15 cube-x64 run showed a different
+                                 * and far more informative shape here:
+                                 *
+                                 *   aa1c03e1  mov x1, x28
+                                 *   d2800003  mov x3, #0
+                                 *   58014184  ldr x4, <literal>
+                                 *   d63f0080  blr x4
+                                 *
+                                 * That is the dispatcher CALLING A JIT BLOCK, with the
+                                 * block's entry address in a PC-relative literal -- not
+                                 * the ExitFunctionLink call at all. LR is then simply
+                                 * where the block was entered from, and the fault is
+                                 * somewhere inside the block. Resolve the literal: it
+                                 * names the block entry, and PC minus that entry says
+                                 * how far the block got before it died. */
+                                else if ((prev[2] & 0xFF000000) == 0x58000000)
+                                {
+                                    unsigned rt = prev[2] & 0x1f;
+                                    int64_t imm19 = (int64_t)((prev[2] >> 5) & 0x7FFFF);
+                                    uint64_t lit_at, entry = 0;
+                                    int ok;
+
+                                    if (imm19 & 0x40000) imm19 -= 0x80000;   /* sign-extend */
+                                    lit_at = (uint64_t)(state.__lr - 8) + (uint64_t)(imm19 * 4);
+                                    ok = vm_read_overwrite( mach_task_self(), (vm_address_t)lit_at,
+                                                            sizeof(entry), (vm_address_t)&entry, &got ) == KERN_SUCCESS;
+                                    dprintf(STDERR_FILENO,
+                                            "[dispatch-src] the call target came from x%u = literal @%p -> %s%p "
+                                            "-- this is the dispatcher entering a JIT block, so PC-entry=%lld "
+                                            "bytes is how far the block ran\n",
+                                            rt, (void *)(uintptr_t)lit_at,
+                                            ok ? "" : "<unreadable> ", (void *)(uintptr_t)entry,
+                                            (long long)((uint64_t)(uintptr_t)fault_pc - entry));
                                 }
                                 else
                                 {
                                     dprintf(STDERR_FILENO,
-                                            "[dispatch-src] insn before the call is not `ldr x?, [x28,#imm]` "
-                                            "(0x%08x) -- dispatcher emit is not the shape Dispatcher.cpp describes\n",
+                                            "[dispatch-src] insn before the call is neither `ldr x?, [x28,#imm]` "
+                                            "nor `ldr x?, <literal>` (0x%08x)\n",
                                             prev[2]);
                                 }
                             }
