@@ -4313,6 +4313,62 @@ skip_reclaim_band: ;
                         uint32_t *lr_p = (uint32_t*)(uintptr_t)(state.__lr - 4);
                         dprintf(STDERR_FILENO, "[mach_exc] caller_insn @lr-4=0x%p: 0x%08x\n",
                             (void*)lr_p, *lr_p);
+
+                        /* iOS-Madeira: the dispatcher reaches its runtime helpers
+                         * through a function-pointer table in the CPU state:
+                         *
+                         *   ldr x2, [x28, #offsetof(CpuStateFrame, Pointers.ExitFunctionLink)]
+                         *   blr x2                      <- Dispatcher.cpp:409-413
+                         *
+                         * and x2 keeps arriving as garbage: 0 on 2026-09-14, a JIT
+                         * block tail's +16 on 2026-09-15, both from this exact site
+                         * (caller_insn 0xd63f0040). Two very different faults look
+                         * identical from here -- the table entry is wrong, or the ldr
+                         * reads the wrong offset -- and Module.cpp already documents
+                         * FEX's emitter producing madd/mul where stp belongs on this
+                         * very dispatcher, so a mis-emitted ldr is not far-fetched.
+                         *
+                         * Decode the preceding instruction. If it is an LDR (unsigned
+                         * immediate) off x28, print both the offset it uses and the
+                         * value actually sitting there. That separates the two in one
+                         * line instead of another round of device logs. */
+                        {
+                            uint32_t prev[3] = {0, 0, 0};
+                            vm_size_t got = 0;
+                            if (vm_read_overwrite( mach_task_self(), (vm_address_t)(state.__lr - 16),
+                                                   sizeof(prev), (vm_address_t)prev, &got ) == KERN_SUCCESS)
+                            {
+                                dprintf(STDERR_FILENO, "[dispatch-src] lr-16..lr-8: %08x %08x %08x\n",
+                                        prev[0], prev[1], prev[2]);
+
+                                /* ldr xT, [x28, #imm12*8] == 0xF940_0000 | imm12<<10 | 28<<5 | Rt */
+                                if ((prev[2] & 0xFFC003E0) == (0xF9400000u | (28u << 5)))
+                                {
+                                    unsigned imm = ((prev[2] >> 10) & 0xFFF) * 8;
+                                    unsigned rt = prev[2] & 0x1f;
+                                    uint64_t slot = (uint64_t)state.__x[28] + imm, val = 0;
+                                    int ok = vm_read_overwrite( mach_task_self(), (vm_address_t)slot,
+                                                                sizeof(val), (vm_address_t)&val, &got ) == KERN_SUCCESS;
+                                    dprintf(STDERR_FILENO,
+                                            "[dispatch-src] the call target came from x%u = [x28+0x%x] "
+                                            "(x28=%p, slot=%p) -> %s%p  %s\n",
+                                            rt, imm, (void *)(uintptr_t)state.__x[28], (void *)(uintptr_t)slot,
+                                            ok ? "" : "<unreadable> ", (void *)(uintptr_t)val,
+                                            !ok           ? "-- the state frame itself is not mapped"
+                                            : val == 0    ? "-- TABLE ENTRY IS NULL (never filled in)"
+                                            : val == (uint64_t)state.__x[2]
+                                                          ? "-- table matches x2: the ENTRY is wrong, not the load"
+                                                          : "-- table does NOT match x2: the LOAD is wrong");
+                                }
+                                else
+                                {
+                                    dprintf(STDERR_FILENO,
+                                            "[dispatch-src] insn before the call is not `ldr x?, [x28,#imm]` "
+                                            "(0x%08x) -- dispatcher emit is not the shape Dispatcher.cpp describes\n",
+                                            prev[2]);
+                                }
+                            }
+                        }
                     }
                     /* Which pool COPY is pc in, and who owns it? Names the
                      * session-vs-child copy — the PE attribution below can't
