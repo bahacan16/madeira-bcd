@@ -57,13 +57,38 @@ jobs:
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
 
+      # 13m25s of a 21m37s run was spent rebuilding wine's host tools, every
+      # time, for a submodule that does not move. Key the cache on the wine
+      # revision so it rebuilds exactly when wine actually changes.
+      - name: Wine submodule revision
+        id: winerev
+        shell: bash
+        run: echo "sha=$(git -C wine rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore native wine tools
+        id: winenative
+        uses: actions/cache/restore@v4
+        with:
+          path: wine/build-native
+          key: wine-native-v1-${{ steps.winerev.outputs.sha }}
+
       - name: "Build native wine (for host-side tools: widl/wrc/wmc)"
+        if: steps.winenative.outputs.cache-hit != 'true'
         run: |
           cd wine
           mkdir -p build-native
           cd build-native
           ../configure > "$GITHUB_WORKSPACE/wine-native-configure.log" 2>&1 || true
           make -j"$(sysctl -n hw.ncpu)" > "$GITHUB_WORKSPACE/wine-native-make.log" 2>&1 || true
+
+      # Saved only once the next step has confirmed widl actually exists, so a
+      # half-built tree cannot be cached and then trusted on every later run.
+      - name: Save native wine tools
+        if: steps.winenative.outputs.cache-hit != 'true' && hashFiles('wine/build-native/tools/widl/widl') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: wine/build-native
+          key: wine-native-v1-${{ steps.winerev.outputs.sha }}
 
       - name: Diagnose native wine tools build
         run: |
