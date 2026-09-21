@@ -851,6 +851,7 @@ struct ContentView: View {
     @State private var debuggerAttached = isDebuggerAttached()
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
+    @State private var showGameLibrary = false
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -1489,6 +1490,17 @@ struct ContentView: View {
                 // and Stray's args already are, and any title can be tried
                 // between runs with no build at all. Args come from the same
                 // madeira-args.txt those buttons use.
+                // Every title above needed its own button, and madeira-exe.txt was
+                // the escape hatch -- a file to create by hand in Files, with a
+                // Windows path spelled exactly right. The prefix already knows
+                // what is installed, so let it answer: scan C:\ and offer the list.
+                // Both older routes still work; this is an addition.
+                Button("Games (scan C:\\)") {
+                    showGameLibrary = true
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
                 Button("Custom exe (madeira-exe.txt)") {
                     let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
                     let exe = docs
@@ -1553,6 +1565,17 @@ struct ContentView: View {
                 .tint(.red)
             }
             .padding()
+        }
+        .sheet(isPresented: $showGameLibrary) {
+            GameLibraryView(
+                onLaunch: { windowsPath, args in
+                    setenv("MADEIRA_EXE", windowsPath, 1)
+                    if args.isEmpty { unsetenv("MADEIRA_ARGS") } else { setenv("MADEIRA_ARGS", args, 1) }
+                    unsetenv("MADEIRA_DESKTOP")
+                    runWineFullSequence()
+                },
+                onLog: { logStore.log($0) }
+            )
         }
     }
 
