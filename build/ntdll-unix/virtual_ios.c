@@ -10304,225 +10304,163 @@ static void ios_dc_census_take( const void *addr, size_t len, struct ios_dc_cens
     }
 }
 
+/* Replacement for decommit_pages in pinned virtual_ios.c.  The original
+ * ios_pool_live_overlap helper is retained.  All helpers are inlined so the
+ * native build can preserve the original function's bounds/unwind frame.
+ * The heavy dc-census/decommit-zero logging is deliberately omitted: no raw
+ * verification read is permitted after a temporary PROT_NONE page is restored.
+ */
+#define IOS_DC_INLINE static inline __attribute__((always_inline))
+struct ios_dc_edge
+{
+    char *page, *base;
+    size_t size;
+    vm_prot_t original, maximum;
+    int changed;
+};
+
+IOS_DC_INLINE int ios_dc_query( char *page, vm_prot_t *current, vm_prot_t *maximum )
+{
+    mach_vm_address_t address = (mach_vm_address_t)(uintptr_t)page;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region( mach_task_self(), &address, &size,
+                                      VM_REGION_BASIC_INFO_64,
+                                      (vm_region_info_t)&info, &count, &object );
+    if (object != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), object );
+    if (kr != KERN_SUCCESS || count != VM_REGION_BASIC_INFO_COUNT_64 ||
+        address > (uintptr_t)page || size < host_page_size ||
+        (uintptr_t)page - address > size - host_page_size) return 0;
+    *current = info.protection;
+    *maximum = info.max_protection;
+    return 1;
+}
+
+IOS_DC_INLINE int ios_dc_prepare( struct ios_dc_edge *edge, char *base, size_t size )
+{
+    vm_prot_t current, maximum;
+    uintptr_t overlap_base = 0, overlap_end = 0;
+    uintptr_t pool_rx = (uintptr_t)ios_jit_rx_base_global;
+    uintptr_t pool_rw = (uintptr_t)ios_jit_rw_base_global;
+    extern int ios_jit_anon_alias_overlaps( void *, size_t, uintptr_t *, uintptr_t * );
+    edge->page = ROUND_ADDR( base, host_page_mask );
+    edge->base = base;
+    edge->size = size;
+    edge->changed = 0;
+    /* A plain subrange must not grant write access to a neighboring JIT alias
+     * sharing this physical host page.  The caller's alias-at-base route stays
+     * unchanged; this is a guard on the plain partial-page route only. */
+    if (ios_jit_anon_alias_overlaps( edge->page, host_page_size,
+                                   &overlap_base, &overlap_end )) return 0;
+    /* Neither view of the physical JIT pool may be made writable by this
+     * plain-page helper, even if no user-VA alias entry covers it. */
+    if (ios_jit_pool_size_global)
+    {
+        uintptr_t p = (uintptr_t)edge->page;
+        if ((pool_rx && ((p >= pool_rx && p - pool_rx < ios_jit_pool_size_global) ||
+                         (pool_rx >= p && pool_rx - p < host_page_size))) ||
+            (pool_rw && ((p >= pool_rw && p - pool_rw < ios_jit_pool_size_global) ||
+                         (pool_rw >= p && pool_rw - p < host_page_size)))) return 0;
+    }
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    edge->original = current;
+    edge->maximum = maximum;
+    if ((current & VM_PROT_EXECUTE) ||
+        (maximum & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) return 0;
+    if ((current & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE)) return 1;
+    /* Mark before the call: even an unsuccessful operation is followed by a
+     * best-effort restoration and checked error result, never by a raw clear. */
+    edge->changed = 1;
+    if (mach_vm_protect( mach_task_self(), (mach_vm_address_t)(uintptr_t)edge->page,
+                         host_page_size, FALSE, current | VM_PROT_READ | VM_PROT_WRITE ) != KERN_SUCCESS)
+        return 0;
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    return current == (edge->original | VM_PROT_READ | VM_PROT_WRITE) && maximum == edge->maximum;
+}
+
+IOS_DC_INLINE int ios_dc_restore( struct ios_dc_edge *edge )
+{
+    vm_prot_t current, maximum;
+    if (!edge->changed) return 1;
+    if (mach_vm_protect( mach_task_self(), (mach_vm_address_t)(uintptr_t)edge->page,
+                         host_page_size, FALSE, edge->original ) != KERN_SUCCESS) return 0;
+    if (!ios_dc_query( edge->page, &current, &maximum )) return 0;
+    return current == edge->original && maximum == edge->maximum;
+}
+
 static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
 {
-    char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
-    /* ml293 probe state: which branch honoured the zero contract, and where to read back. */
-    const char *dc_branch = "none";
-    const void *dc_verify = NULL;
-    size_t      dc_vsize  = 0;
-    /* ml610 [dc-census] sample state. */
-    struct ios_dc_census dc_before, dc_after;
-    struct timeval dc_t0, dc_t1, dc_t2, dc_t3;
-    int dc_sampled = 0;
+    struct ios_dc_edge edges[2];
+    char *end, *host_start, *host_end;
+    unsigned count = 0, i;
+    NTSTATUS status = STATUS_ACCESS_DENIED;
+    uintptr_t rw_alias;
+    extern uintptr_t ios_jit_anon_alias_lookup( uintptr_t );
 
-    if (!size)
-    {
-        size = view->size;
-        host_end = host_start + view->size;
-    }
-    else host_end = ROUND_ADDR( base + size, host_page_mask );
+    if (!size) size = view->size;
+    /* NtFreeVirtualMemory validates the view/range; keep arithmetic bounded
+     * independently because host rounding may otherwise wrap before access. */
+    if (!size || (uintptr_t)base > ~(uintptr_t)0 - size ||
+        (uintptr_t)base > ~(uintptr_t)0 - host_page_mask) return STATUS_ACCESS_DENIED;
+    end = base + size;
+    host_start = (char *)(((uintptr_t)base + host_page_mask) & ~(uintptr_t)host_page_mask);
+    host_end = ROUND_ADDR( end, host_page_mask );
 
-    /* ml610 [dc-census] BEFORE sample. Large ranges only (the 16MB callret
-     * stacks and the LookupCache clears — the small-decommit flood would drown
-     * the signal and cost far more than it measures). Hard-capped: this runs
-     * with virtual_mutex held, and for callret resets it runs on the SWEEPER
-     * with the code-buffer migration gate active, so an uncapped probe would
-     * perturb exactly what it is measuring. The cost is logged per sample so
-     * that judgement is checkable rather than asserted. */
+    rw_alias = ios_jit_anon_alias_lookup( (uintptr_t)base );
+    if (rw_alias)
     {
-        static unsigned long dc_big_seen, dc_samples;
-        if (size >= (4u << 20))
-        {
-            unsigned long n = ++dc_big_seen;
-            if (dc_samples < 16 && (n <= 8 || (n % 512) == 0))
-            {
-                dc_samples++;
-                dc_sampled = 1;
-                gettimeofday( &dc_t0, NULL );
-                ios_dc_census_take( base, size, &dc_before );
-                gettimeofday( &dc_t1, NULL );
-            }
-        }
-    }
-
-    /* iOS-Madeira (task #22 real root cause, 2026-07-10): FEX's Windows
-     * VirtualDontNeed() = MEM_DECOMMIT (often WITHOUT recommit — LookupCache
-     * uses it as a cheap bzero on every cache clear) and then touches the
-     * pages again assuming Linux MADV_DONTNEED semantics (still mapped,
-     * reads return zero). The upstream PROT_NONE mmap-over therefore turned
-     * every Steam module-load cache-clear into a recurring BUS-fault burst
-     * on the SAME pages (retry#1..63 in one run), and on anon-RWX ranges it
-     * silently DESTROYED the pool vm_remap alias (decoupled user VA from the
-     * pool RW/RX views). Give decommit Linux-like semantics instead:
-     *  - alias-backed range: memset the RW alias (zero contract), keep the
-     *    mapping and the alias intact;
-     *  - plain range: mmap-over RW (fresh zero pages, still accessible) and
-     *    zero the partial host pages at the edges by hand. */
-    {
-        extern uintptr_t ios_jit_anon_alias_lookup(uintptr_t fault_addr);
-        uintptr_t rw_alias = ios_jit_anon_alias_lookup( (uintptr_t)base );
-        if (rw_alias)
-        {
-            /* ml92/ml94 [alias-tomb]: the exec faults that survived removing the
-             * MADV sweep all landed on RECYCLED pool ranges whose instruction
-             * stream read back as ZEROS (insn_stream 00000000 00000000, and the
-             * nls poison 0xdead1 still intact) — the signature of this memset
-             * firing through a stale alias, not of iOS harvesting a page. The
-             * allocator's own comment predicted it: "any guest MEM_DECOMMIT of
-             * the old user VA memsets the NEW occupant to zero via
-             * decommit_pages' alias path -> blr into zeros -> fault storm."
-             * Refuse it: zeroing a loaded DLL copy is never the right answer,
-             * and the log names the victim so the claim is checkable. */
-            size_t l_off = 0;
-            void  *l_peb = NULL;
-            if (ios_pool_live_overlap( rw_alias, size, &l_off, &l_peb ))
-            {
-                dprintf(2, "[alias-tomb] STALE alias decommit REFUSED: user_va=%p size=0x%lx rw_alias=0x%lx -> pool off=0x%lx (LIVE, peb=%p) — would have zeroed a loaded module\n",
-                        base, (unsigned long)size, (unsigned long)rw_alias,
-                        (unsigned long)l_off, l_peb);
-                /* ml293: this branch DELIBERATELY skips zeroing. That is right for a loaded
-                 * module, but it means the caller's decommit-as-bzero contract is broken for
-                 * this range -- name it so, instead of leaving it indistinguishable from a
-                 * range that was zeroed. */
-                dc_branch = "alias-REFUSED(NOT zeroed)";
-            }
-            else
-            {
-                memset( (void *)rw_alias, 0, size );
-                dc_branch = "alias-memset";
-                dc_verify = (const void *)rw_alias;
-                dc_vsize  = size;
-            }
-        }
-        else if (host_start < host_end)
-        {
-            anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
-            dc_branch = "mmap-over";
-            dc_verify = host_start;
-            dc_vsize  = host_end - host_start;
-            /* Zero the guest sub-ranges on partial host pages the mmap-over
-             * couldn't cover — FEX relies on decommit-as-bzero, and stale
-             * LookupCache entries surviving at the edges would run wrong
-             * blocks. Edge pages belong to the same committed RW guest heap. */
-            if ((char *)base < host_start) memset( base, 0, host_start - (char *)base );
-            if (host_end < (char *)base + size) memset( host_end, 0, (char *)base + size - host_end );
-        }
+        /* Preserve the existing stale-alias refusal: do not blank a loaded
+         * module.  The historical final logical decommit behavior is retained. */
+        size_t ledger_offset = 0;
+        void *ledger_peb = NULL;
+        if (!ios_pool_live_overlap( rw_alias, size, &ledger_offset, &ledger_peb ))
+            memset( (void *)rw_alias, 0, size );
         else
-        {
-            /* Range lies within a single host page — no full page to remap;
-             * zero it in place to honour the decommit-as-bzero contract. */
-            memset( base, 0, size );
-            dc_branch = "subpage-memset";
-            dc_verify = base;
-            dc_vsize  = size;
-        }
-
-        /* iOS-Madeira ml293 (task #52): VERIFY THE DECOMMIT ZERO CONTRACT IN THE PA ARENAS.
-         *
-         * Chromium's PartitionAlloc decommits slot spans and requires the pages to read
-         * back as zero on recommit; its BackupRefPtr refcount lives in that metadata. A
-         * stale (non-zero) refcount is exactly the failure chrome_elf reported: a "refcount"
-         * PA_CHECK ending in `ud2` at chrome_elf+0xd7d70, with 0xAA poison and the caller
-         * passing 0xEF (PA's quarantine byte).
-         *
-         * Every branch above believes it zeroed the range, so a report that merely echoed
-         * the branch would prove nothing -- READ THE MEMORY BACK. Both outcomes are
-         * reportable: OK confirms the contract holds and moves the hypothesis elsewhere,
-         * while a non-zero offset plus the stale bytes names the bug outright. The
-         * alias-REFUSED branch is reported without a read-back precisely because it does
-         * not zero.
-         *
-         * Arena-band only, capped, so this cannot storm a log. */
-        /* ml547: same census conversion as [commit-zero]. As written this was
-         * arena-band only (excluding the GUEST band where CEF's render bitmap
-         * lives) AND capped at 40 -- and in ml546 all 40 reports went to ONE
-         * repeated FEX-band address (0x7c012a1000), so guest and pool decommits
-         * were never measured at all. Unbounded counters, every anomaly logged,
-         * only the OK lines rate-limited, totals on every line. */
-        {
-            static unsigned long dc_hi, dc_lo, dcbad_hi, dcbad_lo;
-            int dc_isarena = ios_is_arena_addr( base );
-            unsigned long dc_n = dc_isarena ? ++dc_hi : ++dc_lo;
-            {
-                if (dc_verify && dc_vsize)
-                {
-                    size_t chk = dc_vsize < 64 ? dc_vsize : 64;
-                    long nz = ios_first_nonzero( dc_verify, chk );
-                    if (nz < 0)
-                    {
-                        if (dc_n <= 8 || (dc_n % 4096) == 0)
-                            dprintf( 2, "[decommit-zero] #%lu %s OK base=%p size=0x%lx branch=%s "
-                                     "(zero) checked=%lu/%lu notzero=%lu/%lu rev=ml547\n",
-                                     dc_n, dc_isarena ? "arena/pool" : "GUEST",
-                                     base, (unsigned long)size, dc_branch,
-                                     dc_lo, dc_hi, dcbad_lo, dcbad_hi );
-                    }
-                    else
-                    {
-                        /* print from the OFFENDING offset, not from base */
-                        const unsigned char *b = (const unsigned char *)dc_verify + nz;
-                        if (dc_isarena) dcbad_hi++; else dcbad_lo++;
-                        dprintf( 2, "[decommit-zero] #%lu %s *** NOT ZEROED *** base=%p size=0x%lx "
-                                 "branch=%s first_nonzero=+0x%lx checked=%lu/%lu notzero=%lu/%lu "
-                                 "bytes@nz=%02x %02x %02x %02x %02x %02x %02x %02x rev=ml547\n",
-                                 dc_n, dc_isarena ? "arena/pool" : "GUEST",
-                                 base, (unsigned long)size, dc_branch, (unsigned long)nz,
-                                 dc_lo, dc_hi, dcbad_lo, dcbad_hi,
-                                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7] );
-                    }
-                }
-                else
-                    dprintf( 2, "[decommit-zero] #%lu base=%p size=0x%lx branch=%s "
-                             "(no read-back: this branch does not zero)\n",
-                             dc_n, base, (unsigned long)size, dc_branch );
-            }
-        }
+            dprintf(2, "[alias-tomb] STALE alias decommit REFUSED: user_va=%p size=0x%lx rw_alias=0x%lx -> pool off=0x%lx (LIVE, peb=%p) — would have zeroed a loaded module\n",
+                    base, (unsigned long)size, (unsigned long)rw_alias,
+                    (unsigned long)ledger_offset, ledger_peb);
+        goto success;
     }
-    /* ml610 [dc-census] AFTER sample + report. `returned` is the number three
-     * builds have argued about without ever measuring it: dirty+swapped before
-     * minus after, i.e. what this decommit actually handed back to the system.
-     * A near-zero `returned` on a 16MB callret clear would mean the clear is
-     * NOT a reclaim and ml609's premise was right after all — so this can
-     * refute the change it ships with, which is the point. */
-    if (dc_sampled)
+
+    /* At most two partial host pages.  Equal host_start/host_end can mean two
+     * edge pages with no full interior page, not only one subpage interval. */
+    if (base < host_start)
     {
-        long census_us, work_us;
-        unsigned long long charged_before, charged_after;
-
-        gettimeofday( &dc_t2, NULL );
-        ios_dc_census_take( base, size, &dc_after );
-        gettimeofday( &dc_t3, NULL );
-
-        census_us = (long)((dc_t1.tv_sec - dc_t0.tv_sec) * 1000000 + (dc_t1.tv_usec - dc_t0.tv_usec))
-                  + (long)((dc_t3.tv_sec - dc_t2.tv_sec) * 1000000 + (dc_t3.tv_usec - dc_t2.tv_usec));
-        work_us   = (long)((dc_t2.tv_sec - dc_t1.tv_sec) * 1000000 + (dc_t2.tv_usec - dc_t1.tv_usec));
-
-        charged_before = dc_before.dirty + dc_before.swapped;
-        charged_after  = dc_after.dirty + dc_after.swapped;
-
-        dprintf( 2, "[dc-census] ml610 base=%p size=%luKB branch=%s "
-                 "dirty %lluKB->%lluKB swapped %lluKB->%lluKB charged %lluKB->%lluKB "
-                 "returned=%lldKB | mincore_res %lluKB->%lluKB resident %lluKB->%lluKB "
-                 "span=%lluKB(%s) fp %lluMB->%lluMB decommit_us=%ld census_us=%ld\n",
-                 base, (unsigned long)(size >> 10), dc_branch,
-                 dc_before.dirty >> 10, dc_after.dirty >> 10,
-                 dc_before.swapped >> 10, dc_after.swapped >> 10,
-                 charged_before >> 10, charged_after >> 10,
-                 ((long long)charged_before - (long long)charged_after) >> 10,
-                 dc_before.mincore_res >> 10, dc_after.mincore_res >> 10,
-                 dc_before.resident >> 10, dc_after.resident >> 10,
-                 dc_before.span >> 10,
-                 dc_before.span > (unsigned long long)size ? "OVER-COUNTS: region exceeds range" : "clean",
-                 dc_before.footprint >> 20, dc_after.footprint >> 20,
-                 work_us, census_us );
+        char *edge_end = end < host_start ? end : host_start;
+        if (!ios_dc_prepare( &edges[count++], base, edge_end - base )) goto cleanup;
+    }
+    if (host_end >= host_start && host_end < end)
+    {
+        if (!ios_dc_prepare( &edges[count++], host_end, end - host_end )) goto cleanup;
     }
 
+    if (host_start < host_end &&
+        anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 ) == MAP_FAILED)
+    {
+        status = STATUS_NO_MEMORY;
+        goto cleanup;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        volatile const unsigned char *p = (const unsigned char *)edges[i].base;
+        size_t n;
+        memset( edges[i].base, 0, edges[i].size );
+        /* Read while the page is known R/W.  Volatile prevents the compiler
+         * replacing this actual readback with knowledge about memset. */
+        for (n = 0; n < edges[i].size; ++n) if (p[n]) goto cleanup;
+    }
+    status = STATUS_SUCCESS;
+cleanup:
+    while (count) if (!ios_dc_restore( &edges[--count] )) status = STATUS_ACCESS_DENIED;
+    if (status != STATUS_SUCCESS) return status;
+success:
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
     return STATUS_SUCCESS;
 }
-
+#undef IOS_DC_INLINE
 
 /***********************************************************************
  *           remove_pages_from_view
