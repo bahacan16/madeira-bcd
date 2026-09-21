@@ -565,6 +565,11 @@ jobs:
           # dies in seconds anyway.
           python3 tools/patch-fex-link-log.py "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
 
+          # Build 79's runtime-teb fix: Module.S reads the TEB slot ProcessInit
+          # discovered instead of the 0x898 placeholder that wine's x18 patcher
+          # is supposed to rewrite and, per 15 of 17 device logs, does not.
+          python3 tools/patch-fex-teb-macro.py "$GITHUB_WORKSPACE/FEX/Source/Windows/ARM64EC/Module.S"
+
           JITCPP="$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
           python3 - "$JITCPP" <<'PYSUSPEND'
           import sys
