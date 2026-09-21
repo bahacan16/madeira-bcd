@@ -576,6 +576,14 @@ jobs:
           # is supposed to rewrite and, per 15 of 17 device logs, does not.
           python3 tools/patch-fex-teb-macro.py "$GITHUB_WORKSPACE/FEX/Source/Windows/ARM64EC/Module.S"
 
+          # Build 79's cpuid-metadata-index fix: the 8000_000xh brand-string
+          # leaves indexed PerCPUData by raw CPU id while their only caller
+          # already wrapped it, so one generic MIDR plus several logical CPUs
+          # read past the end.
+          python3 tools/patch-fex-cpuid-index.py \
+            "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/CPUID.cpp" \
+            "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/CPUID.h"
+
           JITCPP="$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
           python3 - "$JITCPP" <<'PYSUSPEND'
           import sys
