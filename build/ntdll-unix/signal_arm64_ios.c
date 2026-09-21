@@ -10775,7 +10775,12 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         wait_suspend( &context );
         restore_context( &context, ucontext );
 #ifdef WINE_IOS
-        ios_fixup_x18_for_return( ucontext );
+        /* An APC can interrupt FEX with a live x17. The x18 trampoline
+         * replaces that register with PC and corrupts the resumed code.
+         * Preserve restore_context's PC and registers on this path, as
+         * the existing Mach recovery path already does. This does not
+         * solve every Darwin x18-zero case: indirect copies and silent
+         * zero-page reads still require separate runtime work. */
 #endif
     }
 }

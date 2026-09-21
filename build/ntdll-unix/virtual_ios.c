@@ -3885,7 +3885,9 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             uint32_t i0, i1, i2;
             unsigned reg;
 
-            if (data_map && (data_map[i / 4] || data_map[(i + 4) / 4] || data_map[(i + 8) / 4]))
+            if (data_map && ((data_map[(i / 4) >> 3] & (1u << ((i / 4) & 7))) ||
+                             (data_map[((i + 4) / 4) >> 3] & (1u << (((i + 4) / 4) & 7))) ||
+                             (data_map[((i + 8) / 4) >> 3] & (1u << (((i + 8) / 4) & 7)))))
                 continue;
 
             i0 = *(uint32_t *)(text_rw + i);

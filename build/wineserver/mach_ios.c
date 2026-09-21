@@ -375,9 +375,13 @@ extern int __pthread_kill( mach_port_t, int );
 int send_thread_signal( struct thread *thread, int sig )
 {
     int ret = -1;
-    mach_port_t process_port = get_process_port( thread->process );
+    /* Wine guests are pthreads in this iOS app's Darwin task. The normal
+     * cross-process task-port handoff is disabled here. Use our task only
+     * for real thread-right extraction and signal delivery; leave
+     * get_process_port() disabled for remote-memory operations. */
+    mach_port_t process_port = mach_task_self();
 
-    if (thread->unix_pid != -1 && process_port)
+    if (thread->unix_pid != -1)
     {
         mach_msg_type_name_t type;
         mach_port_t port;
