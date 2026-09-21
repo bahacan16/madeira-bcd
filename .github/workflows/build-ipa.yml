@@ -233,6 +233,11 @@ jobs:
             build/gnutls-ios/src
           key: gnutls-ios-gmp6.3.0-nettle3.10.1-gnutls3.8.9-v1
 
+      # Five Build 79 fixes live in our own sources, so nothing re-applies them
+      # each run and nothing would notice a revert. Check they are still here.
+      - name: Check in-tree Build 79 transplants
+        run: python3 tools/check-transplant.py
+
       # Build 79 runtime fixes that land in the wine submodule, which points at
       # willfaust/wine and so cannot take a commit from us. Each script is
       # idempotent and fails the build by name if the pinned tree moves.

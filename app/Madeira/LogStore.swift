@@ -7,7 +7,27 @@ final class LogStore: ObservableObject {
     /// One row per unique signature — semantically identical events bucket here.
     @Published var entries: [LogEntry] = []
 
-    private let logFileURL: URL
+    /// Readable so the UI can hand the file to a share sheet. Every device round
+    /// so far ended with the log being hunted down in the Files app and uploaded
+    /// by hand; one tap is cheaper, and these runs are expensive enough that the
+    /// friction was costing us results.
+    let logFileURL: URL
+
+    /// The rotated previous run, when there is one. Worth offering alongside the
+    /// current log: a crash often matters less than the run before it.
+    var previousLogFileURL: URL? {
+        let url = logFileURL.deletingLastPathComponent().appendingPathComponent("madeira-log.prev.txt")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// Files worth exporting, newest first, skipping any that are empty.
+    var exportableLogs: [URL] {
+        [logFileURL, previousLogFileURL].compactMap { $0 }.filter { url in
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+            return size > 0
+        }
+    }
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"

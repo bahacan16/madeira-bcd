@@ -1558,6 +1558,20 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.blue)
 
+                // Pulling a log used to mean finding madeira-log.txt in the Files
+                // app and uploading it by hand. Device rounds are expensive and
+                // often not reproducible, so that friction was costing results.
+                // The rotated previous run rides along: a crash frequently matters
+                // less than the run before it.
+                if !logStore.exportableLogs.isEmpty {
+                    ShareLink(items: logStore.exportableLogs) {
+                        Text("Share Log")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                }
+
                 Button("Clear Log") {
                     logStore.clear()
                 }
