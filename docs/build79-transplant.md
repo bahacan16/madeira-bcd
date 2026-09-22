@@ -57,7 +57,48 @@ read(s)` is absent from 15 of 17 device logs: the pass ran and matched nothing,
 leaving `Module.S` reading TSD slot `0x898` when the device publishes `0x8d0`.
 05 removes the dependency on that pass; 06 removes the bug in it.
 
-### 01 and 03 are blocked on a missing capability
+### 01 and 03 are the difference, and this was measured
+
+On 2026-09-22 the user captured two logs from the same device, same game,
+minutes apart: one from the developer's working Build 79 IPA, one from ours.
+The working one ran to `[PRESENT_GAP] #1024` without a single fault. Ours died.
+The tag sequences diverge on exactly one thing:
+
+    working build:   err:module:alloc_module_tls_slot   (three times)
+    ours:            absent
+
+`alloc_module_tls_slot` does not exist in the unpatched tree. Patch 03 adds it:
+
+    03-module-tls-fix/module-tls.patch:38:
+      +static NTSTATUS alloc_module_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
+
+Comparing the binaries confirmed it. The `aarch64-windows` ntdll.dll is
+**byte-identical** to ours, so the difference is entirely in the arm64ec copy,
+which is the one whose loader sets up the guest's TLS:
+
+| | working | ours |
+|---|---|---|
+| size | 4,259,840 | 1,572,864 |
+| `alloc_module_tls_slot` | 3 | 0 |
+| `alloc_tls_slot` | 2 | 1 |
+| exports | 1469 | 1469 (identical set) |
+| `.text` / `.data` / `.pdata` | 468K / 50K / 17K | same |
+
+The size gap is six DWARF sections, not code: the working binary is unstripped.
+Code sections match to the kilobyte, and `.rdata` differs by 1K -- consistent
+with the same wine build plus these two patches, not a different lineage.
+
+This matters because without them ntdll's own TLS index stays zero, which
+Madeira allocates to the main executable, so wine's exception and unwind code
+reads the executable's TLS block instead of its own. Our 2026-09-22 crash was a
+`br x11` to 0x159c00000 -- the ARM64EC CPU area, a data structure -- from inside
+a JIT block, with the correct value (`EnterEC=0x1587fc138`) printed on the same
+log line.
+
+`tools/check-ntdll-tls.py` tests the shipped binary for the marker so this can
+never silently regress.
+
+### Why they cannot be applied as patches here
 
 Both patch wine's **PE-side** `dlls/ntdll/loader.c`, and this repository ships
 `ntdll.dll` as a committed binary for both `aarch64-windows` and
