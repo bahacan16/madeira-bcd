@@ -49,6 +49,16 @@ MARKERS = [
         "IOS_DC_INLINE int ios_dc_prepare",
         "partial host pages must be prepared and restored, not cleared blind",
     ),
+    (
+        # Not one of the numbered patches, but what Build 79's host binary does
+        # and ours did not: it is the cause of every x64 JIT-tail crash through
+        # 2026-09-22. See the NtFlushInstructionCache comment in virtual_ios.c.
+        "ml795-icache-flush",
+        "build/ntdll-unix/virtual_ios.c",
+        "if (addr && size) sys_icache_invalidate( (void *)addr, size );",
+        "NtFlushInstructionCache must invalidate the icache -- it is the only "
+        "way FEX's PE-side JIT blocks get flushed",
+    ),
 ]
 
 # Things a fix removed, which must not come back.

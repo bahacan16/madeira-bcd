@@ -242,6 +242,59 @@ at `7817e22`; `[shadow]` is `research/dxmt/src/winemetal/unix/winemetal_unix.c`
 at `b4b89f0`. Our own sources carry revision markers up to ml786 against their
 binary's ml762. The host side is not behind.
 
+### The x64 crash was a missing icache flush (2026-09-22, overnight)
+
+Every x64 fault since 2026-09-15 -- the JITCodeTail landings at tail+8 and
+tail+24, and the SP-alignment fault at DispatchPtr -- has one cause:
+`NtFlushInstructionCache` in `virtual_ios.c` did nothing.
+
+It is written with three branches: x86 no-op, `HAVE___CLEAR_CACHE` ->
+`__clear_cache`, and an `#else` that logs one FIXME and returns. Our config.h
+does not define `HAVE___CLEAR_CACHE`, so we compiled the `#else`. Every device
+log carries its FIXME, with the current-process handle, which only that branch
+prints:
+
+    fixme:virtual:NtFlushInstructionCache 0xffffffffffffffff 0x155ffc004 644
+
+The caller is FEX. `xtajit64.dll` is a PE: it writes each JIT block through
+the pool's RW alias and calls `FlushInstructionCache` on the RX address. That
+call is the only way the host learns PE-side code wrote instructions; every
+host-side code writer in this tree calls `sys_icache_invalidate` itself.
+
+With nothing invalidated, the CPU runs whatever its icache holds for those
+addresses -- and FEX prefills its code buffer with NOPs. A block executes its
+fresh cache lines, slides through a stale line of NOPs, and resumes at the next
+line boundary, in the block's own metadata.
+
+How it was established, since three theories died before it:
+
+| evidence | reading |
+|---|---|
+| all five faulting PCs have `pc % 64 == 0` | a line boundary, not a field |
+| run 104: x10, x8, x6 hold their new values; x9=1, x11=0, SP unchanged | line 0 of the block ran, line 1 did not |
+| no fault, no branch, no LR write between them | nothing *transferred* control; it slid |
+| Build 79's host binary: `"%p %p %ld other process not supported"`, `___clear_cache` defined, `sys_icache_invalidate` imported | the working build has the other branch |
+
+The "three different offsets into JITCodeTail" were never three bugs. They
+were wherever the next 64-byte boundary happened to fall inside the tail.
+
+Eliminated on the way, each by a probe or an offline comparison rather than
+by argument:
+
+* **the block cache** -- `[cache-hit]` never fired; FindBlock never hit;
+* **the dispatcher's pointer slots** -- `[exitlink]`, 17 calls, identical;
+* **block publication** -- `[fex-entry] ok` 16/16, zero BAD, zero UNVALIDATED;
+* **the entry thunk** -- read from `ucrtbase.dll` on disk at the RVA `[ffs]`
+  computed: a genuine MSVC ARM64EC thunk;
+* **Module.S** -- our patched source assembled with clang-18 for
+  `arm64ec-pc-windows-msvc` and compared word by word with Build 79's
+  `xtajit64.dll`, relocated fields masked: **0 of 229 words differ**;
+* **suspension** -- no BREAKPOINT or `brk #0xCAFE` in any log.
+
+The fix calls `sys_icache_invalidate` for the current process, under the same
+`WINE_IOS` guard `<libkern/OSCacheControl.h>` is included under.
+`tools/check-transplant.py` now fails the build if it disappears.
+
 ### One thing to resolve with the developer
 
 09's patch adds an inline comment reading *"Proposed isolated replacement, not

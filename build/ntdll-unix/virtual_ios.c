@@ -17513,6 +17513,54 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
 {
 #if defined(__x86_64__) || defined(__i386__)
     /* no-op */
+#elif defined(WINE_IOS)   /* the guard <libkern/OSCacheControl.h> is included under */
+    /* iOS-Madeira ml795: THIS WAS THE x64 CRASH.
+     *
+     * Our config.h does not define HAVE___CLEAR_CACHE, so this function used
+     * to compile to the #else branch below: log one FIXME and flush nothing.
+     * Every device log carries that FIXME, with the current-process handle,
+     * which only the #else branch prints:
+     *
+     *   fixme:virtual:NtFlushInstructionCache 0xffffffffffffffff 0x155ffc004 644
+     *
+     * That caller is FEX. xtajit64.dll is a PE; it emits each JIT block
+     * through the pool's RW alias and then calls FlushInstructionCache on the
+     * RX address -- 0x155ffc004 is the first block past RXCursor, 644 bytes.
+     * This is the only way the host ever learns that PE-side code wrote
+     * instructions. Everything else in this file that writes code calls
+     * sys_icache_invalidate itself; this was the one path that did not.
+     *
+     * With no invalidation the CPU executes whatever its icache already holds
+     * for those addresses, and FEX prefills its code buffer with NOPs. So a
+     * block runs its fresh lines, slides through a stale line of NOPs, and
+     * resumes at the next line boundary -- in the middle of the block's own
+     * metadata. Measured, not inferred:
+     *
+     *   * every faulting pc across five runs is 64-byte aligned (pc % 64 == 0:
+     *     tail+24, tail+8, tail+24, tail+24, and DispatchPtr) -- the "three
+     *     different offsets into JITCodeTail" were just wherever the next line
+     *     boundary fell;
+     *   * in the 2026-09-22 run every register written by line 0 of the block
+     *     holds its new value (x10, x8, x6) and every one written by line 1
+     *     does not (x9=1, x11=0, SP still the emulator stack), with no fault,
+     *     no branch and no LR change in between;
+     *   * Build 79's host binary, which runs these games, has the other branch:
+     *     it carries "%p %p %ld other process not supported", defines
+     *     ___clear_cache and imports sys_icache_invalidate.
+     *
+     * sys_icache_invalidate cleans the data cache to the point of unification
+     * and invalidates the instruction cache over the range, which is what a
+     * dual-mapped JIT needs after writing through the other alias. The RX
+     * alias is readable, so it is a valid address for both. */
+    if (handle == GetCurrentProcess())
+    {
+        if (addr && size) sys_icache_invalidate( (void *)addr, size );
+    }
+    else
+    {
+        static int once;
+        if (!once++) FIXME( "%p %p %ld other process not supported\n", handle, addr, size );
+    }
 #elif defined(HAVE___CLEAR_CACHE)
     if (handle == GetCurrentProcess())
     {
