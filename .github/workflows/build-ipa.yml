@@ -580,6 +580,13 @@ jobs:
           # precedes every real block entry.
           python3 tools/patch-fex-cachehit-trace.py "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/Core.cpp"
 
+          # The cache probe logged nothing, so the bad pointer comes from the
+          # compile path -- where FEX already has a guard for this exact fault
+          # (written for BlockTail+0x18 on Thumper, July). It has never spoken.
+          # Make it say when it passes and when it cannot run, so silence stops
+          # meaning two different things.
+          python3 tools/patch-fex-entry-publish.py "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/Core.cpp"
+
           # Build 79's runtime-teb fix: Module.S reads the TEB slot ProcessInit
           # discovered instead of the 0x898 placeholder that wine's x18 patcher
           # is supposed to rewrite and, per 15 of 17 device logs, does not.
