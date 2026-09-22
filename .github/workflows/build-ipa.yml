@@ -556,32 +556,15 @@ jobs:
             || echo "  (no arm64ec-prefixed tools -- this toolchain may not support it)"
           command -v arm64ec-w64-mingw32-clang++ || echo "  arm64ec-w64-mingw32-clang++ NOT on PATH"
 
-          # EXPERIMENT (revert = delete this block): drop the per-block suspend
-          # check on iOS.
-          #
-          # hello-x64.exe -- no D3D11, no DXMT, no Metal -- dies the same way the
-          # cube does, so the fault is in the emulation loop itself. The device
-          # log names it exactly:
-          #
-          #   [task-exc] BREAKPOINT #1 insn=0xd4395fc0 imm=0xcafe FEX-SuspendCheck(0xCAFE)
-          #   D 24 Suspending: RIP: 15783117A SP: 703881FEF8
-          #   D 24 Passing through exception
-          #   [mach_exc] UNHANDLED #2 pc=0x0 addr=0x0
-          #
-          # The JIT emits `ldr w11,[x28,#0x5e8]; cbz; brk #0xCAFE` at every block
-          # entry (EmitSuspendInterruptCheck). The doorbell rings, the brk fires,
-          # and FEX's own handler catches it correctly -- "Suspending" comes from
-          # Module.cpp:1172. But coming back it re-packs the whole native context
-          # (StoreStateToPackedECContext) and the PC lands on 0, which is no
-          # longer a JIT address, so the next fault is passed through and nobody
-          # owns it.
-          #
-          # This does not fix that repack; it stops us entering it, to establish
-          # whether the suspend path is the only thing standing between us and a
-          # running x64 guest. If it is, the answer is one log line away and the
-          # real fix has a target. The cost is that a thread cannot be
-          # cooperatively suspended mid-block -- acceptable while every x64 run
-          # dies in seconds anyway.
+          # Build 79's IPA runs Fallout and Stray with FEX's per-block suspend
+          # check emitted, so the check is not what stands between us and a
+          # running x64 guest. It was patched out here on 2026-09-14, labelled
+          # an experiment, because the brk #0xCAFE it plants was firing and the
+          # repack that follows produced PC=0. Transplant 11 has since fixed
+          # that repack's cause -- an APC interrupting FEX with a live x17 --
+          # and the patched ntdll.dll fixed the TLS underneath it. Leaving the
+          # experiment in now only keeps our emulator different from the one
+          # known to work, in the exact machinery we are still failing in.
           python3 tools/patch-fex-link-log.py "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
 
           # Build 79's runtime-teb fix: Module.S reads the TEB slot ProcessInit
@@ -596,24 +579,6 @@ jobs:
           python3 tools/patch-fex-cpuid-index.py \
             "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/CPUID.cpp" \
             "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/CPUID.h"
-
-          JITCPP="$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
-          python3 - "$JITCPP" <<'PYSUSPEND'
-          import sys
-          p = sys.argv[1]
-          s = open(p).read()
-          old = "#ifdef ARCHITECTURE_arm64ec\n  static constexpr uint16_t SuspendMagic {0xCAFE};"
-          new = ("#if defined(ARCHITECTURE_arm64ec) && !defined(FEX_IOS_HOST)\n"
-                 "  static constexpr uint16_t SuspendMagic {0xCAFE};")
-          if new in s:
-              print("::notice::suspend check already patched out")
-          elif s.count(old) == 1:
-              open(p, "w").write(s.replace(old, new))
-              print("::notice::suspend check PATCHED OUT for FEX_IOS_HOST (brk #0xCAFE no longer emitted)")
-          else:
-              print(f"::error::suspend-check anchor not found ({s.count(old)} matches) -- upstream changed, review needed")
-              sys.exit(1)
-          PYSUSPEND
 
           cmake -S "$GITHUB_WORKSPACE/FEX" -B "$GITHUB_WORKSPACE/FEX/build-arm64ec" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/FEX/Data/CMake/toolchain_mingw.cmake" \
@@ -666,6 +631,11 @@ jobs:
               # remove the path entirely. Print both so the claim is measured.
               python3 tools/count-x18.py "$SHIPPED" "$GITHUB_WORKSPACE/committed-xtajit64.dll" 2>/dev/null \
                 || python3 tools/count-x18.py "$SHIPPED"
+              # Build 79's own arm64ecfex, chunk by chunk. Same pinned FEX, same
+              # llvm-mingw, and as of 2026-09-22 the same .text virtual size to
+              # the byte -- so whatever differs is ours, and the log is the only
+              # way those bytes leave the runner.
+              python3 tools/xtajit-fingerprint.py compare "$SHIPPED" tools/ref/xtajit64-build79.fp
             else
               echo "::error::build reported success but no libarm64ecfex.dll was produced -- keeping the committed xtajit64.dll"
             fi

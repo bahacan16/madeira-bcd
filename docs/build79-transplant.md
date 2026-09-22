@@ -132,6 +132,51 @@ Madeira allocates to the main executable. Wine's exception and unwind code then
 reads the executable's TLS block instead of its own. That is adjacent to the
 transition machinery we have been chasing.
 
+### The emulator itself is not the difference, and this was measured too
+
+On 2026-09-22 the user pulled `arm64ec-windows/xtajit64.dll` out of the same
+working IPA. It is a different binary from either of ours, but the comparison
+says the lineage is shared and the code is very nearly the same:
+
+| | Build 79 | ours (built in CI) | ours (committed) |
+|---|---|---|---|
+| size | 5,386,240 | 5,348,352 | 5,410,816 |
+| `.text` virtual size | **0x1ffcf6** | **0x1ffcf6** | 0x205cf6 |
+| x18 references | 121 | 120 | 115 |
+| SectionAlignment | 0x1000 | 0x4000 | 0x1000 |
+| version string | `Madeira-pinned-053c385` | 053c385 submodule | `FEX-2607-55-gac555dd` |
+| build id | `rev=ml755 compiled Sep  9 2026` | — | `rev=ml755 compiled Aug 27 2026` |
+| clang | 22.1.4 (`3599050`) | same | same |
+
+The `.text` sizes agreeing to the byte, out of two megabytes, is not a
+coincidence a different source tree produces. Same pinned FEX, same Madeira
+revision ml755, same llvm-mingw. So swapping this binary in the way `ntdll.dll`
+was swapped would buy very little -- and the committed one, which is a
+different lineage, would be a step backwards. We keep building ours.
+
+What the comparison did surface is that our build carries two changes of our
+own that Build 79 does not:
+
+* **the per-block suspend check, patched out.** Added 2026-09-14 and labelled
+  "EXPERIMENT (revert = delete this block)", because the `brk #0xCAFE` it
+  plants was firing and FEX's repack afterwards produced PC=0. Build 79 emits
+  the check and runs Fallout and Stray, and transplant 11 has since fixed the
+  repack's cause. Removed 2026-09-22.
+* **`--section-alignment=0x4000`.** Build 79's binary is 0x1000-aligned, which
+  means `.data` lands off iOS's 16KB grid and `ios_jit_data_align_delta`
+  shifts the whole pool copy -- and it works anyway. Ours avoids that path.
+  Kept for now: commit 003731d already established the alignment was not the
+  cause of anything, so this is a layout preference rather than a fix, but it
+  is a divergence and it is now reported on every build.
+
+`tools/xtajit-fingerprint.py` holds Build 79's binary as per-chunk hashes
+(`tools/ref/xtajit64-build79.fp`, 256-byte chunks over `.text`) and compares
+our build against it on every run. The runner cannot send us its artifact --
+its egress reaches GitHub and nothing else -- so the step prints the differing
+chunks' bytes into the build log, where they can be disassembled against the
+reference off-runner. It never fails the build: a build that legitimately
+differs should say so and carry on.
+
 ### One thing to resolve with the developer
 
 09's patch adds an inline comment reading *"Proposed isolated replacement, not
