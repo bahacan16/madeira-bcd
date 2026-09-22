@@ -1320,9 +1320,50 @@ static void ios_probe_jit_block_tail( const void *pc )
                                  ? "== `blr x16`: ExitFunctionEC returns to an exit thunk (br x9)"
                                  : "entry-thunk offset path" );
                     if (w != 0xd63f0200u)
+                    {
+                        uint64_t thunk = base + (int64_t)off;
                         dprintf( STDERR_FILENO,
                                  "[ffs] ExitFunctionEC would branch to %p  (target %+d)\n",
-                                 (void *)(uintptr_t)(base + (int64_t)off), (int)off );
+                                 (void *)(uintptr_t)thunk, (int)off );
+
+                        /* iOS-Madeira ml793: show what is AT that address.
+                         *
+                         * Three runs have now established that everything up to
+                         * this branch is right: block entries publish sound
+                         * (16/16 [fex-entry] ok), the block runs from its own
+                         * entry, it reaches its last instruction, and the FFS
+                         * arithmetic above checks out. Control then reappears
+                         * inside the block's own JITCodeTail. So the fault is on
+                         * the way BACK, and the only thing on that path we have
+                         * never looked at is the entry thunk itself.
+                         *
+                         * An ARM64EC entry thunk is what makes a return possible:
+                         * it takes the x64 return address off the stack into LR,
+                         * which is also what re-aligns SP from the 8-mod-16 that
+                         * `call` leaves. If this address is a function body
+                         * rather than a thunk, the callee returns to whatever LR
+                         * happened to hold -- and LR at fault time is stale, the
+                         * dispatcher's CompileBlock call site.
+                         *
+                         * Eight words is enough to tell a thunk from a prologue,
+                         * and the bytes can be disassembled against the module
+                         * off-device. */
+                        {
+                            uint32_t tw[8] = { 0 };
+                            int tgot = vm_read_overwrite( mach_task_self(), (vm_address_t)thunk,
+                                                          sizeof(tw), (vm_address_t)tw,
+                                                          &g2 ) == KERN_SUCCESS;
+                            if (tgot)
+                                dprintf( STDERR_FILENO,
+                                         "[ffs] entry thunk @%p: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                         (void *)(uintptr_t)thunk,
+                                         tw[0], tw[1], tw[2], tw[3], tw[4], tw[5], tw[6], tw[7] );
+                            else
+                                dprintf( STDERR_FILENO,
+                                         "[ffs] entry thunk @%p UNREADABLE -- the branch target is not mapped\n",
+                                         (void *)(uintptr_t)thunk );
+                        }
+                    }
                 }
             }
         }
