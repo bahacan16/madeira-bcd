@@ -1,0 +1,13 @@
+# Components taken from the verified Build 79 IPA, because we ship the other
+# half of them and the two halves must come from the same DXMT revision.
+# See tools/import-verified-runtime.py and docs/build79-transplant.md.
+#
+# sha256                                                            bytes      path inside Payload/Madeira.app
+IPA 5c2a8d7aff37bfc6a0bd7e80ae52cfef4744b88c717ef77e6284dc36c77b41b9 76257139  Madeira.ipa
+935bd86464ef030fed2e7c3c132d91fcf7c95405236d5a91160633187a9acbc2 1937408  aarch64-windows/d3d10core.dll
+a903a4638f6f4e20894266f56dab4f568143ce685c414a8ca644f50db8bd8b4f 34414592 aarch64-windows/d3d11.dll
+96b93cb436a20f9aac412535ab3263ced2b74e46dad8d6626558b469448acb20 5894144  aarch64-windows/dxgi.dll
+e8470fefc59729424f0d813faa40fee1255544ddac51b1c5ac1373d828eedb5a 204800   aarch64-windows/winemetal.dll
+bb66e435ff79ec732e06547c4a850a05165f323dff20a63cff26f246fded52c1 35291136 arm64ec-windows/d3d11.dll
+92b9858d683434e724d524dc5039a456003411c6b5965c937c729f0e4eed2101 6127616  arm64ec-windows/dxgi.dll
+a81782c5694c19de301a67f5b12df7430dff3f5128de538c6dc3273a8fddcc61 1022623  prefix-template.tar.gz

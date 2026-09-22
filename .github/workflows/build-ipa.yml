@@ -787,6 +787,57 @@ jobs:
           cp libdxmt_combined.a "$GITHUB_WORKSPACE/app/Madeira/"
           echo "::notice::libdxmt_combined.a $(wc -c < libdxmt_combined.a | tr -d ' ') bytes"
 
+      # DXMT is two halves and ours are from different revisions. The unix
+      # half is compiled from research/dxmt (pinned b4b89f0, which is the tip
+      # of willfaust/dxmt ios-port) and linked into the Madeira binary; the PE
+      # half is committed and nothing builds it, and those binaries predate
+      # the commit we link against. The module boundary moved in between --
+      # airconv's reflection symbols are in b4b89f0's headers and in Build
+      # 79's winemetal.dll, and absent from our committed one, while its
+      # d3d11.dll .text is 61,440 bytes smaller than ours. So we ship a pair
+      # nobody built, and the guest dies with d3d11.dll on the stack.
+      #
+      # Until the PE half is built here the way xtajit64.dll is, take it from
+      # the IPA those DLLs came out of: Build 79, 0.34.7, the build that runs
+      # Fallout and Stray on the device. tools/import-verified-runtime.py
+      # checks the IPA and every file against a manifest, so a replaced
+      # release asset fails the build instead of quietly changing what ships.
+      - name: Restore the verified Build 79 IPA
+        id: b79ipa
+        uses: actions/cache/restore@v4
+        with:
+          path: build79-ipa
+          key: build79-ipa-5c2a8d7a
+
+      - name: "Take DXMT's PE half from the verified Build 79 IPA"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build79-ipa
+          IPA=build79-ipa/Madeira.ipa
+          if [ ! -f "$IPA" ]; then
+            API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/claude2"
+            URL=$(curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+                       -H "Accept: application/vnd.github+json" "$API" \
+                  | python3 -c "import sys,json; a=[x for x in json.load(sys.stdin).get('assets',[]) if x['name']=='Madeira.ipa']; print(a[0]['url'] if a else '')")
+            if [ -z "$URL" ]; then
+              echo "::error::release tag claude2 has no Madeira.ipa asset -- the verified Build 79 runtime cannot be imported, and the committed DXMT DLLs do not match the unix half we link against"
+              exit 1
+            fi
+            curl -sSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+                 -H "Accept: application/octet-stream" -o "$IPA" "$URL"
+          fi
+          python3 tools/import-verified-runtime.py "$IPA"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Save the verified Build 79 IPA
+        if: steps.b79ipa.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build79-ipa
+          key: build79-ipa-5c2a8d7a
+
       # The PE-side DXMT DLLs (d3d11/dxgi/winemetal/d3d10core) are committed
       # under app/Madeira/aarch64-windows/ despite the README calling them
       # gitignored, so there is nothing to build here -- just confirm they

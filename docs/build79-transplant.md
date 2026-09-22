@@ -177,6 +177,68 @@ chunks' bytes into the build log, where they can be disassembled against the
 reference off-runner. It never fails the build: a build that legitimately
 differs should say so and carry on.
 
+### The two halves of DXMT in our IPA are from different revisions
+
+On 2026-09-22 the user put the whole working Build 79 IPA in a release, which
+made the comparison exhaustive rather than file by file. Version 0.34.7,
+build 79, `com.willfaust.mythicemu` -- the IPA the runtime patches came from.
+
+**259 of the 266 Windows DLLs are byte-identical to ours.** Every one of
+`aarch64-windows` and `arm64ec-windows` matches except seven files:
+
+| file | ours | Build 79 |
+|---|---|---|
+| `aarch64/d3d10core.dll` | 524,288 | 1,937,408 |
+| `aarch64/d3d11.dll` | 8,654,848 | 34,414,592 |
+| `aarch64/dxgi.dll` | 1,835,008 | 5,894,144 |
+| `aarch64/winemetal.dll` | 135,168 | 204,800 |
+| `arm64ec/d3d11.dll` | 5,398,528 | 35,291,136 |
+| `arm64ec/dxgi.dll` | 1,695,744 | 6,127,616 |
+| `arm64ec/xtajit64.dll` | 5,410,816 | 5,386,240 |
+
+`nls/` is identical; `prefix-template.tar.gz` differs by one added file,
+`system32/xaudio2_7.dll`. There is no pile of missing DLLs. Six of the seven
+are DXMT.
+
+Most of that size gap is DWARF -- Build 79's DXMT is unstripped -- but the
+code differs too, and in a direction that names the problem. Their
+`arm64ec/d3d11.dll` `.text` is **61,440 bytes smaller** than ours, and their
+`winemetal.dll` carries airconv's reflection symbols (`MTL_SM50_SHADER_ARGUMENT_*`,
+`MTL_GEOMETRY_SHADER_PASS_THROUGH`, `ArgumentTableQwords`) which ours does not.
+Code moved out of d3d11 and into winemetal between the two builds.
+
+Now put that next to what we link. DXMT is two halves: the unix half is
+compiled from `research/dxmt` and linked into the Madeira binary, and the PE
+half ships as committed binaries that nothing here builds -- the PE build was
+dropped as "redundant" in commit 4184816. The submodule is pinned at
+`b4b89f0`, which is **the tip of `willfaust/dxmt` ios-port**; there is nothing
+newer upstream, so Build 79's DLLs and our unix half come from the same
+source. But `b4b89f0` landed 2026-08-29 and our committed DLLs are dated
+2026-08-27, and those reflection symbols are in the submodule's
+`airconv_public.h`.
+
+So our IPA pairs a unix half from `b4b89f0` with a PE half from before it.
+That is not a version anyone tested; it is a version nobody built. And the
+guest now dies with `d3d11.dll` loaded and on the terminal stack.
+
+`tools/import-verified-runtime.py` takes the PE half out of the verified IPA
+until we build it here. The IPA and every file are checked against
+`tools/ref/build79-runtime.manifest`, so a replaced release asset fails the
+build rather than quietly changing what ships. Building the PE half from the
+pinned submodule, the way `xtajit64.dll` is built, remains the right end
+state -- and now there is a measurement saying it matters.
+
+### What is *not* different, which was worth checking
+
+Their host binary carries diagnostics our `build/` overlay has no trace of --
+`[shadow] ml760`, `[hot-lock] ml444`, `[lock-orphan] ml447`, `[alert-storm]
+ml439`, `[acc-take] ml480`. That reads like 200 revisions of host-side work we
+are missing, and it is not: they live in the pinned submodules we already
+build. `[lock-orphan]` and `[hot-lock]` are in `wine/dlls/ntdll/unix/sync.c`
+at `7817e22`; `[shadow]` is `research/dxmt/src/winemetal/unix/winemetal_unix.c`
+at `b4b89f0`. Our own sources carry revision markers up to ml786 against their
+binary's ml762. The host side is not behind.
+
 ### One thing to resolve with the developer
 
 09's patch adds an inline comment reading *"Proposed isolated replacement, not
