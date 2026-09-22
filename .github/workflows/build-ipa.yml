@@ -238,6 +238,12 @@ jobs:
       - name: Check in-tree Build 79 transplants
         run: python3 tools/check-transplant.py
 
+      # 01 and 03 cannot be applied here -- they change wine's PE-side loader
+      # and we ship ntdll.dll as a binary. The binary itself is the only place
+      # to check, and the marker is a function patch 03 introduces.
+      - name: Check arm64ec ntdll carries the Build 79 TLS fixes
+        run: python3 tools/check-ntdll-tls.py
+
       # Build 79 runtime fixes that land in the wine submodule, which points at
       # willfaust/wine and so cannot take a commit from us. Each script is
       # idempotent and fails the build by name if the pinned tree moves.

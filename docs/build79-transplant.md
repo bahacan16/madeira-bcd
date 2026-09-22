@@ -32,9 +32,9 @@ for `tools/patch-fex-link-log.py`.
 
 | # | Fix | Target | State |
 |---|---|---|---|
-| 01 | ntdll static TLS isolation | wine `dlls/ntdll/loader.c` | **blocked** — see below |
+| 01 | ntdll static TLS isolation | wine `dlls/ntdll/loader.c` | **binary swapped in** — see below |
 | 02 | CPUID per-CPU metadata index | FEX `CPUID.cpp`/`.h` | applied · `tools/patch-fex-cpuid-index.py` |
-| 03 | module TLS | wine `dlls/ntdll/loader.c` | **blocked** — see below |
+| 03 | module TLS | wine `dlls/ntdll/loader.c` | **binary swapped in** — see below |
 | 04 | CPUID assembly check | — | not a patch; it is 02's binary verification harness |
 | 05 | FEX runtime TEB | FEX `Module.S` | applied · `tools/patch-fex-teb-macro.py` |
 | 05b | SRW orphan guard | wine `sync.c` | same hunk as 13 |
@@ -96,7 +96,23 @@ a JIT block, with the correct value (`EnterEC=0x1587fc138`) printed on the same
 log line.
 
 `tools/check-ntdll-tls.py` tests the shipped binary for the marker so this can
-never silently regress.
+never silently regress, and the workflow runs it on every build.
+
+### How 01 and 03 got in
+
+Not as patches. The user pulled `arm64ec-windows/ntdll.dll` out of the
+developer's working Build 79 IPA — which they have, and which is GPLv3 with its
+corresponding source published and held here — and committed it in place of
+ours. That is exactly what the developer's own `build_r6.py` does: start from a
+verified IPA and replace components.
+
+This is a stopgap, and it should be said plainly. We now ship a 4 MB binary we
+did not build, so we cannot change anything in wine's PE-side loader without
+going back to the same source. Building `ntdll.dll` from the pinned wine tree
+with llvm-mingw in CI remains the right end state; it would let 01 and 03 be
+applied as patches like the other eleven, and would unblock every future
+PE-side fix. The measurement above is what makes it worth doing rather than
+speculative.
 
 ### Why they cannot be applied as patches here
 
