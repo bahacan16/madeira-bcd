@@ -567,6 +567,12 @@ jobs:
           # known to work, in the exact machinery we are still failing in.
           python3 tools/patch-fex-link-log.py "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
 
+          # The 2026-09-22 fault is a branch to DispatchPtr with the guest's
+          # 8-mod-16 RSP. The only candidate caller is the ExitFunctionLinker
+          # stub's `blr x2`, and the fault-time registers neither confirm nor
+          # refute it. Log the call so the next dump can say which.
+          python3 tools/patch-fex-exitlink-trace.py "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/JIT/JIT.cpp"
+
           # Build 79's runtime-teb fix: Module.S reads the TEB slot ProcessInit
           # discovered instead of the 0x898 placeholder that wine's x18 patcher
           # is supposed to rewrite and, per 15 of 17 device logs, does not.

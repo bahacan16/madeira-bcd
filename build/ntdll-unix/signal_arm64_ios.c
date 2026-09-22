@@ -10323,6 +10323,41 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
                  * Deliver the honest AV; FEX's ResetToConsistentState takes the
                  * reconstruction path for c0000005 and rewrites the record to
                  * the true guest RIP (proven in ml419's fault #27 flow). */
+                /* iOS-Madeira ml790: say EXC_ARM_SP_ALIGN out loud instead of
+                 * inventing a data address for it.
+                 *
+                 * An SP-alignment fault has no faulting address. si_addr
+                 * arrives as 0, the readability probe above calls 0 unreadable,
+                 * and this path then reports "unreadable target addr=0x0" --
+                 * which sent the 2026-09-22 cube run looking for a null pointer
+                 * that does not exist. What actually happened there:
+                 *
+                 *   pc   = FEX's DispatchPtr (0x156ffc000, per [disp-addrs])
+                 *   insn = a9bf53f3  stp x19,x20,[sp,#-16]!
+                 *   sp   = 0x703881fef8, the guest's post-call RSP
+                 *
+                 * x86-64 hands every callee an 8-mod-16 RSP; ARM64 refuses
+                 * SP-relative accesses on it. kr=259 is EXC_ARM_SP_ALIGN and
+                 * says so, but only [fault_rip] prints kr and it prints 259 as
+                 * "other".
+                 *
+                 * Diagnosis only -- the exception still goes out as it did. A
+                 * wrong name for a fault costs a device round, and those are
+                 * the expensive thing here. */
+                {
+                    ULONG_PTR fsp = SP_sig( bus_ctx );
+                    uint32_t finsn = pc ? *(uint32_t *)(uintptr_t)pc : 0;
+
+                    /* Rn, the base register of a load/store, is bits 9:5; 31 is SP. */
+                    if ((fsp & 15) && ((finsn >> 5) & 0x1f) == 31)
+                        ERR("[sp-align] ml790 THIS IS AN SP-ALIGNMENT FAULT, not an access "
+                            "violation: sp=0x%llx (sp%%16=%d) pc=%p insn=%08x lr=0x%llx "
+                            "si_addr=%p -- an SP-relative access on a stack pointer that is "
+                            "8 mod 16, which is what x86-64 leaves after a call. There is no "
+                            "faulting data address; the addr=0x0 below is an artefact.\n",
+                            (unsigned long long)fsp, (int)(fsp & 15), pc, finsn,
+                            (unsigned long long)LR_sig( bus_ctx ), siginfo->si_addr);
+                }
                 rec = vrec;
                 ERR("BUS->AV: unreadable target addr=%p pc=%p rw=%d rev=ml420\n",
                     siginfo->si_addr, pc, (int)vrec.ExceptionInformation[0]);
