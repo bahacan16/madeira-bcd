@@ -1349,7 +1349,7 @@ static void ios_probe_jit_block_tail( const void *pc )
                          * and the bytes can be disassembled against the module
                          * off-device. */
                         {
-                            uint32_t tw[8] = { 0 };
+                            uint32_t tw[16] = { 0 };
                             int tgot = vm_read_overwrite( mach_task_self(), (vm_address_t)thunk,
                                                           sizeof(tw), (vm_address_t)tw,
                                                           &g2 ) == KERN_SUCCESS;
@@ -1362,6 +1362,73 @@ static void ios_probe_jit_block_tail( const void *pc )
                                 dprintf( STDERR_FILENO,
                                          "[ffs] entry thunk @%p UNREADABLE -- the branch target is not mapped\n",
                                          (void *)(uintptr_t)thunk );
+
+                            /* iOS-Madeira ml794: follow the thunk's way home.
+                             *
+                             * Read offline from ucrtbase.dll (byte-identical to
+                             * Build 79's) at the RVA the 2026-09-22 run computed,
+                             * the thunk is a genuine MSVC entry thunk -- saves
+                             * q6-q15 and x29/x30, `blr x9` -- so the outbound
+                             * branch is right. It returns like this:
+                             *
+                             *     adrp x8, <page>
+                             *     ldr  x1, [x8, #off]   ; __os_arm64x_dispatch_ret
+                             *     ...restore...
+                             *     br   x1
+                             *
+                             * The return target is a pointer the thunk loads from
+                             * its own module's .data, PC-relatively. On iOS the
+                             * thunk executes from the module's POOL COPY, so that
+                             * adrp resolves into the pool copy's .data -- not the
+                             * PE mapping, which is where wine's hybrid-metadata
+                             * pass writes. If the two disagree, every native call
+                             * from x64 returns to wherever the stale copy says.
+                             *
+                             * So decode the adrp/ldr pair, then read the slot in
+                             * both images. tgt_pe - tgt_pool is this module's
+                             * PE<->pool delta, so no module table is needed. */
+                            if (tgot && tgt_pool && tgt_pe)
+                            {
+                                int k;
+                                for (k = 7; k + 1 < 16; k++)
+                                {
+                                    uint32_t a = tw[k], l = tw[k + 1];
+                                    if ((a & 0x9f000000u) != 0x90000000u) continue;          /* ADRP */
+                                    if ((l & 0xffc00000u) != 0xf9400000u) continue;          /* LDR Xt,[Xn,#imm] */
+                                    if (((l >> 5) & 31) != (a & 31)) continue;               /* same base reg */
+                                    {
+                                        int64_t pimm = (int64_t)((((a >> 5) & 0x7ffff) << 2) | ((a >> 29) & 3));
+                                        uint64_t pc = thunk + (uint64_t)k * 4;
+                                        uint64_t slot_pool, slot_pe, v_pool = 0, v_pe = 0;
+                                        int r_pool, r_pe;
+                                        if (pimm & (1LL << 20)) pimm -= (1LL << 21);         /* sign-extend 21 bits */
+                                        slot_pool = (pc & ~0xfffULL) + (uint64_t)(pimm * 4096)
+                                                    + (uint64_t)(((l >> 10) & 0xfff) * 8);
+                                        slot_pe = slot_pool - tgt_pool + tgt_pe;
+                                        r_pool = vm_read_overwrite( mach_task_self(), (vm_address_t)slot_pool,
+                                                                    sizeof(v_pool), (vm_address_t)&v_pool,
+                                                                    &g2 ) == KERN_SUCCESS;
+                                        r_pe = vm_read_overwrite( mach_task_self(), (vm_address_t)slot_pe,
+                                                                  sizeof(v_pe), (vm_address_t)&v_pe,
+                                                                  &g2 ) == KERN_SUCCESS;
+                                        dprintf( STDERR_FILENO,
+                                                 "[ffs-ret] thunk returns via x%u = [slot]: pool slot %p = %s0x%llx, "
+                                                 "PE slot %p = %s0x%llx  %s\n",
+                                                 l & 31,
+                                                 (void *)(uintptr_t)slot_pool, r_pool ? "" : "?", (unsigned long long)v_pool,
+                                                 (void *)(uintptr_t)slot_pe, r_pe ? "" : "?", (unsigned long long)v_pe,
+                                                 !(r_pool && r_pe) ? "-- a slot is unreadable"
+                                                 : v_pool == v_pe ? "-- the copies AGREE"
+                                                 : "<== the POOL COPY DISAGREES with the PE image: the thunk "
+                                                   "returns through a pointer wine never wrote" );
+                                        break;
+                                    }
+                                }
+                                if (k + 1 >= 16)
+                                    dprintf( STDERR_FILENO,
+                                             "[ffs-ret] no adrp/ldr return-pointer pair in the first 16 thunk "
+                                             "words -- not the MSVC shape; bytes above\n" );
+                            }
                         }
                     }
                 }
