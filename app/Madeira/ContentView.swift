@@ -852,6 +852,35 @@ struct ContentView: View {
     @ObservedObject private var input = InputSettings.shared
     @State private var pointerPanel = false
     @State private var showGameLibrary = false
+    /// Physical controllers. A singleton that outlives every view, so
+    /// @ObservedObject rather than @StateObject -- same as `input` above.
+    @ObservedObject private var controllers = GameControllerManager.shared
+    @State private var showControllerSheet = false
+    /// The Wine virtual desktop's size. Persisted because it is a property of
+    /// the prefix the user set up, not of one launch, and it only takes effect
+    /// on the next desktop start.
+    @AppStorage("wine_desktop_res") private var desktopRes = "960x540"
+
+    /// 960x540 is the shipped default and the only size the desktop has ever
+    /// been run at here. The rest are the usual 16:9 steps plus 1024x768 for
+    /// titles that refuse widescreen; "native" asks for the device's own
+    /// points, which is what a game expecting a full screen wants.
+    static let desktopResolutions = ["native", "960x540", "1280x720", "1600x900", "1920x1080", "1024x768"]
+
+    /// Parses a stored value into a size, falling back to the default rather
+    /// than trusting a string that survived an app update.
+    static func desktopSize(_ value: String) -> (Int, Int) {
+        if value == "native" {
+            let b = UIScreen.main.bounds
+            return (max(640, Int(b.width)), max(480, Int(b.height)))
+        }
+        let parts = value.split(separator: "x")
+        if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]), w >= 640, h >= 480 {
+            return (w, h)
+        }
+        return (960, 540)
+    }
+
     @Namespace private var pointerNS
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
@@ -1084,6 +1113,20 @@ struct ContentView: View {
             entitlementBadge("JIT", granted: debuggerAttached)
             entitlementBadge("Memory+", granted: ents.increasedMemory)
             entitlementBadge("64-bit VA", granted: ents.extendedVA)
+            // Only when something is actually attached: an always-present
+            // "no controller" badge would spend the row on nothing.
+            if controllers.connectedControllersCount > 0 {
+                HStack(spacing: 4) {
+                    Image(systemName: "gamecontroller.fill")
+                        .foregroundColor(.green)
+                    Text(controllers.activeControllerName ?? "Controller")
+                        .font(.caption2)
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(Color.green.opacity(0.15))
+                .cornerRadius(4)
+            }
             Spacer()
             // Device model rides in this row (the old standalone statusHeader
             // row above it spent ~50pt of vertical space on nothing else).
@@ -1275,8 +1318,10 @@ struct ContentView: View {
                     // pass, RA liveness, or the ARM emitter.
                     //
                     // Compile-time only, capped at 4 captures. Unset it for a normal run.
-                    setenv("MADEIRA_IRCAP_RVA", "0x4db25b", 1)
-                    setenv("MADEIRA_IRCAP_MODULE", "mono-2.0-bdwgc.dll", 1)
+                    // (An IR-capture pin for mono-2.0-bdwgc.dll+0x4db25b used to
+                    // be set here. It answered its question; a compile-time
+                    // capture aimed at one RVA of one DLL has no business
+                    // firing on every press of a shipped button.)
                     setenv("MADEIRA_EXE", "explorer.exe", 1)
                     setenv("MADEIRA_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) cmd /c C:\\steam-launch.bat", 1)
@@ -1432,7 +1477,7 @@ struct ContentView: View {
                     // Known risk: if shellwindows_init beats services.exe's
                     // RPC_Init, OpenSCManager fails → watch whether that
                     // fails fast or hits the RaiseException→CS wedge again.
-                    let deskW = 960, deskH = 540
+                    let (deskW, deskH) = Self.desktopSize(desktopRes)
                     setenv("MADEIRA_EXE", "explorer.exe", 1)
                     setenv("MADEIRA_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
@@ -1443,6 +1488,24 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.mint)
+
+                // Beside the button it affects, because it only takes effect on
+                // the next desktop start and a setting buried in a sheet would
+                // not say that.
+                Picker("Desktop size", selection: $desktopRes) {
+                    ForEach(Self.desktopResolutions, id: \.self) { Text($0).tag($0) }
+                }
+                .pickerStyle(.menu)
+
+                Button {
+                    showControllerSheet = true
+                } label: {
+                    Label(controllers.connectedControllersCount > 0
+                            ? "Controller: \(controllers.activeControllerName ?? "connected")"
+                            : "Controllers",
+                          systemImage: "gamecontroller")
+                }
+                .buttonStyle(.bordered)
 
                 // ml741: Stray (UE4). Launch the shipping binary DIRECTLY rather
                 // than Stray.exe -- the launcher builds its child's command line
@@ -1579,6 +1642,9 @@ struct ContentView: View {
                 .tint(.red)
             }
             .padding()
+        }
+        .sheet(isPresented: $showControllerSheet) {
+            ControllerSetupSheet()
         }
         .sheet(isPresented: $showGameLibrary) {
             GameLibraryView(
@@ -3176,5 +3242,85 @@ struct MappingPanel: View {
                     .fill(.white.opacity(on ? 0.36 : 0.12)))
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// Controller status, an on/off switch, and a live input tester.
+///
+/// Ported from SaimSuhailQu/Madeira (commit 72ca339) alongside
+/// GameControllerManager.swift. Their "Persistent Virtual Gamepad" toggle is
+/// left out: the flag it sets has no reader in either tree, and a switch that
+/// does nothing is worse than no switch.
+///
+/// The input tester is the part worth having. Controller mapping is invisible
+/// until a game reacts, and a game reacting is a long way down the chain from
+/// here -- this says whether the button reached us at all.
+struct ControllerSetupSheet: View {
+    @ObservedObject private var manager = GameControllerManager.shared
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Controllers") {
+                    Toggle("Enable game controllers", isOn: $manager.isEnabled)
+                        .tint(.green)
+
+                    HStack {
+                        Text("Connected")
+                        Spacer()
+                        Text("\(manager.connectedControllersCount)")
+                            .foregroundColor(.secondary)
+                    }
+
+                    HStack {
+                        Text(manager.activeControllerName == nil ? "Status" : "Active")
+                        Spacer()
+                        Text(manager.activeControllerName
+                             ?? (manager.isEnabled ? "scanning…" : "disabled"))
+                            .foregroundColor(manager.activeControllerName != nil ? .primary
+                                             : (manager.isEnabled ? .orange : .secondary))
+                    }
+
+                    Button("Scan again") { manager.refreshControllers() }
+                        .disabled(!manager.isEnabled)
+                }
+
+                Section("Live input") {
+                    HStack {
+                        Text("Last")
+                        Spacer()
+                        Text(manager.lastPressedButton)
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundColor(.green)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(String(format: "Left stick (WASD)   x %.2f  y %.2f",
+                                    manager.leftStickValues.x, manager.leftStickValues.y))
+                        Text(String(format: "Right stick (arrows) x %.2f  y %.2f",
+                                    manager.rightStickValues.x, manager.rightStickValues.y))
+                        Text(String(format: "Triggers             LT %.2f  RT %.2f",
+                                    manager.triggerValues.0, manager.triggerValues.1))
+                    }
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                }
+
+                Section("Mapping") {
+                    Text("A→Space  B→Esc  X→E  Y→R  LB→Shift  RB→Tab  L3→Ctrl  R3→F  "
+                         + "LT→right click  RT→left click  Menu→Esc  Share→Enter  "
+                         + "left stick→WASD  right stick and D-pad→arrows.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("Controllers")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
     }
 }
