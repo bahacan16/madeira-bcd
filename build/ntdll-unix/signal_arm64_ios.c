@@ -4436,14 +4436,60 @@ skip_reclaim_band: ;
                                      (unsigned long long)state.__sp, (unsigned long long)state.__lr );
                         }
 
+                        /* ml565: PC landed on a non-code address. Two things pin
+                         * down which emitted sequence branched there, and neither
+                         * needs another guess:
+                         *
+                         *  - name the register whose value equals PC. FEX's exits
+                         *    are `br TMP1` (dispatcher, Dispatcher.cpp:423) and
+                         *    `br TMP2` (the ARM64EC path, BranchOps.cpp:87), so the
+                         *    register names the path.
+                         *  - dump the block the dispatcher last branched to. LR is
+                         *    stale after a `br`, so the only handle on the running
+                         *    block is TMP1, which still holds that target. The
+                         *    branch that killed us is inside it. */
+                        {
+                            int ri2;
+                            char rl2[256]; int rn2 = 0;
+                            rn2 += snprintf( rl2 + rn2, sizeof(rl2) - rn2, "[branch-src] PC matches:" );
+                            for (ri2 = 0; ri2 <= 30; ri2++)
+                                if ((uint64_t)state.__x[ri2] == (uint64_t)(uintptr_t)fault_pc && rn2 < (int)sizeof(rl2) - 12)
+                                    rn2 += snprintf( rl2 + rn2, sizeof(rl2) - rn2, " x%d", ri2 );
+                            if ((uint64_t)state.__lr == (uint64_t)(uintptr_t)fault_pc)
+                                rn2 += snprintf( rl2 + rn2, sizeof(rl2) - rn2, " lr" );
+                            dprintf( STDERR_FILENO, "%s%s\n", rl2,
+                                     rn2 > 24 ? "  (TMP1=x10 dispatcher exit, TMP2=x11 ARM64EC exit)" : " none" );
+
+                            {
+                                uint64_t blk = (uint64_t)state.__x[10];
+                                uint32_t w[24];
+                                vm_size_t g3 = 0;
+                                if (blk >= 0x100000000ULL &&
+                                    vm_read_overwrite( mach_task_self(), (vm_address_t)blk,
+                                                       sizeof(w), (vm_address_t)w, &g3 ) == KERN_SUCCESS)
+                                {
+                                    char bl[512]; int bn = 0, bi;
+                                    bn += snprintf( bl + bn, sizeof(bl) - bn,
+                                                    "[branch-blk] x10=%p (dispatcher's last target):", (void *)(uintptr_t)blk );
+                                    for (bi = 0; bi < 24 && bn < (int)sizeof(bl) - 12; bi++)
+                                        bn += snprintf( bl + bn, sizeof(bl) - bn, " %08x", w[bi] );
+                                    dprintf( STDERR_FILENO, "%s\n", bl );
+                                }
+                            }
+                        }
+
                         {
                             uint64_t st = (uint64_t)state.__x[28];
                             struct { unsigned off; const char *name; } slots[] = {
                                 { 0x638, "ExitFunctionLink" },
                                 { 0x660, "ExitFunctionEC" },
+                                /* ExitFunctionLink returns this on the TF and
+                                 * unpublished-compile paths, so a bad value here
+                                 * reaches the dispatcher's br as a return value. */
+                                { 0x610, "DispatcherLoopTop?" },
                             };
                             unsigned i;
-                            for (i = 0; i < 2; i++)
+                            for (i = 0; i < 3; i++)
                             {
                                 uint64_t val = 0; uint32_t head[4] = {0,0,0,0};
                                 vm_size_t got = 0;
