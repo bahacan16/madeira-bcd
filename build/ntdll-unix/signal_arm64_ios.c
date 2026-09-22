@@ -4478,18 +4478,75 @@ skip_reclaim_band: ;
                             }
                         }
 
+                        /* ml566: the fault PC keeps landing inside a JIT block's own
+                         * JITCodeTail -- tail+8 on 2026-09-15, tail+24 on 2026-09-22 --
+                         * and [branch-src] finds no register holding it, so this is not
+                         * a bad branch target. It is a bad RETURN address: control left
+                         * for native EC code (x11 no longer holds ExitFunctionEC, x16
+                         * carries ExitToX64's ldursw signature) and came back here.
+                         *
+                         * A return address is stored somewhere before it is used, so
+                         * look for PC in the two places FEX and wine keep them: the
+                         * callret shadow stack (pairs of {guest RIP, host PC} at
+                         * State.callret_sp) and the guest stack around RSP. Whichever
+                         * holds it names who wrote it. */
+                        {
+                            uint64_t crsp = (uint64_t)state.__x[17];
+                            uint64_t grsp = (uint64_t)state.__x[23];
+                            uint64_t want = (uint64_t)(uintptr_t)fault_pc;
+                            vm_size_t g4 = 0;
+                            uint64_t buf[64];
+                            int k, hits = 0;
+
+                            if (crsp >= 0x100000000ULL &&
+                                vm_read_overwrite( mach_task_self(), (vm_address_t)crsp,
+                                                   sizeof(uint64_t) * 32, (vm_address_t)buf, &g4 ) == KERN_SUCCESS)
+                            {
+                                for (k = 0; k < 32; k++)
+                                    if (buf[k] == want)
+                                    {
+                                        dprintf( STDERR_FILENO,
+                                                 "[tail-origin] PC is in the CALLRET shadow stack at callret_sp+0x%x "
+                                                 "(%s of entry %d) -- FEX recorded it as a host return PC\n",
+                                                 (unsigned)(k * 8), (k & 1) ? "hostPC" : "retRIP", k / 2 );
+                                        hits++;
+                                    }
+                            }
+
+                            if (grsp >= 0x1000 &&
+                                vm_read_overwrite( mach_task_self(), (vm_address_t)(grsp - 128),
+                                                   sizeof(buf), (vm_address_t)buf, &g4 ) == KERN_SUCCESS)
+                            {
+                                for (k = 0; k < 64; k++)
+                                    if (buf[k] == want)
+                                    {
+                                        dprintf( STDERR_FILENO,
+                                                 "[tail-origin] PC is on the GUEST STACK at RSP%+d -- something pushed "
+                                                 "a host address where the guest expects a return address\n",
+                                                 (int)(k * 8) - 128 );
+                                        hits++;
+                                    }
+                            }
+
+                            if (!hits)
+                                dprintf( STDERR_FILENO,
+                                         "[tail-origin] PC is in neither the callret stack (sp=%p) nor the guest stack "
+                                         "around RSP=%p -- it was computed, not stored\n",
+                                         (void *)(uintptr_t)crsp, (void *)(uintptr_t)grsp );
+                        }
+
                         {
                             uint64_t st = (uint64_t)state.__x[28];
                             struct { unsigned off; const char *name; } slots[] = {
                                 { 0x638, "ExitFunctionLink" },
                                 { 0x660, "ExitFunctionEC" },
-                                /* ExitFunctionLink returns this on the TF and
-                                 * unpublished-compile paths, so a bad value here
-                                 * reaches the dispatcher's br as a return value. */
-                                { 0x610, "DispatcherLoopTop?" },
+                                /* 0x610 was a guess at DispatcherLoopTop and it is
+                                 * wrong: the 2026-09-22 run read 0x7c01110238 there,
+                                 * whose first words are a stored pointer, not code.
+                                 * Dropped rather than left to mislead. */
                             };
                             unsigned i;
-                            for (i = 0; i < 3; i++)
+                            for (i = 0; i < 2; i++)
                             {
                                 uint64_t val = 0; uint32_t head[4] = {0,0,0,0};
                                 vm_size_t got = 0;
