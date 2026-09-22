@@ -291,6 +291,23 @@ by argument:
   `xtajit64.dll`, relocated fields masked: **0 of 229 words differ**;
 * **suspension** -- no BREAKPOINT or `brk #0xCAFE` in any log.
 
+**The developer had already found this.** FEX's own `JIT.cpp` says so, in a
+comment dated 2026-07-06:
+
+> cross-modifying code flushes MUST go through the kernel
+> (NtFlushInstructionCache -> __clear_cache -> sys_icache_invalidate) ... a
+> core already executing near the target kept stale icache lines (prefill
+> NOPs) and slid into block-tail data: every Thumper-desktop ILL pc was exactly
+> 64-byte cache-line aligned.
+
+Same bug, same signature, fixed in July by routing FEX's block flush and its
+link backpatches (`IOSFlushOneInstr`) through `NtFlushInstructionCache` -- on
+the assumption that wine's side reaches `__clear_cache`. In Build 79 it does.
+In this tree that branch was never compiled, so the July fix turned into no
+flush at all: worse than the inline `dc`/`ic` it replaced. The derivation above
+was made without having seen that comment; it is reassuring that it lands on
+the same mechanism and the same 64-byte signature.
+
 The fix calls `sys_icache_invalidate` for the current process, under the same
 `WINE_IOS` guard `<libkern/OSCacheControl.h>` is included under.
 `tools/check-transplant.py` now fails the build if it disappears.
