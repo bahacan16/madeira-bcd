@@ -164,10 +164,13 @@ own that Build 79 does not:
   repack's cause. Removed 2026-09-22.
 * **`--section-alignment=0x4000`.** Build 79's binary is 0x1000-aligned, which
   means `.data` lands off iOS's 16KB grid and `ios_jit_data_align_delta`
-  shifts the whole pool copy -- and it works anyway. Ours avoids that path.
-  Kept for now: commit 003731d already established the alignment was not the
-  cause of anything, so this is a layout preference rather than a fix, but it
-  is a divergence and it is now reported on every build.
+  shifts the whole pool copy -- and it works anyway. Removed 2026-09-22. It was
+  added to avoid that shift; 003731d then measured that the shift was a side
+  effect and not the cause of anything. What settled it was the first
+  fingerprint run: the flag puts `.text` at RVA 0x4000 instead of 0x1000, which
+  changes every PC-relative constant in two megabytes of code, and **7711 of
+  8189 chunks differed** from a binary built from the same source. A layout
+  preference is not worth that.
 
 `tools/xtajit-fingerprint.py` holds Build 79's binary as per-chunk hashes
 (`tools/ref/xtajit64-build79.fp`, 256-byte chunks over `.text`) and compares

@@ -580,6 +580,15 @@ jobs:
             "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/CPUID.cpp" \
             "$GITHUB_WORKSPACE/FEX/FEXCore/Source/Interface/Core/CPUID.h"
 
+          # No --section-alignment=0x4000. It was added on 2026-09-16 to keep
+          # .data on iOS's 16KB grid so virtual_ios.c would not shift the pool
+          # copy; commit 003731d then measured that the shift was a side effect
+          # and not the cause of anything. Build 79's own binary is
+          # 0x1000-aligned, takes the shift, and runs the games. Meanwhile the
+          # flag moves .text from RVA 0x1000 to 0x4000, which changes every
+          # PC-relative constant in two megabytes of code -- it made 7711 of
+          # 8189 fingerprint chunks differ from a binary built from the same
+          # source. Matching the layout is worth more than avoiding the shift.
           cmake -S "$GITHUB_WORKSPACE/FEX" -B "$GITHUB_WORKSPACE/FEX/build-arm64ec" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/FEX/Data/CMake/toolchain_mingw.cmake" \
             -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
@@ -590,7 +599,6 @@ jobs:
             -DBUILD_TESTING=OFF -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF \
             -DBUILD_FEXCONFIG=OFF -DBUILD_THUNKS=OFF \
             -DTUNE_CPU=generic -DTUNE_ARCH=generic \
-            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--section-alignment=0x4000" \
             > "$GITHUB_WORKSPACE/arm64ec-cfg.log" 2>&1
           cfg=$?
           echo "configure exit=$cfg"
