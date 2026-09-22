@@ -17554,7 +17554,13 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
      * alias is readable, so it is a valid address for both. */
     if (handle == GetCurrentProcess())
     {
+        static int seen;
         if (addr && size) sys_icache_invalidate( (void *)addr, size );
+        /* Say so, a few times. The old build logged a FIXME here and flushed
+         * nothing; the absence of that FIXME is weaker evidence than this. */
+        if (seen < 3 && ++seen)
+            ERR( "[icache] ml795 invalidated %p+%lu (call %d) -- the pre-fix build "
+                 "flushed nothing here\n", addr, (unsigned long)size, seen );
     }
     else
     {
