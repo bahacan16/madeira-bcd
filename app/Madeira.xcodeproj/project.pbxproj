@@ -53,6 +53,7 @@
 		A1000201 /* LogTail.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000201 /* LogTail.swift */; };
 		A1000203 /* GameLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000203 /* GameLibrary.swift */; };
 		A1000204 /* GameControllerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000204 /* GameControllerManager.swift */; };
+		A1000205 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000205 /* HomeView.swift */; };
 		A1000202 /* FPSOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000202 /* FPSOverlay.swift */; };
 /* End PBXBuildFile section */
 
@@ -114,6 +115,7 @@
 		A2000201 /* LogTail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogTail.swift; sourceTree = "<group>"; };
 		A2000203 /* GameLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameLibrary.swift; sourceTree = "<group>"; };
 		A2000204 /* GameControllerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameControllerManager.swift; sourceTree = "<group>"; };
+		A2000205 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		A2000202 /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -170,6 +172,7 @@
 				A2000202 /* FPSOverlay.swift */,
 				A2000203 /* GameLibrary.swift */,
 				A2000204 /* GameControllerManager.swift */,
+				A2000205 /* HomeView.swift */,
 				A2000004 /* JITAllocator.c */,
 				A2000005 /* JITAllocator.h */,
 				A200000B /* FEXBridge.mm */,
@@ -321,6 +324,7 @@
 				A1000202 /* FPSOverlay.swift in Sources */,
 				A1000203 /* GameLibrary.swift in Sources */,
 				A1000204 /* GameControllerManager.swift in Sources */,
+				A1000205 /* HomeView.swift in Sources */,
 				A1000004 /* JITAllocator.c in Sources */,
 				A1000005 /* EntitlementChecker.swift in Sources */,
 				A1000006 /* FEXBridge.mm in Sources */,

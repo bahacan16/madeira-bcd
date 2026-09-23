@@ -885,6 +885,17 @@ struct ContentView: View {
     /// .compact = iPhone landscape: game surface expands, arrow keys appear.
     @Environment(\.verticalSizeClass) private var vSizeClass
 
+    /// Set by the library (HomeView): what to start as soon as this view is up.
+    /// nil means the developer panel, which starts nothing on its own.
+    let pendingLaunch: LaunchRequest?
+
+    init(pendingLaunch: LaunchRequest? = nil) {
+        self.pendingLaunch = pendingLaunch
+    }
+
+    /// onAppear can run again (rotation swaps the body), and a launch must not.
+    private static var pendingLaunchConsumed = false
+
     enum JITStatus {
         case unknown
         case testing
@@ -920,6 +931,16 @@ struct ContentView: View {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
                 logEntitlementStatus()
+                if let launch = pendingLaunch, !Self.pendingLaunchConsumed {
+                    Self.pendingLaunchConsumed = true
+                    launch.apply()
+                    logStore.log("Starting \(launch.title) from the library", level: .info)
+                    // Let the surface lay out first -- the buttons this replaces
+                    // were only ever pressed with the view already on screen.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        runWineFullSequence()
+                    }
+                }
             }
         }
     }
