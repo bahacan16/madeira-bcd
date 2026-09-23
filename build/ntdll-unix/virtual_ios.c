@@ -13679,16 +13679,51 @@ static unsigned long long ios_swap_footprint_mb( unsigned long long *internal, u
     return (unsigned long long)vmi.phys_footprint >> 20;
 }
 
+/* ml797: NOT $HOME. The app points HOME at the Wine prefix (Documents/wine)
+ * before Wine starts, so $HOME/Library/Caches does not exist and the ml796
+ * build failed its self-test with ENOENT. The app now exports its real Caches
+ * directory; the Darwin per-user cache dir and TMPDIR are fallbacks -- all
+ * three live inside the app container on iOS. */
+static const char *ios_swap_dir(void)
+{
+    static char dir[PATH_MAX];
+    static int resolved;
+    const char *cand[3];
+    char darwin[PATH_MAX];
+    int i;
+
+    if (resolved) return dir[0] ? dir : NULL;
+    resolved = 1;
+    cand[0] = getenv( "MADEIRA_SWAP_DIR" );
+#ifdef _CS_DARWIN_USER_CACHE_DIR
+    cand[1] = confstr( _CS_DARWIN_USER_CACHE_DIR, darwin, sizeof(darwin) ) ? darwin : NULL;
+#else
+    cand[1] = NULL; (void)darwin;
+#endif
+    cand[2] = getenv( "TMPDIR" );
+    for (i = 0; i < 3; i++)
+    {
+        if (!cand[i] || !cand[i][0] || access( cand[i], W_OK )) continue;
+        snprintf( dir, sizeof(dir), "%s", cand[i] );
+        dprintf( 2, "[swap] ml797 swap files go in %s (source %s)\n", dir,
+                 i == 0 ? "MADEIRA_SWAP_DIR" : i == 1 ? "_CS_DARWIN_USER_CACHE_DIR" : "TMPDIR" );
+        return dir;
+    }
+    dprintf( 2, "[swap] ml797 no writable directory for swap files (MADEIRA_SWAP_DIR=%s TMPDIR=%s)\n",
+             cand[0] ? cand[0] : "(unset)", cand[2] ? cand[2] : "(unset)" );
+    return NULL;
+}
+
 static void *ios_swap_file_map( void *base, size_t size, int prot, int fixed )
 {
     static unsigned int seq;
     char path[PATH_MAX];
-    const char *home = getenv( "HOME" );
+    const char *dir = ios_swap_dir();
     void *p;
     int fd;
 
-    if (!home) return MAP_FAILED;
-    snprintf( path, sizeof(path), "%s/Library/Caches/madeira-swap-%d-%u", home, (int)getpid(), seq++ );
+    if (!dir) { errno = ENOENT; return MAP_FAILED; }
+    snprintf( path, sizeof(path), "%s/madeira-swap-%d-%u", dir, (int)getpid(), seq++ );
     if ((fd = open( path, O_RDWR | O_CREAT | O_EXCL, 0600 )) < 0) return MAP_FAILED;
     unlink( path );
     if (ftruncate( fd, (off_t)size ))
@@ -13739,7 +13774,7 @@ static void ios_swap_selftest(void)
 
 static void ios_swap_back_view( struct file_view *view, int unix_prot )
 {
-    const char *home;
+    const char *dir;
     struct statfs sfs;
     void *p;
 
@@ -13754,11 +13789,11 @@ static void ios_swap_back_view( struct file_view *view, int unix_prot )
     }
     if (!ios_swap_min_mb || view->size < ((size_t)ios_swap_min_mb << 20)) return;
     if (((UINT_PTR)view->base & host_page_mask) || (view->size & host_page_mask)) return;
-    if (!(home = getenv( "HOME" ))) return;
+    if (!(dir = ios_swap_dir())) return;
 
     /* Sparse, so no space is taken up front -- but pages are written out
      * under pressure, and a full disk would leave them nowhere to go. */
-    if (!statfs( home, &sfs ) && (unsigned long long)sfs.f_bavail * sfs.f_bsize < (4ULL << 30))
+    if (!statfs( dir, &sfs ) && (unsigned long long)sfs.f_bavail * sfs.f_bsize < (4ULL << 30))
     {
         static int warned;
         if (!warned++) dprintf( 2, "[swap] ml796 under 4 GB free on disk -- leaving allocations in RAM\n" );

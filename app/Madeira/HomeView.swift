@@ -78,6 +78,11 @@ enum ExperimentalSettings {
     /// Must run before runWineFullSequence -- ntdll-unix reads it once.
     static func exportToEnvironment() {
         if storageBackedMemory { setenv("MADEIRA_SWAP", "1", 1) } else { unsetenv("MADEIRA_SWAP") }
+        // ml797: HOME is repointed at the Wine prefix, so ntdll cannot derive
+        // this itself -- hand it the container's real Caches directory.
+        if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            setenv("MADEIRA_SWAP_DIR", caches.path, 1)
+        }
     }
 }
 
