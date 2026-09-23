@@ -83,6 +83,7 @@ extern kern_return_t vm_protect(mach_port_t target_task, vm_address_t address,
 #include <dlfcn.h>
 #ifdef WINE_IOS
 #include <libkern/OSCacheControl.h>
+#include <sys/mount.h>   /* statfs, for ml796 storage-backed memory */
 #endif
 #ifdef HAVE_VALGRIND_VALGRIND_H
 # include <valgrind/valgrind.h>
@@ -13634,6 +13635,153 @@ void virtual_set_large_address_space(void)
  *
  * NtAllocateVirtualMemory[Ex] implementation.
  */
+/***********************************************************************
+ *           iOS-Madeira ml796: storage-backed guest memory (experimental)
+ *
+ * iOS has no swap for apps. Jetsam kills the foreground app when its
+ * phys_footprint passes the limit, and phys_footprint counts ANONYMOUS memory
+ * -- which is all a Windows heap is. What it does not count is file-backed
+ * memory: our own [footprint] line splits the two ("internal" vs "external"),
+ * and the external half is the kernel's to write back to its file and evict
+ * whenever it needs the RAM.
+ *
+ * So with MADEIRA_SWAP=1, a large guest allocation is re-backed, right after
+ * map_view creates it, by a MAP_SHARED mapping of a sparse file of the same
+ * size in Library/Caches. The file is unlinked the moment it is open: its
+ * blocks live exactly as long as the mapping, nothing is left behind by a
+ * crash, and untouched pages cost no disk at all.
+ *
+ * What it deliberately does not touch:
+ *   - anything executable, or ever mapped with force_exec_prot -- code has to
+ *     stay where the JIT pool and code signing expect it;
+ *   - MEM_WRITE_WATCH and placeholder views, whose bookkeeping assumes the
+ *     anonymous mapping they were created with;
+ *   - anything smaller than MADEIRA_SWAP_MIN_MB (default 128): small blocks
+ *     are FEX's hot tables and allocator arenas, where a page-in would hurt
+ *     and the saving is nothing. Game heaps and asset pools are the target.
+ * A decommitted range goes back to anonymous memory through the normal path;
+ * that is correct, it just stops being offloaded.
+ *
+ * Whether iOS 27 actually keeps dirty MAP_SHARED pages out of phys_footprint
+ * is the premise, so the first call measures it: 256 MB anonymous vs 256 MB
+ * file-backed, footprint before and after, into the log as [swap-selftest].
+ */
+static int ios_swap_min_mb = -1;          /* -1 not yet read, 0 disabled */
+static unsigned long long ios_swap_backed_mb;
+
+static unsigned long long ios_swap_footprint_mb( unsigned long long *internal, unsigned long long *external )
+{
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &cnt ) != KERN_SUCCESS) return 0;
+    if (internal) *internal = (unsigned long long)vmi.internal >> 20;
+    if (external) *external = (unsigned long long)vmi.external >> 20;
+    return (unsigned long long)vmi.phys_footprint >> 20;
+}
+
+static void *ios_swap_file_map( void *base, size_t size, int prot, int fixed )
+{
+    static unsigned int seq;
+    char path[PATH_MAX];
+    const char *home = getenv( "HOME" );
+    void *p;
+    int fd;
+
+    if (!home) return MAP_FAILED;
+    snprintf( path, sizeof(path), "%s/Library/Caches/madeira-swap-%d-%u", home, (int)getpid(), seq++ );
+    if ((fd = open( path, O_RDWR | O_CREAT | O_EXCL, 0600 )) < 0) return MAP_FAILED;
+    unlink( path );
+    if (ftruncate( fd, (off_t)size ))
+    {
+        close( fd );
+        return MAP_FAILED;
+    }
+    p = mmap( base, size, prot, MAP_SHARED | (fixed ? MAP_FIXED : 0), fd, 0 );
+    close( fd );   /* the mapping keeps the vnode alive */
+    return p;
+}
+
+static void ios_swap_selftest(void)
+{
+    const size_t sz = 256u << 20;
+    unsigned long long f0, f1, f2, i0, i1, e0, e1;
+    void *p;
+
+    f0 = ios_swap_footprint_mb( &i0, &e0 );
+    p = mmap( NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
+    if (p != MAP_FAILED)
+    {
+        memset( p, 0xa5, sz );
+        f1 = ios_swap_footprint_mb( NULL, NULL );
+        munmap( p, sz );
+        dprintf( 2, "[swap-selftest] ml796 256 MB ANONYMOUS, dirtied: footprint %llu -> %llu MB (%+lld)\n",
+                 f0, f1, (long long)(f1 - f0) );
+    }
+
+    f0 = ios_swap_footprint_mb( &i0, &e0 );
+    p = ios_swap_file_map( NULL, sz, PROT_READ | PROT_WRITE, 0 );
+    if (p == MAP_FAILED)
+    {
+        dprintf( 2, "[swap-selftest] ml796 could not create a file-backed mapping (errno %d) -- "
+                 "storage-backed memory is OFF for this run\n", errno );
+        ios_swap_min_mb = 0;
+        return;
+    }
+    memset( p, 0xa5, sz );
+    f2 = ios_swap_footprint_mb( &i1, &e1 );
+    munmap( p, sz );
+    dprintf( 2, "[swap-selftest] ml796 256 MB FILE-BACKED, dirtied: footprint %llu -> %llu MB (%+lld), "
+             "internal %+lld MB, external %+lld MB -- %s\n",
+             f0, f2, (long long)(f2 - f0), (long long)(i1 - i0), (long long)(e1 - e0),
+             (long long)(f2 - f0) < 64 ? "iOS does NOT charge it to the jetsam footprint: offload works"
+                                       : "iOS CHARGES it like anonymous memory: offload buys nothing here" );
+}
+
+static void ios_swap_back_view( struct file_view *view, int unix_prot )
+{
+    const char *home;
+    struct statfs sfs;
+    void *p;
+
+    if (ios_swap_min_mb < 0)
+    {
+        const char *on = getenv( "MADEIRA_SWAP" ), *min = getenv( "MADEIRA_SWAP_MIN_MB" );
+        ios_swap_min_mb = (on && on[0] == '1') ? (min && atoi( min ) > 0 ? atoi( min ) : 128) : 0;
+        if (!ios_swap_min_mb) return;
+        dprintf( 2, "[swap] ml796 storage-backed memory ENABLED for guest allocations >= %d MB\n",
+                 ios_swap_min_mb );
+        ios_swap_selftest();
+    }
+    if (!ios_swap_min_mb || view->size < ((size_t)ios_swap_min_mb << 20)) return;
+    if (((UINT_PTR)view->base & host_page_mask) || (view->size & host_page_mask)) return;
+    if (!(home = getenv( "HOME" ))) return;
+
+    /* Sparse, so no space is taken up front -- but pages are written out
+     * under pressure, and a full disk would leave them nowhere to go. */
+    if (!statfs( home, &sfs ) && (unsigned long long)sfs.f_bavail * sfs.f_bsize < (4ULL << 30))
+    {
+        static int warned;
+        if (!warned++) dprintf( 2, "[swap] ml796 under 4 GB free on disk -- leaving allocations in RAM\n" );
+        return;
+    }
+
+    p = ios_swap_file_map( view->base, view->size, unix_prot, 1 );
+    if (p == view->base)
+    {
+        static int logged;
+        ios_swap_backed_mb += view->size >> 20;
+        if (logged++ < 12)
+            dprintf( 2, "[swap] ml796 %p+%zu MB now storage-backed (total %llu MB)\n",
+                     view->base, view->size >> 20, ios_swap_backed_mb );
+        return;
+    }
+    /* A failed MAP_FIXED may already have taken the old range down: put a
+     * fresh anonymous mapping back so the view is exactly as map_view left it. */
+    anon_mmap_fixed( view->base, view->size, unix_prot, 0 );
+    dprintf( 2, "[swap] ml796 %p+%zu MB could not be storage-backed (errno %d) -- kept in RAM\n",
+             view->base, view->size >> 20, errno );
+}
+
 static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG type, ULONG protect,
                                          ULONG_PTR limit_low, ULONG_PTR limit_high,
                                          ULONG_PTR align, ULONG attributes )
@@ -13708,6 +13856,9 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             {
                 base = view->base;
                 if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
+                else if (!is_dos_memory &&
+                         !(vprot & (VPROT_WRITEWATCH | VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER)))
+                    ios_swap_back_view( view, get_unix_prot( vprot ) & ~PROT_EXEC );
 
                 /* iOS-Madeira ml308 (task #54): DETECT VA HANDED OUT TWICE.
                  *

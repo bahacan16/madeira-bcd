@@ -39,6 +39,7 @@ struct LaunchRequest {
     let desktop: (w: Int, h: Int)?
 
     func apply() {
+        ExperimentalSettings.exportToEnvironment()
         setenv("MADEIRA_EXE", exe, 1)
         if let a = args, !a.isEmpty { setenv("MADEIRA_ARGS", a, 1) } else { unsetenv("MADEIRA_ARGS") }
         if let d = desktop {
@@ -62,6 +63,24 @@ struct LaunchRequest {
     static let x64Cube = LaunchRequest(title: "x64 DX11 Cube", exe: "cube-x64.exe", args: nil, desktop: nil)
 }
 
+// MARK: - Experimental settings
+
+/// Opt-in switches that change how the runtime behaves, exported to the
+/// environment the unix side reads. Off by default: each is a measurement
+/// waiting to happen, not a known win.
+enum ExperimentalSettings {
+    static let storageBackedMemoryKey = "madeira.experimental.storageBackedMemory"
+
+    static var storageBackedMemory: Bool {
+        UserDefaults.standard.bool(forKey: storageBackedMemoryKey)
+    }
+
+    /// Must run before runWineFullSequence -- ntdll-unix reads it once.
+    static func exportToEnvironment() {
+        if storageBackedMemory { setenv("MADEIRA_SWAP", "1", 1) } else { unsetenv("MADEIRA_SWAP") }
+    }
+}
+
 // MARK: - Root
 
 struct RootView: View {
@@ -76,7 +95,10 @@ struct RootView: View {
         switch screen {
         case .home:
             HomeView(onLaunch: { screen = .session($0) },
-                     onDeveloper: { screen = .session(nil) })
+                     onDeveloper: {
+                         ExperimentalSettings.exportToEnvironment()
+                         screen = .session(nil)
+                     })
         case .session(let request):
             ContentView(pendingLaunch: request)
         }
@@ -845,6 +867,7 @@ struct AppSettingsSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage("wine_desktop_res") private var desktopRes = "960x540"
+    @AppStorage(ExperimentalSettings.storageBackedMemoryKey) private var storageBackedMemory = false
     @State private var showControllers = false
 
     var body: some View {
@@ -870,6 +893,19 @@ struct AppSettingsSheet: View {
                     Text("Games")
                 } footer: {
                     Text("Games live in the Windows drive: On My iPhone › Madeira › wine › drive_c.")
+                }
+
+                Section {
+                    Toggle(isOn: $storageBackedMemory) {
+                        Label("Storage-backed memory", systemImage: "internaldrive")
+                    }
+                } header: {
+                    Text("Experimental")
+                } footer: {
+                    Text("Backs a game's large memory allocations (128 MB and up) with space on the device's "
+                         + "storage, so iOS can move them out of RAM instead of closing Madeira when a game "
+                         + "needs more than fits. Costs some speed when that happens, and writes to storage. "
+                         + "Takes effect at the next launch; the log shows [swap] lines when it is working.")
                 }
 
                 Section {
