@@ -18,6 +18,10 @@
 //    own buttons do. Every launch path in the old panel still exists, reachable
 //    as "Developer tools".
 //
+//  Targets iOS 26+, so it uses Liquid Glass for the floating controls (chips,
+//  badges, play buttons) and leaves the box art and cards opaque -- glass is
+//  for things that sit on top of content, and the covers are the content.
+//
 
 import SwiftUI
 import PhotosUI
@@ -330,6 +334,7 @@ struct HomeView: View {
     // MARK: Sections
 
     private var statusRow: some View {
+        GlassEffectContainer(spacing: 8) {
         HStack(spacing: 8) {
             StatusChip(icon: "bolt.fill", text: jitOn ? "JIT on" : "JIT off", tint: jitOn ? .green : .orange)
             if controllers.connectedControllersCount > 0 {
@@ -338,6 +343,7 @@ struct HomeView: View {
             }
             StatusChip(icon: "square.stack.3d.up.fill", text: "\(games.count) games", tint: .blue)
             Spacer()
+        }
         }
         .padding(.top, 4)
     }
@@ -416,7 +422,7 @@ struct HomeView: View {
                     .font(.title3)
                     .foregroundStyle(.white)
                     .frame(width: 40, height: 40)
-                    .background(.white.opacity(0.15), in: Circle())
+                    .glassEffect(.regular.interactive(), in: Circle())
             }
         }
         .padding(14)
@@ -462,7 +468,7 @@ struct HomeView: View {
                 Button { FilesApp.openDriveC() } label: {
                     Label("Open C:\\ in Files", systemImage: "folder")
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.glassProminent)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -594,7 +600,7 @@ private struct StatusChip: View {
         .foregroundStyle(tint)
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
-        .background(tint.opacity(0.15), in: Capsule())
+        .glassEffect(.regular.tint(tint.opacity(0.25)), in: Capsule())
     }
 }
 
@@ -615,9 +621,9 @@ private struct PlayGlyph: View {
     var body: some View {
         Image(systemName: "play.fill")
             .font(.system(size: 16, weight: .bold))
-            .foregroundStyle(.black)
+            .foregroundStyle(.white)
             .frame(width: 40, height: 40)
-            .background(.white, in: Circle())
+            .glassEffect(.regular.interactive(), in: Circle())
     }
 }
 
@@ -682,7 +688,7 @@ private struct GameCard: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(.black.opacity(0.55), in: Capsule())
+                        .glassEffect(.regular, in: Capsule())
                         .padding(8)
                 }
             }
