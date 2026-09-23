@@ -312,6 +312,15 @@ The fix calls `sys_icache_invalidate` for the current process, under the same
 `WINE_IOS` guard `<libkern/OSCacheControl.h>` is included under.
 `tools/check-transplant.py` now fails the build if it disappears.
 
+### Confirmed on device: the x64 cube runs (2026-09-23)
+
+Build 108, the first with the icache fix. `cube-x64.exe` rendered for the
+first time in this tree: 832+ presents at `gap_avg=16.7ms` -- a steady 60 FPS
+-- with zero faults, zero `[jit-tail]`, zero unhandled exceptions, and the old
+`fixme:virtual:NtFlushInstructionCache` line gone. The `[icache]` confirmation
+line did not appear because the `err:virtual` channel is filtered in these logs
+(zero `err:virtual` lines in the whole run); it now goes straight to stderr.
+
 ### One thing to resolve with the developer
 
 09's patch adds an inline comment reading *"Proposed isolated replacement, not
