@@ -82,6 +82,28 @@ jobs:
             printf '/* placeholder: see build-ipa.yml; PE-side only, never compiled here */\n' > "$F"
             echo "::warning::$F missing from the wine fork -- empty placeholder written for makedep"
           fi
+          # dlls/ntdll/unix/sync.c includes build/madeira_cfg.h BEFORE config.h,
+          # on purpose (ml1122: Wine's headers ban strncpy by macro). makedep
+          # treats that ordering as fatal, so configure never writes a
+          # Makefile. Upstream builds from a long-configured tree and never
+          # meets it. Make that one sanity check a warning.
+          MD=wine/tools/makedep.c
+          python3 - "$MD" <<'PYEOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = 'fatal_error( "%s must be included before other headers\\n", file->name );'
+          new = ('fprintf( stderr, "%s:%d: warning: %s must be included before other headers '
+                 '(madeira-bcd CI: not fatal)\\n", input_file_name, input_line, file->name );')
+          if new in s:
+              print("makedep: already patched")
+          elif s.count(old) == 1:
+              open(p, "w").write(s.replace(old, new))
+              print("makedep: config.h ordering check is now a warning")
+          else:
+              print("::error::makedep.c anchor not found -- wine moved, review this step")
+              sys.exit(1)
+          PYEOF
 
       - name: Restore native wine tools
         id: winenative
@@ -97,7 +119,12 @@ jobs:
           mkdir -p build-native
           cd build-native
           ../configure > "$GITHUB_WORKSPACE/wine-native-configure.log" 2>&1 || true
-          make -j"$(sysctl -n hw.ncpu)" > "$GITHUB_WORKSPACE/wine-native-make.log" 2>&1 || true
+          # Only the host tools and the generated headers are used from this
+          # tree. A full host build also compiles the iOS-only unix sources
+          # for macOS, and one failure there used to stop make before widl.
+          N=$(sysctl -n hw.ncpu)
+          { make -j"$N" __tools__ && make -j"$N" include; } > "$GITHUB_WORKSPACE/wine-native-make.log" 2>&1 \
+            || make -k -j"$N" >> "$GITHUB_WORKSPACE/wine-native-make.log" 2>&1 || true
 
       # Saved only once the next step has confirmed widl actually exists, so a
       # half-built tree cannot be cached and then trusted on every later run.
