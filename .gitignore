@@ -142,3 +142,7 @@ research/remote-metal/host/rmetald.*
 app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
 app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
 research/madeira-d3d12/tests/offline/sm51/
+
+# Metal Shader Converter headers extracted by CI from the msc-private release;
+# staged per build, never committed.
+build/madeira-d3d12/msc-include/

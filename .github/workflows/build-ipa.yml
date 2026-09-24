@@ -15,6 +15,12 @@ concurrency:
 jobs:
   build:
     runs-on: macos-15
+    # contents: write only so the token can see DRAFT releases, which is where
+    # the Metal Shader Converter installer is kept (drafts are not public).
+    # Nothing in this job creates, edits or pushes anything.
+    permissions:
+      contents: write
+      actions: read
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
@@ -690,6 +696,70 @@ jobs:
       # they are vendored under build/madeira-d3d12/msc-include the real
       # conversion service is built; otherwise build/dxmt-ios/build.sh links a
       # stub and D3D12 pipelines fail by name while D3D11 is untouched.
+      # Apple's installer (the .pkg from developer.apple.com/download, or the
+      # .dmg around it) is an asset on a release tagged msc-private, meant to
+      # be a DRAFT so the package itself is never published. From it take the
+      # public headers (Apache-2.0) AND the iOS library, so the headers the
+      # runtime is compiled against always match the library it loads.
+      # Nothing extracted here is committed.
+      - name: Fetch Metal Shader Converter from the msc-private release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100"
+          ASSET=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" \
+            | python3 -c "
+          import json, sys
+          rels = json.load(sys.stdin)
+          for r in rels if isinstance(rels, list) else []:
+              if r.get('tag_name') == 'msc-private' or r.get('name') == 'msc-private':
+                  if not r.get('draft'):
+                      print('::warning::the msc-private release is PUBLISHED -- Apple\'s installer is publicly downloadable; make it a draft', file=sys.stderr)
+                  for a in r.get('assets', []):
+                      if a['name'].lower().endswith(('.dmg', '.pkg')):
+                          print(a['url'], a['name']); sys.exit(0)
+          ")
+          if [ -z "$ASSET" ]; then
+            echo "::warning::no msc-private release with a .dmg/.pkg asset -- D3D12 conversion stays a stub"
+            exit 0
+          fi
+          URL=${ASSET%% *}; NAME=${ASSET#* }
+          mkdir -p /tmp/msc && cd /tmp/msc
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o "$NAME" "$URL"
+          echo "downloaded $NAME: $(wc -c < "$NAME" | tr -d ' ') bytes, sha256 $(shasum -a 256 "$NAME" | cut -d' ' -f1)"
+          PKG=""
+          case "$NAME" in
+            *.dmg|*.DMG)
+              hdiutil attach -nobrowse -readonly -mountpoint /tmp/msc/mnt "$NAME" > /dev/null
+              PKG=$(find /tmp/msc/mnt -maxdepth 3 -name "*.pkg" | head -1) ;;
+            *) PKG="/tmp/msc/$NAME" ;;
+          esac
+          if [ -z "$PKG" ]; then
+            echo "::error::no .pkg inside $NAME"; hdiutil detach /tmp/msc/mnt > /dev/null 2>&1; exit 0
+          fi
+          pkgutil --expand-full "$PKG" /tmp/msc/x > /dev/null
+          hdiutil detach /tmp/msc/mnt > /dev/null 2>&1
+          HDR=$(find /tmp/msc/x -path "*include/metal_irconverter/metal_irconverter.h" | head -1)
+          LIB=$(find /tmp/msc/x -path "*lib_iOS/libmetalirconverter.dylib" | head -1)
+          if [ -z "$HDR" ] || [ -z "$LIB" ]; then
+            echo "::error::package layout not recognised (header: ${HDR:-none}, iOS lib: ${LIB:-none})"
+            find /tmp/msc/x -maxdepth 6 -type d | head -30
+            exit 0
+          fi
+          INC=$(dirname "$(dirname "$HDR")")
+          DEST="$GITHUB_WORKSPACE/build/madeira-d3d12/msc-include"
+          rm -rf "$DEST"; mkdir -p "$DEST"
+          cp -R "$INC/metal_irconverter" "$DEST/"
+          [ -d "$INC/metal_irconverter_runtime" ] && cp -R "$INC/metal_irconverter_runtime" "$DEST/"
+          OLD="$GITHUB_WORKSPACE/app/Madeira/d3d12/libmetalirconverter.dylib"
+          echo "tracked iOS library: sha256 $(shasum -a 256 "$OLD" | cut -d' ' -f1)"
+          echo "package iOS library: sha256 $(shasum -a 256 "$LIB" | cut -d' ' -f1)"
+          cp "$LIB" "$OLD"
+          V=$(grep -E "define IR_VERSION_(MAJOR|MINOR|PATCH)" "$DEST/metal_irconverter/ir_version.h" | awk '{print $3}' | paste -sd. -)
+          echo "::notice::Metal Shader Converter $V: headers staged, app library replaced with the package's own"
+
       - name: Locate Metal Shader Converter headers
         shell: bash
         run: |
