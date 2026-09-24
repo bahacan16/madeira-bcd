@@ -61,6 +61,11 @@ struct LaunchRequest {
 
     /// Identical to the "x64 DX11 cube" button. The exe ships in the bundle.
     static let x64Cube = LaunchRequest(title: "x64 DX11 Cube", exe: "cube-x64.exe", args: nil, desktop: nil)
+
+    /// Upstream's D3D12 smoke test (the developer panel's "D3D12 cube"): an
+    /// x86-64 program drawing through the native D3D12 runtime, its shaders
+    /// converted at pipeline creation by the Metal Shader Converter.
+    static let x64D3D12Cube = LaunchRequest(title: "x64 DX12 Cube", exe: "d3d12-cube-x64.exe", args: nil, desktop: nil)
 }
 
 // MARK: - Experimental settings
@@ -505,25 +510,32 @@ struct HomeView: View {
     private var demosSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionHeader(title: "Test programs", detail: nil)
-            Button { start(.x64Cube) } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "cube.transparent.fill")
-                        .font(.title2)
-                        .foregroundStyle(.purple)
-                        .frame(width: 44, height: 44)
-                        .background(.purple.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("x64 DX11 Cube").font(.subheadline.weight(.semibold))
-                        Text("x86-64 → FEX → D3D11 → Metal. The smoke test.").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: "play.circle.fill").font(.title2).foregroundStyle(.purple)
-                }
-                .padding(12)
-                .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            }
-            .buttonStyle(.plain)
+            demoCard(.x64Cube, icon: "cube.transparent.fill", tint: .purple,
+                     detail: "x86-64 → FEX → D3D11 → Metal. The smoke test.")
+            demoCard(.x64D3D12Cube, icon: "cube.fill", tint: .indigo,
+                     detail: "x86-64 → FEX → native D3D12 → Metal Shader Converter → Metal.")
         }
+    }
+
+    private func demoCard(_ request: LaunchRequest, icon: String, tint: Color, detail: String) -> some View {
+        Button { start(request) } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.title2)
+                    .foregroundStyle(tint)
+                    .frame(width: 44, height: 44)
+                    .background(tint.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(request.title).font(.subheadline.weight(.semibold))
+                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "play.circle.fill").font(.title2).foregroundStyle(tint)
+            }
+            .padding(12)
+            .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 
     private var footnote: some View {
