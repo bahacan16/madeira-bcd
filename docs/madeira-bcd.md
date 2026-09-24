@@ -13,12 +13,33 @@ are upstream's tracked builds. The Microsoft VC++ runtime is fetched from
 Microsoft at build time and never committed. Archived as Debug, per upstream's
 docs/BUILDING.md.
 
-**Metal Shader Converter headers.** The D3D12 runtime's unix half compiles
-against Apple's converter headers, which upstream does not track. With them
-under `build/madeira-d3d12/msc-include/` CI builds the real conversion service;
-without them `build/madeira-d3d12/madeira_ir_stub.c` answers every conversion
-with `MADEIRA_IR_NO_DYLIB`, so D3D12 pipelines fail by name and D3D11 is
-unaffected.
+**Metal Shader Converter.** The D3D12 runtime's unix half compiles against
+Apple's converter headers, which upstream does not track. Apple's installer
+(`Metal_Shader_Converter_4.0_beta_2.pkg`, from developer.apple.com/download) is
+kept as an asset of a DRAFT release tagged `msc-private` -- drafts are visible
+only to people with write access, so the package is never published. CI
+expands it, stages the Apache-2.0 public headers in
+`build/madeira-d3d12/msc-include/` (ignored) and copies the package's iOS
+library over `app/Madeira/d3d12/libmetalirconverter.dylib`, so the headers and
+the library always come from one build. First run (build 122): converter
+4.0.1, iOS library sha256 `073f903b...` -- identical to upstream's tracked one.
+Without the asset `build/madeira-d3d12/madeira_ir_stub.c` answers every
+conversion with `MADEIRA_IR_NO_DYLIB`: D3D12 pipelines fail by name, D3D11 is
+unaffected. The job has `contents: write` only because listing drafts needs it.
+
+**Upstream fixes applied in CI.** Upstream builds from long-lived trees; a clean
+checkout of its pins does not build. The workflow works around each, and every
+step says so when it becomes a no-op:
+- wine `dlls/ntdll/arm64ec_x64_export_iat.c` is included but was never
+  committed: an empty placeholder for makedep (PE-side only, never compiled).
+- wine `dlls/ntdll/unix/sync.c` includes `build/madeira_cfg.h` before
+  `config.h` on purpose; makedep's ordering check is made a warning.
+- `server_ios.c` reads `rusage_info_v6.ri_page_wait_time_mach`, absent from the
+  runner's SDK: the `pgw=` figure of the `[xp]` line reads 0.
+- FEX (`tools/patch-fex-ios-probes.py`): two diagnostic probes compiled outside
+  their guards, and `rpm_cas_snapshot_take` (rpmalloc, not built with
+  `ENABLE_FEX_ALLOCATOR=OFF`) gets a weak fallback; `IOS_RPM_GUARD` gets a
+  no-op definition in the system-allocator branch.
 
 ## Runtime
 
