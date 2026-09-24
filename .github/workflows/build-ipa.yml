@@ -279,6 +279,10 @@ jobs:
           key: gnutls-ios-gmp6.3.0-nettle3.10.1-gnutls3.8.9-v1
 
       - name: Build ntdll-unix
+        # Keep going so one run reports every broken stage (and caches FEX and
+        # LLVM). "Verify all linked archives exist" still fails the job before
+        # anything is archived if this produced no library.
+        continue-on-error: true
         run: bash build/ntdll-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ntdll.log"; exit ${PIPESTATUS[0]}
 
       # The link failure showed up only at xcodebuild time; catch it here.
@@ -287,6 +291,7 @@ jobs:
       # check passed while the linker still failed. -gU = external AND
       # defined only.
       - name: Verify ntdll-unix exports the crypto call tables
+        continue-on-error: true
         shell: bash
         run: |
           set +e
@@ -370,9 +375,17 @@ jobs:
           done
 
       - name: Build wineserver
+        # Keep going so one run reports every broken stage (and caches FEX and
+        # LLVM). "Verify all linked archives exist" still fails the job before
+        # anything is archived if this produced no library.
+        continue-on-error: true
         run: bash build/wineserver/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/wineserver.log"; exit ${PIPESTATUS[0]}
 
       - name: Build win32u-unix
+        # Keep going so one run reports every broken stage (and caches FEX and
+        # LLVM). "Verify all linked archives exist" still fails the job before
+        # anything is archived if this produced no library.
+        continue-on-error: true
         run: bash build/win32u-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/win32u.log"; exit ${PIPESTATUS[0]}
 
       - name: Restore llvm-mingw
