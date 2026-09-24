@@ -250,7 +250,7 @@ void winios_dump_window_tree(void)
 /* Implemented in app/Madeira/Winios/Winios.m (weak, same pattern as the
  * driver hooks below). Called on wine threads — the app side copies the
  * bits before returning and uploads on the main thread. */
-extern void winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
+extern int winios_surface_present( HWND hwnd, int dirty_x, int dirty_y, int dirty_w, int dirty_h,
                                     int surf_w, int surf_h, int stride, const void *bits ) __attribute__((weak));
 extern void winios_window_frame( HWND hwnd, int x, int y, int w, int h, int visible,
                                  int cx, int cy, int cw, int ch ) __attribute__((weak));
@@ -419,10 +419,15 @@ static BOOL winios_surface_flush( struct window_surface *surface, const RECT *re
         int surf_w = color_info->bmiHeader.biWidth;
         int surf_h = color_info->bmiHeader.biHeight;
         if (surf_h < 0) surf_h = -surf_h;
-        winios_surface_present( surface->hwnd,
-                                dirty->left, dirty->top,
-                                dirty->right - dirty->left, dirty->bottom - dirty->top,
-                                surf_w, surf_h, surf_w * 4, color_bits );
+        /* ml1028: propagate the snapshot allocation result. dce.c only calls
+         * reset_bounds() when we return TRUE, so returning FALSE keeps the
+         * dirty region and the frame is repainted on a later flush instead of
+         * the copy throwing an uncaught ObjC exception and killing us. */
+        if (!winios_surface_present( surface->hwnd,
+                                     dirty->left, dirty->top,
+                                     dirty->right - dirty->left, dirty->bottom - dirty->top,
+                                     surf_w, surf_h, surf_w * 4, color_bits ))
+            return FALSE;
     }
     return TRUE;
 }
@@ -516,6 +521,29 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
             dprintf( 2, "[win-pos] #%u hwnd=%p after=%p flags=%08x vis={%d,%d,%d,%d} "
                      "surface=%p rev=ml505\n", n, hwnd, insert_after, (unsigned)swp_flags,
                      (int)v->left, (int)v->top, (int)v->right, (int)v->bottom, surface );
+            /* ml853: name the window. A dialog nobody can see (nothing is
+             * presenting) is otherwise just a rectangle; the class and the
+             * text of every window, children included, make it readable
+             * from the log. Static controls carry a message box's body. */
+            {
+                WCHAR clsW[64], txtW[200];
+                char cls[64], txt[200];
+                UNICODE_STRING us = { 0, sizeof(clsW), clsW };
+                int j, tn;
+                cls[0] = 0;
+                if (NtUserGetClassName( hwnd, FALSE, &us ) > 0)
+                {
+                    for (j = 0; j < us.Length / (int)sizeof(WCHAR) && j < 63; j++)
+                        cls[j] = (clsW[j] >= 32 && clsW[j] < 127) ? (char)clsW[j] : '?';
+                    cls[j] = 0;
+                }
+                tn = NtUserInternalGetWindowText( hwnd, txtW, ARRAY_SIZE(txtW) );
+                for (j = 0; j < tn && j < 199; j++)
+                    txt[j] = (txtW[j] >= 32 && txtW[j] < 127) ? (char)txtW[j] : '?';
+                txt[j] = 0;
+                if (cls[0] || txt[0])
+                    dprintf( 2, "[win-name] #%u hwnd=%p class='%s' text=\"%s\" rev=ml853\n", n, hwnd, cls, txt );
+            }
         }
     }
 

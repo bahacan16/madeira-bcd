@@ -13,9 +13,34 @@ BIND="${1:-10.0.1.53}"
 VER=$(sed -n 's/^#define RM_VERSION \([0-9]*\)u.*/\1/p' protocol.h)
 echo "  protocol.h declares v$VER"
 
-rm -f host/rmetald
-clang -O1 -fobjc-arc -fdeclspec -framework Foundation -framework Metal \
-      -framework QuartzCore -framework AppKit -o host/rmetald host/rmetald.m
+# Build to a TEMPORARY name and move it into place only on success.
+#
+# This used to "rm -f host/rmetald" and compile straight to that path, so ANY
+# build failure left no binary at all -- and the failure that exposed it was not
+# a code error: after a host restart clang refused with "You have not agreed to
+# the Xcode license agreements", which destroyed a working daemon and then could
+# not rebuild it. A build step must never leave you with less than you started.
+#
+# Prefer the standalone Command Line Tools toolchain when present: it needs no
+# Xcode licence agreement, which is exactly the failure above.
+if [ -x /Library/Developer/CommandLineTools/usr/bin/clang ] && \
+   [ -d /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk ]; then
+  CC=/Library/Developer/CommandLineTools/usr/bin/clang
+  SYSROOT="-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+else
+  CC=clang
+  SYSROOT=""
+fi
+if ! $CC -O1 -w -fobjc-arc -fdeclspec $SYSROOT \
+      -framework Foundation -framework Metal \
+      -framework QuartzCore -framework AppKit -o host/rmetald.new host/rmetald.m; then
+  echo "  BUILD FAILED -- keeping the existing binary"
+  rm -f host/rmetald.new
+  [ -x host/rmetald ] || { echo "  and there is no existing binary to fall back to"; exit 1; }
+  echo "  (the running daemon was NOT restarted)"
+  exit 1
+fi
+mv -f host/rmetald.new host/rmetald
 echo "  host rebuilt"
 
 pkill -f "host/rmetald" 2>/dev/null || true

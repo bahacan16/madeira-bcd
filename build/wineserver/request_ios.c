@@ -308,6 +308,33 @@ static void call_req_handler( struct thread *thread )
 
     if (debug_level) trace_request();
 
+    /* ml1055: which requests. With the JIT no longer thrashing, ~16% of running
+     * CPU samples sit in the client/server pipe read; the mix decides whether an
+     * in-process fast path for waits is worth building. Request numbers map to
+     * names through wine/server/request_trace.h req_names[]. */
+    {
+        static unsigned long counts[REQ_NB_REQUESTS], total;
+        static struct timespec t0;
+        if (req < REQ_NB_REQUESTS) counts[req]++;
+        if (!total) clock_gettime( CLOCK_MONOTONIC, &t0 );
+        if (++total % 200000 == 0)
+        {
+            struct timespec t1; char line[600]; int n = 0, k; unsigned r;
+            clock_gettime( CLOCK_MONOTONIC, &t1 );
+            for (k = 0; k < 10; k++)
+            {
+                unsigned best = 0; unsigned long bn = 0;
+                for (r = 0; r < REQ_NB_REQUESTS; r++) if (counts[r] > bn) { bn = counts[r]; best = r; }
+                if (!bn) break;
+                n += snprintf( line + n, sizeof(line) - n, " req%u=%lu", best, bn );
+                counts[best] = 0;
+            }
+            for (r = 0; r < REQ_NB_REQUESTS; r++) counts[r] = 0;
+            fprintf( stderr, "[srv-req] ml1055 last 200000 requests in %.1f s:%s\n",
+                     (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, line );
+            t0 = t1;
+        }
+    }
     if (req < REQ_NB_REQUESTS)
         req_handlers[req]( &current->req, &reply );
     else

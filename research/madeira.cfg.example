@@ -1,0 +1,30 @@
+# Madeira configuration (ml1095): one file for every switch.
+# key = value; lines starting with # are comments; the last line wins.
+# Keys are the old file names without 'madeira-' and '.txt'.
+# Environment exports: env.NAME = value. DXMT options: dxmt = a=b;c=d.
+
+# memory
+swap-mb = 3072
+vram-mb = 1536
+pool = 640
+totalphys = 4096
+swap-canary = 0
+
+# emulator environment (FEX reads FEX_* from the process environment)
+env.FEX_TSOENABLED = 1
+env.FEX_EXTENDEDVOLATILEMETADATA = oo2core_5_win64.dll:bink2w64.dll
+
+# ml1127: virtual desktop size for the "Wine Virtual Desktop" button (WxH, default 960x540)
+# desktop-size = 1280x720
+
+# ml1110/ml1134: GPU encoder ordering in the native D3D12 runtime.
+#   1 = every encoder waits for the one before it (ml1091, accurate, slowest)
+#   6 = barrier-driven (ml1134): an encoder waits only after a ResourceBarrier,
+#       at a list start, or when it reuses a pending pass's attachment;
+#       compute encoders stay open across barriers
+#   0 = none (perf experiment, flickers); 2/3/5 = older experiments
+# fence-chain = 1
+# ml1134: 0 closes compute encoders at every barrier even in mode 6 (defect isolation)
+# f6-compute-open = 1
+# ml1133: start with ECO on (guest threads at a low QoS class); eco-qos = utility | background | initiated
+# eco = 0

@@ -11,9 +11,24 @@ BIND="${1:-10.0.1.53}"
 # while the source said otherwise. Building here means "restart" can never
 # again mean "restart the stale one".
 echo "  building rmetald (protocol v$(sed -n 's/^#define RM_VERSION \([0-9]*\)u.*/\1/p' protocol.h))"
-rm -f host/rmetald
-clang -O1 -w -fobjc-arc -fdeclspec -framework Foundation -framework Metal \
-      -framework QuartzCore -framework AppKit -o host/rmetald host/rmetald.m || exit 1
+# Build to a temp name, swap on success -- never delete the working binary
+# first (see run-host.sh: a clang licence refusal once destroyed it outright).
+if [ -x /Library/Developer/CommandLineTools/usr/bin/clang ] && \
+   [ -d /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk ]; then
+  CC=/Library/Developer/CommandLineTools/usr/bin/clang
+  SYSROOT="-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+else
+  CC=clang
+  SYSROOT=""
+fi
+if $CC -O1 -w -fobjc-arc -fdeclspec $SYSROOT -framework Foundation -framework Metal \
+      -framework QuartzCore -framework AppKit -o host/rmetald.new host/rmetald.m; then
+  mv -f host/rmetald.new host/rmetald
+else
+  echo "  BUILD FAILED -- keeping the existing binary" >&2
+  rm -f host/rmetald.new
+  [ -x host/rmetald ] || exit 1
+fi
 
 while :; do
     host/rmetald "$BIND" >>/tmp/rmetald.log 2>&1

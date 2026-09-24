@@ -65,25 +65,24 @@ struct LaunchRequest {
 
 // MARK: - Experimental settings
 
-/// Opt-in switches that change how the runtime behaves, exported to the
-/// environment the unix side reads. Off by default: each is a measurement
-/// waiting to happen, not a known win.
+/// Opt-in switches that change how the runtime behaves. They live in
+/// Documents/madeira.cfg, the one file the native side reads (ml1095), so a
+/// hand edit and the switch in Settings are the same setting.
 enum ExperimentalSettings {
-    static let storageBackedMemoryKey = "madeira.experimental.storageBackedMemory"
+    /// Upstream's file-backed guest data tier (virtual_ios.c ml1077): large
+    /// guest commits are mapped from a sparse file iOS may page out, which
+    /// jetsam does not count. The cap is the size RDR2 was run with.
+    static let storageBackedMemoryMB = 3072
 
     static var storageBackedMemory: Bool {
-        UserDefaults.standard.bool(forKey: storageBackedMemoryKey)
+        get { (Int(MadeiraConfig.get("swap-mb") ?? "") ?? 0) >= 64 }
+        set { MadeiraConfig.set("swap-mb", newValue ? String(storageBackedMemoryMB) : nil) }
     }
 
-    /// Must run before runWineFullSequence -- ntdll-unix reads it once.
-    static func exportToEnvironment() {
-        if storageBackedMemory { setenv("MADEIRA_SWAP", "1", 1) } else { unsetenv("MADEIRA_SWAP") }
-        // ml797: HOME is repointed at the Wine prefix, so ntdll cannot derive
-        // this itself -- hand it the container's real Caches directory.
-        if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
-            setenv("MADEIRA_SWAP_DIR", caches.path, 1)
-        }
-    }
+    /// Must run before runWineFullSequence. Everything here is read from
+    /// madeira.cfg by the native side, so there is nothing to export today;
+    /// kept as the one place a future environment-only switch would go.
+    static func exportToEnvironment() {}
 }
 
 // MARK: - Root
@@ -872,7 +871,7 @@ struct AppSettingsSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage("wine_desktop_res") private var desktopRes = "960x540"
-    @AppStorage(ExperimentalSettings.storageBackedMemoryKey) private var storageBackedMemory = false
+    @State private var storageBackedMemory = ExperimentalSettings.storageBackedMemory
     @State private var showControllers = false
 
     var body: some View {
@@ -904,13 +903,17 @@ struct AppSettingsSheet: View {
                     Toggle(isOn: $storageBackedMemory) {
                         Label("Storage-backed memory", systemImage: "internaldrive")
                     }
+                    .onChange(of: storageBackedMemory) { _, on in
+                        ExperimentalSettings.storageBackedMemory = on
+                    }
                 } header: {
                     Text("Experimental")
                 } footer: {
-                    Text("Backs a game's large memory allocations (128 MB and up) with space on the device's "
-                         + "storage, so iOS can move them out of RAM instead of closing Madeira when a game "
-                         + "needs more than fits. Costs some speed when that happens, and writes to storage. "
-                         + "Takes effect at the next launch; the log shows [swap] lines when it is working.")
+                    Text("Backs a game's large memory allocations with up to \(ExperimentalSettings.storageBackedMemoryMB / 1024) GB "
+                         + "of the device's storage, so iOS can move them out of RAM instead of closing Madeira "
+                         + "when a game needs more than fits. Costs some speed when that happens, and writes to "
+                         + "storage. Saved as swap-mb in madeira.cfg; takes effect at the next game start, and "
+                         + "the log shows [swap] ml1077 lines when it is working.")
                 }
 
                 Section {

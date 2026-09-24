@@ -20,6 +20,7 @@
  */
 
 #include "config.h"
+#include "../madeira_cfg.h"   /* ml1095 */
 
 #include <assert.h>
 #include <errno.h>
@@ -28,6 +29,7 @@
 #include <stdarg.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>   /* ml1003: O_RDONLY for the escape-hatch read */
 #ifdef HAVE_SYS_SYSCTL_H
 #include <sys/sysctl.h>
 #endif
@@ -375,13 +377,9 @@ extern int __pthread_kill( mach_port_t, int );
 int send_thread_signal( struct thread *thread, int sig )
 {
     int ret = -1;
-    /* Wine guests are pthreads in this iOS app's Darwin task. The normal
-     * cross-process task-port handoff is disabled here. Use our task only
-     * for real thread-right extraction and signal delivery; leave
-     * get_process_port() disabled for remote-memory operations. */
-    mach_port_t process_port = mach_task_self();
+    mach_port_t process_port = get_process_port( thread->process );
 
-    if (thread->unix_pid != -1)
+    if (thread->unix_pid != -1 && process_port)
     {
         mach_msg_type_name_t type;
         mach_port_t port;
@@ -827,6 +825,33 @@ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t 
     kern_return_t ret;
     mach_vm_size_t bytes_read;
     mach_port_t process_port = get_process_port( process );
+#ifdef WINE_IOS
+    /* iOS pseudo-processes share this task, but do not send task ports through
+     * launchd. The request handler already checked PROCESS_VM_READ on the
+     * target handle. Use our task only for a target registered in this Unix
+     * process. Keep get_process_port() and write_process_memory() unchanged:
+     * enabling writes as well previously regressed other applications. */
+    if (!process_port && process->unix_pid == getpid())
+    {
+        /* ml1003: escape hatch. get_process_port()'s own comment records that a
+         * previous, WIDER version of this change (returning mach_task_self()
+         * there, activating reads AND writes) regressed Steam into a guest SEGV
+         * plus loader-lock deadlock, with "some caller depends on the old
+         * ACCESS_DENIED no-op". This change is reads-only and therefore not
+         * that change -- but the warning touches this path too, and the file
+         * knob makes a regression recoverable without a rebuild, on a device
+         * where env vars are not reachable. Checked once. */
+        static int local_read_off = -1;
+        if (local_read_off < 0)
+        {
+            local_read_off = madeira_cfg_bool( "no-local-read", 0 );   /* ml1095: madeira.cfg no-local-read = 1 */
+            fprintf( stderr, "ml1003: local pseudo-process reads %s\n",
+                     local_read_off ? "DISABLED by no-local-read"
+                                    : "ENABLED (reads only; writes still denied)" );
+        }
+        if (!local_read_off) process_port = mach_task_self();
+    }
+#endif
 
     if (!process_port)
     {

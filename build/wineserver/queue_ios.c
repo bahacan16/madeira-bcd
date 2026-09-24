@@ -4469,6 +4469,32 @@ void ios_dump_stuck_waits(void)
                     if (sync) release_object( sync );
                 }
                 obj->ops->dump( obj, 1 );   /* prints its own newline */
+                /* ml805: dump this object's whole recorded history.
+                 *
+                 * The latch is DYNAMIC on purpose: obj is whatever this stuck
+                 * thread is actually waiting on, resolved above from its own
+                 * handle table. Neither the handle number nor the pointer from
+                 * a previous run is used -- both change every launch, and one
+                 * earlier investigation was built on a stale pointer.
+                 *
+                 * A history with no SET from any thread means the producer
+                 * never ran; a SET on a different sync object means the
+                 * producer signalled the wrong thing; a CLOSE means the waiter
+                 * was left on a dead object. Those are the three outcomes worth
+                 * separating. */
+                {
+                    /* ml806: bracket the call with raw writes so the exact
+                     * instruction boundary is visible even if stdio is the
+                     * problem. ml805's call was verified present by
+                     * disassembly, so "did it run" must be answered without
+                     * relying on the same channel that failed. */
+                    extern int ios_evt_dump_for( void *obj );
+                    int matched;
+                    { static const char m[] = "[evt-before]\n"; ssize_t w = write( 2, m, sizeof(m) - 1 ); (void)w; }
+                    matched = ios_evt_dump_for( obj );
+                    { char b[64]; int n2 = snprintf( b, sizeof(b), "[evt-after] matched=%d\n", matched );
+                      ssize_t w = write( 2, b, n2 > 0 ? (size_t)n2 : 0 ); (void)w; }
+                }
             }
             release_object( obj );
         }

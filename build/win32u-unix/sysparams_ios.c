@@ -3937,6 +3937,103 @@ static NTSTATUS d3dkmt_open_adapter_from_gdi_display_name( D3DKMT_OPENADAPTERFRO
 
     RtlInitUnicodeString( &name, desc->DeviceName );
     if (!name.Length) return STATUS_UNSUCCESSFUL;
+
+#ifdef WINE_IOS
+    /* ml1006: resolve the virtual display this file already ADVERTISES.
+     *
+     * NtUserEnumDisplayDevices (below, same file) synthesizes a single primary
+     * adapter "\\.\DISPLAY1" in virtual-monitor mode, precisely because the
+     * sources list is empty there. This function had no matching branch: it goes
+     * straight to find_source(), which cannot find a source that was never
+     * registered, and returns STATUS_UNSUCCESSFUL. wined3d_output_init then
+     * returns E_INVALIDARG -- the observed `Failed to initialise output
+     * L"\\.\DISPLAY1", hr 0x80070057` -- Direct3DCreate9Ex fails with
+     * D3DERR_NOTAVAILABLE, and RDR2 calls Release on the NULL output object it
+     * never checked (rip 0x1426b8b77, `mov rax,[rcx]; call [rax+0x10]`). That
+     * unguarded Release is the first fatal fault of the run; the dispatch storm
+     * afterwards is recovery noise, not the cause.
+     *
+     * So: advertise a display and then be able to open it. Deliberately narrow:
+     *
+     *  - only in virtual-monitor mode, and only for the exact name enumerated,
+     *    matched the same way that branch matches it (length + wcsnicmp, i.e.
+     *    Windows-style case-insensitive). Unknown displays still fail.
+     *  - ONE stable identity for the process lifetime. A fresh
+     *    NtAllocateLocallyUniqueId on every open would give callers a different
+     *    adapter each time they close and reopen, which breaks identity
+     *    comparisons; it is initialised once under the display lock.
+     *  - a REAL managed handle from NtGdiDdDDIOpenAdapterFromLuid, with failure
+     *    propagated. No invented handle value.
+     *  - if a real GPU is registered, use ITS luid rather than a synthetic one;
+     *    only fall back to allocating when the list is genuinely empty. The
+     *    synthetic one is software and is logged as such -- it must not be
+     *    passed off as the remote GPU's identity.
+     *
+     * This does not claim D3D9 rendering works. The block that fails here is
+     * gathering adapter information, and a D3D12CreateDevice call follows it in
+     * the same function. WineD3D may still fail later for lack of a GL/Vulkan
+     * backend; that is a separate gate. */
+    if (ios_virtual_monitor_active())
+    {
+        static const WCHAR kmt_display1W[] = {'\\','\\','.','\\','D','I','S','P','L','A','Y','1',0};
+        static LUID virtual_luid;
+        static BOOL virtual_luid_ready;
+
+        if (name.Length != (sizeof(kmt_display1W) - sizeof(WCHAR)) ||
+            wcsnicmp( name.Buffer, kmt_display1W, ARRAY_SIZE(kmt_display1W) - 1 ))
+        {
+            static int rejected;
+            if (rejected++ < 4)
+                dprintf( 2, "[vmode] ml1006 refusing unknown display %s (only "
+                         "\\\\.\\DISPLAY1 is advertised)\n", debugstr_w( desc->DeviceName ) );
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        pthread_mutex_lock( &display_lock );
+        if (!virtual_luid_ready)
+        {
+            struct gpu *first = LIST_ENTRY( list_head( &gpus ), struct gpu, entry );
+            if (!list_empty( &gpus ) && first)
+            {
+                virtual_luid = first->luid;
+                dprintf( 2, "[vmode] ml1006 virtual adapter adopts the registered GPU luid "
+                         "%08x%08x\n", (unsigned)virtual_luid.HighPart,
+                         (unsigned)virtual_luid.LowPart );
+            }
+            else
+            {
+                NtAllocateLocallyUniqueId( &virtual_luid );
+                dprintf( 2, "[vmode] ml1006 no GPU registered; allocated a SOFTWARE virtual "
+                         "adapter luid %08x%08x (not a hardware identity)\n",
+                         (unsigned)virtual_luid.HighPart, (unsigned)virtual_luid.LowPart );
+            }
+            virtual_luid_ready = TRUE;
+        }
+        luid_desc.AdapterLuid = virtual_luid;
+        pthread_mutex_unlock( &display_lock );
+
+        if ((status = NtGdiDdDDIOpenAdapterFromLuid( &luid_desc )))
+        {
+            dprintf( 2, "[vmode] ml1006 NtGdiDdDDIOpenAdapterFromLuid FAILED %#x for the "
+                     "virtual adapter -- propagating, not inventing a handle\n",
+                     (unsigned)status );
+            return status;
+        }
+        desc->hAdapter = luid_desc.hAdapter;
+        desc->AdapterLuid = luid_desc.AdapterLuid;
+        desc->VidPnSourceId = 1;   /* the real path returns source->id + 1; the virtual source is 0 */
+        {
+            static int opened;
+            if (opened++ < 4)
+                dprintf( 2, "[vmode] ml1006 opened virtual adapter: hAdapter=%#x luid=%08x%08x "
+                         "VidPnSourceId=%u\n", (unsigned)desc->hAdapter,
+                         (unsigned)desc->AdapterLuid.HighPart,
+                         (unsigned)desc->AdapterLuid.LowPart, (unsigned)desc->VidPnSourceId );
+        }
+        return STATUS_SUCCESS;
+    }
+#endif
+
     if (!(source = find_source( &name ))) return STATUS_UNSUCCESSFUL;
 
     luid_desc.AdapterLuid = source->gpu->luid;

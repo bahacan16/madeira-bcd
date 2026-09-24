@@ -6,7 +6,7 @@ the host decoder from one description, because hand-maintaining a wire format
 on both sides of a machine boundary drifts -- and drift in a wire format shows
 up as corruption at runtime rather than as a compile error.
 
-Scope is the 15 render opcodes an ARM64 D3D11 cube actually emits, measured:
+Started as the 15 render opcodes an ARM64 D3D11 cube emits (measured:
 28,800 records over 12,288 batches, zero compute, zero blit. Unobserved
 opcodes are deliberately absent; adding one is a new record type, never an ABI
 change.
@@ -17,15 +17,19 @@ sidecars stay `offset + length` and arrays stay `offset + count`, so a heavier
 title needs new opcode implementations rather than a redesigned ABI.
 """
 
-WIRE_VERSION = 1
+WIRE_VERSION = 2
 
 # Negotiated ceilings. Generous against the cube's measurements (18 records,
 # 12 sidecar bytes) but bounded, so a hostile or corrupt batch cannot make the
 # decoder allocate or loop without limit.
 LIMITS = dict(
-    MAX_BATCH_BYTES   = 1 << 20,
-    MAX_RECORDS       = 4096,
-    MAX_SIDECAR_BYTES = 1 << 16,
+    # ml817: raised from 1MB / 4096 / 64KB. Those were sized against a cube
+    # (18 records per batch). A UE4 base pass exceeded 4096 records in one
+    # batch and the WHOLE batch was dropped -- every draw in it -- which is
+    # what "no graphics" looked like in the first in-game log.
+    MAX_BATCH_BYTES   = 8 << 20,
+    MAX_RECORDS       = 65536,
+    MAX_SIDECAR_BYTES = 1 << 20,
     MAX_ARRAY_COUNT   = 256,
 )
 
@@ -61,6 +65,34 @@ RECORDS = [
                                         ('index_type',U64),('index_buffer',U64),
                                         ('index_offset',U64),('instances',U64),
                                         ('base_vertex',U64),('base_instance',U64)], None),
+    # --- ml7xx: added by hand in the header while the schema went stale. Now
+    # carried here so regeneration cannot silently drop them again. ---
+    (21, 'SetFragmentBufferOffset',    [('offset',U64),('index',U64)], None),
+    (22, 'SetObjectBufferOffset',      [('offset',U64),('index',U64)], None),
+    (23, 'SetVisibilityMode',          [('offset',U64),('mode',U32),('pad',U32)], None),
+    (24, 'DrawIndexedIndirect',        [('index_buffer',U64),('index_buffer_offset',U64),
+                                        ('indirect_args_buffer',U64),('indirect_args_offset',U64),
+                                        ('primitive_type',U32),('index_type',U32)], None),
+    (25, 'SetMeshBuffer',              [('buffer',U64),('offset',U64),('index',U64)], None),
+    (26, 'SetMeshBufferOffset',        [('offset',U64),('index',U64)], None),
+    (27, 'SetObjectBuffer',            [('buffer',U64),('offset',U64),('index',U64)], None),
+    (28, 'DrawMeshThreadgroups',       [('grid_w',U32),('grid_h',U32),('grid_d',U32),
+                                        ('obj_w',U32),('obj_h',U32),('obj_d',U32),
+                                        ('mesh_w',U32),('mesh_h',U32),('mesh_d',U32),
+                                        ('pad',U32)], None),
+    # --- ml817: the draw families a UE4 title actually uses. DXMT's geometry-
+    # shader and tessellation emulation are mesh draws and pack as
+    # SetObjectBuffer(Offset) + DrawMeshThreadgroups; only the INDIRECT mesh
+    # dispatch, plain indirect draw and the render-stage barrier needed new
+    # record types. Wire opcode numbers are ours (winemetal's 29+ are its
+    # composite commands, which never cross the wire). ---
+    (29, 'DrawMeshThreadgroupsIndirect',[('indirect_buffer',U64),('indirect_offset',U64),
+                                        ('obj_w',U32),('obj_h',U32),('obj_d',U32),
+                                        ('mesh_w',U32),('mesh_h',U32),('mesh_d',U32)], None),
+    (30, 'MemoryBarrier',              [('scope',U32),('stages_after',U32),
+                                        ('stages_before',U32),('pad0',U32)], None),
+    (31, 'DrawIndirect',               [('indirect_buffer',U64),('indirect_offset',U64),
+                                        ('primitive',U32),('pad0',U32)], None),
 ]
 
 # Sidecar element shapes: variable-count arrays referenced by offset + count.

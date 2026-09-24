@@ -113,6 +113,8 @@ struct FPSOverlay: View {
                     Text(String(format: "%.1f", fps))
                         .foregroundColor(fpsColor)
                     pacingPill
+                    capturePill
+                    ecoPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(6)
@@ -146,6 +148,8 @@ struct FPSOverlay: View {
                         .foregroundColor(fpsColor)
                         .frame(width: 40, alignment: .trailing)
                     pacingPill
+                    capturePill
+                    ecoPill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(.horizontal, 8)
@@ -181,6 +185,43 @@ struct FPSOverlay: View {
                 vsyncMode = vsyncMode == 1 ? 0 : (vsyncMode == 0 ? 2 : 1)
                 madeira_set_vsync_locked(vsyncMode)
                 ProMotionIntent.shared.setActive(vsyncMode != 1)
+            }
+    }
+
+    /// ml1098: one tap = capture the next frame (every render pass's attachments
+    /// to Documents/capture/, plus the full draw-dump in the log). The pill
+    /// flashes for a second so a tap is visibly taken.
+    @State private var captureFlash = false
+    private var capturePill: some View {
+        Text("CAP")
+            .foregroundColor(captureFlash ? .black : .cyan)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(captureFlash ? Color.cyan : Color.clear)
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.cyan, lineWidth: 1))
+            .onTapGesture {
+                madeira_capture_request(1)
+                captureFlash = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { captureFlash = false }
+            }
+    }
+
+    /// ml1133: ECO. The SoC clamps the CPU clock once ~250 J of CPU energy has
+    /// been spent above ~2.3 W, and a loading screen at full clock spends nearly
+    /// all of it before gameplay starts. ECO on = guest threads run at a low QoS
+    /// class (efficiency cores, lower clocks): loading is slower but keeps the
+    /// budget for gameplay. Turn it off once in game. Green = on.
+    @State private var ecoOn = madeira_get_eco() != 0
+    private var ecoPill: some View {
+        Text("ECO")
+            .foregroundColor(ecoOn ? .black : .green)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(ecoOn ? Color.green : Color.clear)
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.green, lineWidth: 1))
+            .onTapGesture {
+                ecoOn.toggle()
+                madeira_set_eco(ecoOn ? 1 : 0)
             }
     }
 

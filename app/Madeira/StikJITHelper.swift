@@ -79,7 +79,8 @@ enum StikJITHelper {
 
     /// Allocate a JIT memory pool via BRK #0xf00d WITHOUT detaching the debugger.
     /// The debugger stays attached so Wine can use BRK to prepare PE code pages.
-    static func allocatePool(poolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+    static func allocatePool(poolSize requestedPoolSize: Int = 128 * 1024 * 1024) -> (rx: UnsafeMutableRawPointer, rw: UnsafeMutableRawPointer, size: Int)? {
+        var poolSize = requestedPoolSize      // ml1036: may shrink to fit, see the hole census below
         LogStore.shared.log("Allocating \(poolSize / 1024 / 1024)MB JIT pool via debugger...")
 
         // iOS-Madeira: FEX's dispatcher emit has a position-dependent encoding
@@ -108,6 +109,14 @@ enum StikJITHelper {
             var addr: vm_address_t = 0
             let kr = vm_allocate(mach_task_self_, &addr, vm_size_t(chunkSize), VM_FLAGS_ANYWHERE)
             if kr == KERN_SUCCESS {
+                // ml1036: if the frontier is ALREADY past the threshold this chunk
+                // pins nothing useful and costs 16MB of the scarcest VA we have
+                // (the low gap must hold the pool AND the 0x140000000 window).
+                if addr >= pinTarget {
+                    vm_deallocate(mach_task_self_, addr, vm_size_t(chunkSize))
+                    LogStore.shared.log(String(format: "JIT-pool frontier already at 0x%lx — no pin needed", Int(addr)))
+                    break
+                }
                 pinChunks.append(addr)
                 LogStore.shared.log(String(format: "JIT-pool pin chunk %d at 0x%lx (16MB)", i, Int(addr)))
                 if addr + vm_address_t(chunkSize) >= pinTarget { break }
@@ -141,9 +150,200 @@ enum StikJITHelper {
         // fix needs explicit placement (hinted allocation / reserve-and-carve),
         // not a re-roll; simply pinning the bad region to force a different address
         // costs another 896MB against the 4096MB jetsam ceiling.
+        // ml1034: HOLD THE EXECUTABLE WINDOW BEFORE ALLOCATING RX.
+        //
+        // ml977 reserved [0x140000000,0x150000000) only AFTER the RX pool was
+        // allocated, so on the iPhone 18 Pro the pool got there first and the
+        // reservation could only report the loss:
+        //
+        //   ml977: could NOT reserve the executable window (kr=3)
+        //   ml977: RX pool overlaps the executable window -- RX placement, not RW,
+        //          would need changing
+        //   ml977: RX=[0x122000000,0x142000000)          <- contains 0x140000000
+        //   ml985: preferred base 0x140000000+0x70000 REFUSED status=0xc0000018
+        //
+        // RDR2.exe has BASERELOC rva=0 size=0, so it CANNOT be relocated: moved
+        // to 0x146a90000, every absolute pointer in it stayed behind. Its TLS
+        // AddressOfCallBacks still read 0x1432ba978 (relocated it would be
+        // 0x14954a978), call_tls_callbacks walked that stale array and called
+        // garbage:
+        //
+        //   CompileBlock: REFUSING low/invalid RIP=0x170
+        //   [redeliv] 2000 identical redeliveries pc=0x0 -- unrecoverable host
+        //             fault misdelivered to guest -> terminating
+        //
+        // The diagnosis was already in our own log; only the ORDER was wrong. So
+        // reserve first: the debugger's allocator cannot hand back a range that
+        // is already mapped, which removes the collision without naming an RX
+        // address ourselves. Failure is still never fatal -- we log and continue
+        // exactly as before, and MADEIRA_NO_EXE_WINDOW=1 skips it.
+        let exeWinBase: vm_address_t = 0x140000000
+        // ml1037: 128MB, not 256MB. The census on the iPhone 18 Pro read
+        //   0x12067c000+505MB | [window 256MB] | 0x150000000+500MB | 0x16fa24000+261MB
+        // i.e. the window itself was what split the low gap into pieces too small
+        // for the pool, and the 496MB pool that did fit ran out mid-load
+        // ("EXEC ALLOC FAILED ... JIT pool exhausted", exit 0xc000012d: 406MB of
+        // image copies + 64MB of live code buffers). Halving the window gives the
+        // hole above it ~628MB contiguous. The largest fixed-base image we ship
+        // against ends at +117MB; ntdll hands the window to the first fixed map
+        // of >=64MB that fits, and reads the size from WINE_IOS_EXE_WINDOW.
+        let exeWinSize: vm_address_t = 0x8000000           // 128MB
+        func overlapsExeWindow(_ base: vm_address_t, _ len: vm_address_t) -> Bool {
+            return base < exeWinBase + exeWinSize && base + len > exeWinBase
+        }
+        let skipWindow = (ProcessInfo.processInfo.environment["MADEIRA_NO_EXE_WINDOW"].map { $0 != "0" } ?? false)
+        var windowHeld = false
+        if !skipWindow && madeira_early_window_base == UInt(exeWinBase) && madeira_early_window_size == UInt(exeWinSize) {
+            // ml1040: already held since image load (JITAllocator.c constructor).
+            windowHeld = true
+            setenv("WINE_IOS_EXE_WINDOW", String(format: "%lx:%lx", Int(exeWinBase), Int(exeWinSize)), 1)
+            LogStore.shared.log("ml1040: executable window [0x140000000,+128MB) held since image load", level: .success)
+        } else if !skipWindow {
+            var winAddr: vm_address_t = exeWinBase
+            let krWin = vm_allocate(mach_task_self_, &winAddr, vm_size_t(exeWinSize), 0 /* VM_FLAGS_FIXED */)
+            if krWin == KERN_SUCCESS && winAddr == exeWinBase {
+                windowHeld = true
+                setenv("WINE_IOS_EXE_WINDOW", String(format: "%lx:%lx", Int(exeWinBase), Int(exeWinSize)), 1)
+                LogStore.shared.log("ml1034: reserved executable window [0x140000000,0x150000000) BEFORE "
+                    + "RX allocation - a fixed-base main image can now load where it must; "
+                    + "ntdll releases it on demand", level: .success)
+            } else {
+                if krWin == KERN_SUCCESS { vm_deallocate(mach_task_self_, winAddr, vm_size_t(exeWinSize)) }
+                LogStore.shared.log("ml1034: could NOT reserve the executable window (kr=\(krWin)) BEFORE "
+                    + "RX - something else already holds 0x140000000; a non-relocatable image will be "
+                    + "displaced and its absolute pointers will be stale", level: .error)
+                // ml1097: NAME the occupant. The ml1095 build hit this on every launch
+                // (0x140000000+88MB taken before the image-load constructor ran)
+                // and nothing said what it was.
+                var pa = vm_address_t(exeWinBase)
+                var ps: vm_size_t = 0
+                var pinfo = vm_region_basic_info_data_64_t()
+                var pcnt = mach_msg_type_number_t(MemoryLayout<vm_region_basic_info_data_64_t>.size / MemoryLayout<Int32>.size)
+                var pobj: mach_port_t = 0
+                let pkr = withUnsafeMutablePointer(to: &pinfo) {
+                    $0.withMemoryRebound(to: Int32.self, capacity: Int(pcnt)) {
+                        vm_region_64(mach_task_self_, &pa, &ps, VM_REGION_BASIC_INFO_64, $0, &pcnt, &pobj)
+                    }
+                }
+                var depth: natural_t = 0
+                var sinfo = vm_region_submap_info_data_64_t()
+                var scnt = mach_msg_type_number_t(MemoryLayout<vm_region_submap_info_data_64_t>.size / MemoryLayout<Int32>.size)
+                var sa = vm_address_t(exeWinBase)
+                var ss: vm_size_t = 0
+                _ = withUnsafeMutablePointer(to: &sinfo) {
+                    $0.withMemoryRebound(to: Int32.self, capacity: Int(scnt)) {
+                        vm_region_recurse_64(mach_task_self_, &sa, &ss, &depth, $0, &scnt)
+                    }
+                }
+                var dl = Dl_info()
+                let named = dladdr(UnsafeRawPointer(bitPattern: UInt(exeWinBase)), &dl) != 0
+                let image = named && dl.dli_fname != nil ? String(cString: dl.dli_fname) : "(no dyld image)"
+                LogStore.shared.log(String(format: "ml1097: occupant of 0x140000000: region 0x%lx+%luMB prot=%d/%d (kr=%d) user_tag=%u share=%d resident=%u pages; %@",
+                                           Int(pa), Int(ps >> 20), pinfo.protection, pinfo.max_protection, pkr,
+                                           sinfo.user_tag, Int(sinfo.share_mode), sinfo.pages_resident, image), level: .error)
+            }
+        }
+
         let goodLow = 0x119000000
         let guestLo = 0x7000000000
         let guestHi = 0x8000000000
+
+        // ml1036: HOLE CENSUS, then size the pool to what can actually be placed.
+        //
+        // ml1034 held the window first, and the very next launch could not place
+        // the pool at all: three identical "BAD POOL placement 0x7000000000"
+        // and an abort. The debugger's allocator is first-fit with no address
+        // hint, and on this phone the usable low gap is small -- from the slide-
+        // dependent frontier (0x11ed.. to 0x1258.. observed) up to the window.
+        // With the frontier at 0x1223d0000 that is 460MB: a 512MB pool does not
+        // fit, so the kernel falls through to the guest window, which we refuse.
+        // Before ml1034 the same launch would have "worked" by swallowing
+        // 0x140000000 and then killing any fixed-base game -- so the choice is
+        // between a smaller pool and a run that cannot survive. Measure the
+        // holes, log them, and take the largest pool that fits.
+        // ml1040: the run directly above the window has been held since image load
+        // so that nothing of ours could land in it. Release it now -- the very
+        // next allocation of this size is the debugger's.
+        var plugs: [(vm_address_t, vm_size_t)] = []
+        let earlyPoolBase = vm_address_t(madeira_early_pool_base)
+        let earlyPoolSize = vm_address_t(madeira_early_pool_size)
+        if earlyPoolBase != 0 {
+            vm_deallocate(mach_task_self_, earlyPoolBase, vm_size_t(earlyPoolSize))
+            LogStore.shared.log(String(format: "ml1040: released the early pool placeholder 0x%lx+%luMB for the debugger",
+                                       Int(earlyPoolBase), Int(earlyPoolSize >> 20)))
+        } else {
+            LogStore.shared.log("ml1040: no early pool placeholder was obtained — placement is left to chance", level: .error)
+            // ml1135: what was already mapped above the window at image load (user_tag
+            // is the VM_MEMORY_* allocation tag; 0 = untagged anonymous memory).
+            if madeira_early_intruder_base != 0 {
+                LogStore.shared.log(String(format: "ml1135: the placeholder was blocked at image load by a mapping at 0x%lx+%luMB (VM tag %u, prot %u) -- this is what shrinks the JIT pool",
+                                           Int(madeira_early_intruder_base), Int(madeira_early_intruder_size >> 20),
+                                           madeira_early_intruder_tag, madeira_early_intruder_prot), level: .error)
+            }
+        }
+        do {
+            var holes: [(base: vm_address_t, size: vm_address_t)] = []
+            var addr = vm_address_t(goodLow)
+            var prevEnd = vm_address_t(goodLow)
+            while addr < vm_address_t(guestLo) {
+                var rsize: vm_size_t = 0
+                var info = vm_region_basic_info_data_64_t()
+                var cnt = mach_msg_type_number_t(MemoryLayout<vm_region_basic_info_data_64_t>.size / MemoryLayout<Int32>.size)
+                var obj: mach_port_t = 0
+                let kr = withUnsafeMutablePointer(to: &info) {
+                    $0.withMemoryRebound(to: Int32.self, capacity: Int(cnt)) {
+                        vm_region_64(mach_task_self_, &addr, &rsize, VM_REGION_BASIC_INFO_64, $0, &cnt, &obj)
+                    }
+                }
+                if kr != KERN_SUCCESS { break }
+                let start = min(addr, vm_address_t(guestLo))
+                if start > prevEnd && start - prevEnd >= 64 << 20 { holes.append((prevEnd, start - prevEnd)) }
+                prevEnd = max(prevEnd, addr + vm_address_t(rsize))
+                addr = prevEnd
+            }
+            let desc = holes.map { String(format: "0x%lx+%luMB", Int($0.base), Int($0.size >> 20)) }.joined(separator: " ")
+            LogStore.shared.log("ml1036: free holes >=64MB in [0x119000000,0x7000000000) with the window held: "
+                + (desc.isEmpty ? "NONE" : desc))
+            let largest = holes.map { $0.size }.max() ?? 0
+            if largest < vm_address_t(poolSize) {
+                let fit = Int(largest) & ~((16 << 20) - 1)
+                if fit >= 256 << 20 {
+                    LogStore.shared.log("ml1036: no hole fits a \(poolSize >> 20)MB pool — SHRINKING to \(fit >> 20)MB "
+                        + "(the alternative is a pool in the guest window or on top of 0x140000000, "
+                        + "both of which are fatal)", level: .error)
+                    poolSize = fit
+                    // ml1135: ~400MB of the pool is PE image copies, so below ~500MB FEX's
+                    // code cache is starved and rolls over every few seconds in game
+                    // (ph-rdr90: 432MB pool, 52 rollovers, a ~1 s freeze each).
+                    if fit < 500 << 20 {
+                        LogStore.shared.log("⚠️ SMALL JIT POOL (\(fit >> 20)MB) on this launch: expect ~1 s freezes in heavy games. "
+                            + "Quit and relaunch the app for a smooth session.", level: .error)
+                    }
+                } else {
+                    LogStore.shared.log("ml1036: largest hole is only \(largest >> 20)MB — cannot place a usable pool",
+                                        level: .error)
+                }
+            }
+            // ml1040: the debugger allocates first-fit. If a LOWER hole also fits
+            // the final pool size it would win and strand the pool below the
+            // window again, so plug those for the duration of the request.
+            // ml1097: a hole that CONTAINS or ADJOINS the released placeholder is the
+            // pool's own landing site, never a "lower hole" -- when the window was not
+            // held, the placeholder's run merged with the free space below it and
+            // the old test plugged the only hole that fit (every launch of ml1095
+            // ended in the guest window). Plug only holes ending below the placeholder.
+            if earlyPoolBase != 0 && windowHeld {
+                for h in holes where h.base + h.size <= earlyPoolBase && h.size >= vm_address_t(poolSize) {
+                    var a = h.base
+                    if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* FIXED */) == KERN_SUCCESS && a == h.base {
+                        plugs.append((a, vm_size_t(h.size)))
+                        LogStore.shared.log(String(format: "ml1040: plugged lower hole 0x%lx+%luMB so first-fit lands above the window",
+                                                   Int(h.base), Int(h.size >> 20)))
+                    } else if a != h.base { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
+                }
+            }
+        }
+
         var rxPtrOpt: UnsafeMutableRawPointer? = nil
         for attempt in 0..<3 {
             guard let p = jit26_prepare_region(nil, poolSize), p != UnsafeMutableRawPointer(bitPattern: 0) else {
@@ -152,18 +352,26 @@ enum StikJITHelper {
             }
             let a = Int(bitPattern: p)
             let inGuestWindow = a + poolSize > guestLo && a < guestHi
-            if a >= goodLow && !inGuestWindow {
+            // ml1034: a pool covering 0x140000000 displaces a non-relocatable
+            // main image, which is fatal later and unrecoverable.
+            let hitsExeWindow = overlapsExeWindow(vm_address_t(a), vm_address_t(poolSize))
+            if a >= goodLow && !inGuestWindow && !hitsExeWindow {
                 rxPtrOpt = p
                 break
             }
             LogStore.shared.log(String(format: "BAD POOL placement 0x%lx (%@) — re-rolling (attempt %d)",
-                                       a, a < goodLow ? "mode A low" : "guest 64G window",
+                                       a,
+                                       a < goodLow ? "mode A low"
+                                         : (hitsExeWindow ? "swallows the 0x140000000 executable window"
+                                                          : "guest 64G window"),
                                        attempt), level: .error)
             let dkr = vm_deallocate(mach_task_self_, vm_address_t(a), vm_size_t(poolSize))
             LogStore.shared.log(dkr == KERN_SUCCESS
                 ? "  bad region freed"
                 : "  bad region kept as pin (vm_deallocate kr=\(dkr))")
         }
+        // ml1040: the plugs existed only to steer first-fit; give the VA back.
+        for (a, sz) in plugs { vm_deallocate(mach_task_self_, a, sz) }
         guard let rxPtr = rxPtrOpt else {
             LogStore.shared.log("BAD POOL: no valid placement after retries. Killing in 10s — please relaunch.", level: .error)
             DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 10) {
@@ -249,7 +457,56 @@ enum StikJITHelper {
         // PartitionAlloc gets only two of the three 16GB-aligned pools it needs
         // (see the ml96 [jumbo#N] census). Freeing that slot is worth doing —
         // but by moving WINE's furniture out of 496G, not by moving this.
-        rwAddr = 0
+        // ml977: RESERVE the x64 executable window, then let the kernel place RW.
+        //
+        // Every x64 Windows executable defaults to ImageBase 0x140000000, and an
+        // image with no relocation directory MUST have it. RDR2.exe is exactly
+        // that (ImageBase 0x140000000, BASERELOC rva=0 size=0, DYNAMIC_BASE
+        // clear). In rdr40/rdr41 the kernel placed this RW alias adjacent to the
+        // RX pool -- RX=0x119eb0000, RW=RX+512MB -- so the alias covered
+        // 0x140000000, the loader's no-clobber fixed map failed, the exe was
+        // placed elsewhere WITHOUT relocations, and its TLS AddressOfCallBacks
+        // stayed 0x1432ba978: an address inside this alias. call_tls_callbacks
+        // then read its callback list out of pool backing memory.
+        //
+        // ml976 tried a list of FIXED candidates (0x150000000 upward) and every
+        // one returned KERN_NO_SPACE (=3): those ranges are occupied, so a
+        // non-overwriting remap correctly refused. ml976 then returned nil,
+        // which aborted pool allocation and stopped Wine from starting at all --
+        // "JIT pool allocation FAILED". A placement experiment must never brick
+        // the launch; that was the bug, not the refusal.
+        //
+        // So invert it: RESERVE [0x140000000, +256MB) up front, then ask for RW
+        // with VM_FLAGS_ANYWHERE exactly as before. The kernel cannot choose a
+        // range that overlaps a mapping we already hold, so adjacency is ruled
+        // out without naming any address ourselves, and the reservation also
+        // stops unrelated allocations and earlier relocatable images from taking
+        // the window first. rwAddr is seeded with 0x150000000 as a floor hint so
+        // the search starts just above the window rather than jumping far away
+        // (a large alias offset is legal -- FEX derives DualMap::WriteOffset from
+        // the real RW-RX distance -- but a near placement stays closest to the
+        // measured-good configuration).
+        //
+        // Failure is never fatal here: if the window cannot be reserved we log it
+        // and continue with the kernel's choice, which is the pre-ml976 behaviour.
+        // MADEIRA_NO_EXE_WINDOW=1 skips the reservation entirely.
+        // ml1034: the reservation and the RX overlap rejection both happen before
+        // the pool is allocated now (see above). This is a post-hoc assertion: if
+        // it fires, the debugger handed back a range covering a window we held,
+        // which should be impossible.
+        let rxAddrV = vm_address_t(bitPattern: rxPtr)
+        if overlapsExeWindow(rxAddrV, vm_address_t(poolSize)) {
+            LogStore.shared.log("ml1034: RX pool STILL overlaps the executable window despite reserving "
+                + "it first (windowHeld=\(windowHeld)) — a non-relocatable main image will be displaced",
+                level: .error)
+        }
+
+        // ml1037: the hint used to be 0x150000000 ("just above the window"), and
+        // the alias duly took the 500MB hole there -- the very hole the RX pool
+        // now needs. The alias has no placement requirement of its own (FEX
+        // derives WriteOffset from the real distance), so send it high, where it
+        // lived in every run before ml977, and keep the scarce low gap for RX.
+        rwAddr = 0x7000000000
         let kr1 = vm_remap(
             mach_task_self_,
             &rwAddr,
@@ -268,6 +525,15 @@ enum StikJITHelper {
             LogStore.shared.log("vm_remap failed: \(kr1)", level: .error)
             return nil
         }
+
+        let rwOverlaps = overlapsExeWindow(rwAddr, vm_address_t(poolSize))
+        LogStore.shared.log("ml977: RX=[\(String(format:"%p",Int(rxAddrV))),"
+            + "\(String(format:"%p",Int(rxAddrV + vm_address_t(poolSize))))) "
+            + "RW=[\(String(format:"%p",Int(rwAddr))),"
+            + "\(String(format:"%p",Int(rwAddr + vm_address_t(poolSize))))) "
+            + "offset=0x\(String(Int(rwAddr) - Int(rxAddrV), radix: 16)) "
+            + "windowHeld=\(windowHeld) rwOverlap=\(rwOverlaps)",
+            level: rwOverlaps ? .error : .success)
 
         // Set RW protection
         let kr2 = vm_protect(mach_task_self_, rwAddr, vm_size_t(poolSize), 0, VM_PROT_READ | VM_PROT_WRITE)

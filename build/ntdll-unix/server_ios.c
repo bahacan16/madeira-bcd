@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <sys/time.h>
@@ -532,6 +533,1210 @@ static inline unsigned int wait_reply( struct __server_request_info *req )
 }
 
 
+/* ============================================================================
+ * ml875 [thread-sample] -- task-wide guest/native thread sampler.
+ *
+ * Why this shape (review of ml873/ml874):
+ *  - every thread gets a record: native pc/lr/sp + dladdr, name, run state,
+ *    even when guest resolution fails (a GameThread blocked in native code
+ *    carries no valid FEX registers and would otherwise vanish);
+ *  - the guest RIP comes from the ml688 block-tail resolver ([x28+0] is
+ *    InlineJITBlockHeader); State.rip is NOT maintained while the JIT runs;
+ *  - x17 (callret sp) and x23 (SRA guest rsp) are only meaningful when pc is
+ *    inside a JIT block, so callret/stack are only decoded on a resolved
+ *    sample; stack matches are CANDIDATE return addresses, not an unwind;
+ *  - module names come from the sampled thread's OWN PEB (pseudo-processes
+ *    share the Mach task but not their loader lists), rebuilt every burst;
+ *  - one sampler for the task, bursts of 4 passes 250 ms apart every 20 s,
+ *    GameThread and RUNNING threads on every pass, everything else once. */
+static int ios_ts_armed;
+struct ios_ts_mod { uint64_t base, size; char name[40]; };
+struct ios_ts_map { uint64_t peb; int n; struct ios_ts_mod m[160]; };
+static struct ios_ts_map ios_ts_maps[6];
+static int ios_ts_nmaps;
+
+static int ios_ts_read(uint64_t a, void *o, size_t n)
+{
+    vm_size_t got = 0;
+    return a > 0x10000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)o, &got) == KERN_SUCCESS && got == n;
+}
+
+/* ml876: thread_get_state returns x18 == 0 for every thread (the kernel does
+ * not preserve the platform register), so ml875 never had a TEB and never
+ * built a module map. The TEB lives in the pthread TSD slot ios_teb_tls_key;
+ * find the TSD array's offset inside struct pthread by SELF-CALIBRATION (set
+ * a private key on this thread, scan for the value) rather than trusting the
+ * 224 from libpthread's private headers. */
+static long ios_ts_tsd_off = -1;
+static void ios_ts_calibrate(void)
+{
+    extern pthread_key_t ios_teb_tls_key;
+    pthread_key_t k; long off; char *base = (char *)pthread_self();
+    if (pthread_key_create(&k, NULL)) return;
+    pthread_setspecific(k, (void *)0x5a5a1234abcdULL);
+    for (off = 0; off < 8192; off += 8) {
+        uint64_t v = 0;
+        if (ios_ts_read((uint64_t)(uintptr_t)base + off + (uint64_t)k * 8, &v, 8) && v == 0x5a5a1234abcdULL) { ios_ts_tsd_off = off; break; }
+    }
+    pthread_setspecific(k, NULL); pthread_key_delete(k);
+    wine_log_write("[thread-sample] ml876 tsd offset calibrated: %ld (teb key %lu)", ios_ts_tsd_off, (unsigned long)ios_teb_tls_key);
+}
+static uint64_t ios_ts_teb(pthread_t pt)
+{
+    extern pthread_key_t ios_teb_tls_key;
+    uint64_t v = 0;
+    if (ios_ts_tsd_off < 0 || !pt || !ios_teb_tls_key) return 0;
+    ios_ts_read((uint64_t)(uintptr_t)pt + ios_ts_tsd_off + (uint64_t)ios_teb_tls_key * 8, &v, 8);
+    return (v & 0xfff) ? 0 : v;
+}
+
+static struct ios_ts_map *ios_ts_map_for_teb(uint64_t teb)
+{
+    uint64_t peb = 0, ldr = 0, head, cur; int i, guard = 0; struct ios_ts_map *mp;
+    if (!teb || (teb & 0xfff) || !ios_ts_read(teb + 0x60, &peb, 8) || !peb) return NULL;
+    for (i = 0; i < ios_ts_nmaps; i++) if (ios_ts_maps[i].peb == peb) return &ios_ts_maps[i];
+    if (ios_ts_nmaps >= 6 || !ios_ts_read(peb + 0x18, &ldr, 8) || !ldr) return NULL;
+    mp = &ios_ts_maps[ios_ts_nmaps]; memset(mp, 0, sizeof(*mp)); mp->peb = peb;
+    head = ldr + 0x10;
+    if (!ios_ts_read(head, &cur, 8)) return NULL;
+    while (cur && cur != head && guard++ < 200 && mp->n < 160) {
+        uint64_t base = 0, buf = 0, next = 0; uint32_t size = 0; uint16_t len = 0, w[40]; int k;
+        if (!ios_ts_read(cur + 0x30, &base, 8) || !ios_ts_read(cur + 0x40, &size, 4) ||
+            !ios_ts_read(cur + 0x58, &len, 2) || !ios_ts_read(cur + 0x60, &buf, 8)) break;
+        if (base && size) {
+            struct ios_ts_mod *m = &mp->m[mp->n++];
+            m->base = base; m->size = size;
+            len /= 2; if (len > 39) len = 39;
+            if (len && ios_ts_read(buf, w, len * 2)) { for (k = 0; k < len; k++) m->name[k] = w[k] < 128 ? (char)w[k] : '?'; m->name[len] = 0; }
+            else strcpy(m->name, "?");
+        }
+        if (!ios_ts_read(cur, &next, 8)) break;
+        cur = next;
+    }
+    ios_ts_nmaps++;
+    wine_log_write("[thread-sample] ml876 modmap peb=0x%llx modules=%d first=%s@0x%llx", (unsigned long long)peb, mp->n,
+                   mp->n ? mp->m[0].name : "-", (unsigned long long)(mp->n ? mp->m[0].base : 0));
+    return mp;
+}
+
+static const char *ios_ts_mod_for(struct ios_ts_map *mp, uint64_t va, uint64_t *rva)
+{
+    int i;
+    if (!mp) return NULL;
+    for (i = 0; i < mp->n; i++)
+        if (va >= mp->m[i].base && va < mp->m[i].base + mp->m[i].size) { *rva = va - mp->m[i].base; return mp->m[i].name; }
+    return NULL;
+}
+
+static int ios_ts_sym(uint64_t a, char *out, size_t cap)
+{
+    Dl_info di; const char *img;
+    if (!a || !dladdr((void *)a, &di) || !di.dli_fname) { snprintf(out, cap, "0x%llx", (unsigned long long)a); return 0; }
+    img = strrchr(di.dli_fname, '/'); img = img ? img + 1 : di.dli_fname;
+    if (di.dli_sname) snprintf(out, cap, "%s`%s+0x%llx", img, di.dli_sname, (unsigned long long)(a - (uint64_t)di.dli_saddr));
+    else snprintf(out, cap, "%s+0x%llx", img, (unsigned long long)(a - (uint64_t)di.dli_fbase));
+    return 1;
+}
+
+static void ios_thread_sampler_pass(int burst)
+{
+    extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+    mach_port_t self_port = pthread_mach_thread_np(pthread_self());
+    thread_act_array_t tlist; mach_msg_type_number_t tcount; unsigned k, printed = 0;
+    if (task_threads(mach_task_self(), &tlist, &tcount) != KERN_SUCCESS) return;
+    ios_ts_nmaps = 0;                                   /* fresh maps every pass */
+    for (k = 0; k < tcount && printed < 64; k++) {
+        thread_basic_info_data_t bi; mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+        arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+        char tname[40] = ""; pthread_t pt; int running, is_game;
+        uint64_t pc, lr, sp, x28, x17, x18, x23, bb = 0, rip = 0, cr[16], stk[64], nstk[64];
+        int have_bb, have_cr, have_stk, have_nstk;
+        const char *why = "";
+        if (tlist[k] == self_port) continue;
+        if (thread_info(tlist[k], THREAD_BASIC_INFO, (thread_info_t)&bi, &bic) != KERN_SUCCESS) continue;
+        pt = pthread_from_mach_thread_np(tlist[k]);
+        if (pt) pthread_getname_np(pt, tname, sizeof(tname));
+        running = bi.run_state == TH_STATE_RUNNING;
+        is_game = !strcmp(tname, "GameThread") || !strncmp(tname, "RenderThread", 12) || !strncmp(tname, "RHIThread", 9);
+        if (burst && !running && !is_game) continue;    /* idle waiters: once per burst */
+        if (thread_suspend(tlist[k]) != KERN_SUCCESS) continue;
+        if (thread_get_state(tlist[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS) { thread_resume(tlist[k]); continue; }
+        pc = arm_thread_state64_get_pc(st); lr = arm_thread_state64_get_lr(st); sp = arm_thread_state64_get_sp(st);
+        x28 = st.__x[28]; x17 = st.__x[17]; x23 = st.__x[23];
+        x18 = ios_ts_teb(pt);                          /* ml876: TEB from TSD, not x18 */
+        if (!x18) x18 = st.__x[18];
+        have_bb  = ios_ts_read(x28, &bb, 8) && bb > 0x10000;
+        have_cr  = ios_ts_read(x17, cr, sizeof(cr));
+        have_stk = !(x23 & 7) && ios_ts_read(x23, stk, sizeof(stk));
+        have_nstk = !(sp & 7) && ios_ts_read(sp, nstk, sizeof(nstk));
+        thread_resume(tlist[k]);
+        if (have_bb) rip = ios_native_rip_from_hostpc(bb, pc, &why);
+        {
+            char line[1400], s1[120], s2[120]; int n; unsigned i, shown; uint64_t rva; const char *mn;
+            struct ios_ts_map *mp = ios_ts_map_for_teb(x18);
+            ios_ts_sym(pc, s1, sizeof(s1)); ios_ts_sym(lr, s2, sizeof(s2));
+            n = snprintf(line, sizeof(line), "[thread-sample] ml876 b%d \"%s\" teb=0x%llx cpu=%d%% %s pc=%s lr=%s sp=0x%llx",
+                         burst, tname, (unsigned long long)x18, bi.cpu_usage / 10, running ? "RUN" : "wait",
+                         s1, s2, (unsigned long long)sp);
+            if (rip) {
+                mn = ios_ts_mod_for(mp, rip, &rva);
+                n += snprintf(line + n, sizeof(line) - n, " GUEST rip=0x%llx", (unsigned long long)rip);
+                if (mn) n += snprintf(line + n, sizeof(line) - n, "(%s+0x%llx)", mn, (unsigned long long)rva);
+                n += snprintf(line + n, sizeof(line) - n, " callret=[");
+                for (i = 0; have_cr && i < 8 && n < (int)sizeof(line) - 100; i++) {
+                    uint64_t g = cr[i * 2]; if (!g) break;
+                    mn = ios_ts_mod_for(mp, g, &rva);
+                    if (mn) n += snprintf(line + n, sizeof(line) - n, " %s+0x%llx", mn, (unsigned long long)rva);
+                    else n += snprintf(line + n, sizeof(line) - n, " 0x%llx", (unsigned long long)g);
+                }
+                n += snprintf(line + n, sizeof(line) - n, " ] rsp=0x%llx stack-cand=[", (unsigned long long)x23);
+                for (i = 0, shown = 0; have_stk && i < 64 && shown < 12 && n < (int)sizeof(line) - 80; i++) {
+                    mn = ios_ts_mod_for(mp, stk[i], &rva);
+                    if (!mn || rva < 0x1000) continue;
+                    n += snprintf(line + n, sizeof(line) - n, " %s+0x%llx", mn, (unsigned long long)rva); shown++;
+                }
+                n += snprintf(line + n, sizeof(line) - n, " ]");
+            } else {
+                n += snprintf(line + n, sizeof(line) - n, " NATIVE (%s%s) sp-cand=[", have_bb ? "unresolved: " : "no FEX state", have_bb ? why : "");
+                for (i = 0, shown = 0; have_nstk && i < 64 && shown < 12 && n < (int)sizeof(line) - 80; i++) {
+                    mn = ios_ts_mod_for(mp, nstk[i], &rva);
+                    if (!mn || rva < 0x1000) continue;
+                    n += snprintf(line + n, sizeof(line) - n, " %s+0x%llx", mn, (unsigned long long)rva); shown++;
+                }
+                n += snprintf(line + n, sizeof(line) - n, " ]");
+            }
+            wine_log_write("%s", line);
+            printed++;
+        }
+    }
+    for (k = 0; k < tcount; k++) mach_port_deallocate(mach_task_self(), tlist[k]);
+    vm_deallocate(mach_task_self(), (vm_address_t)tlist, tcount * sizeof(*tlist));
+}
+
+/* ml979: is the guest looping tightly, or grinding forward slowly?
+ *
+ * rdr48/rdr49 plateau with four guest threads at ~35% CPU each, all with RIPs
+ * inside EMP.dll's obfuscation VM, while every other signal is frozen: the
+ * sub-floor counter stops dead, memory is flat, and there is no I/O. That is
+ * either a small hot loop waiting for a condition that never becomes true, or
+ * a slow sweep that is genuinely progressing. Those need completely different
+ * responses, and the existing ml876 sampler cannot tell them apart -- it takes
+ * 4 samples 250 ms apart every 20 s, which yielded 3 distinct RIPs across an
+ * entire 15-minute run.
+ *
+ * So take a proper profile: many samples, close together, bucketed. A tight
+ * loop concentrates in a handful of buckets; a sweep spreads across many and
+ * the SPAN between the lowest and highest RIP grows between profiles.
+ *
+ * Deliberately does NOT suspend the threads -- we want them running, and a
+ * sampling profiler tolerates the occasional torn read. Ports and the thread
+ * array are released every pass; at 200 passes a leak here would exhaust the
+ * port table. */
+#define ML979_PASSES  200
+#define ML979_BUCKETS 32
+#define ML979_GRAIN   0x40ull        /* 64-byte buckets */
+#define ML979_MAXTHREADS 12          /* guest threads tracked per profile */
+
+static void ios_guest_rip_profile( int gen )
+{
+    extern uint64_t ios_native_rip_from_hostpc( uint64_t, uint64_t, const char ** );
+    struct { uint64_t base; unsigned n; } b[ML979_BUCKETS];
+    mach_port_t self_port = pthread_mach_thread_np( pthread_self() );
+    uint64_t lo = ~0ull, hi = 0;
+    unsigned total = 0, distinct = 0, dropped = 0;
+    int nb = 0, pass, i;
+    thread_act_t tg[ML979_MAXTHREADS];
+    int ntg = 0;
+
+    /* ml980 FIX: the state read MUST be bracketed by thread_suspend/resume.
+     *
+     * The first cut skipped it on the theory that a sampling profiler tolerates
+     * torn reads. On Darwin that is simply wrong -- thread_get_state on a
+     * thread that is not suspended does not reliably return its registers, and
+     * the sampler immediately above this function has always suspended for
+     * exactly that reason. Result: 3 profiles x 200 passes resolved ZERO guest
+     * RIPs and printed nothing at all (rdr50: 9 bursts, 0 rip-profile lines).
+     *
+     * Suspending every thread 200 times would be far too heavy (~40 threads),
+     * so identify the guest threads ONCE per profile and then sample only those.
+     * A guest thread is one whose x28 points at a readable FEX CpuStateFrame,
+     * which is the same test the ml876 sampler uses. */
+    {
+        thread_act_array_t tl; mach_msg_type_number_t tc; unsigned k;
+        if (task_threads( mach_task_self(), &tl, &tc ) != KERN_SUCCESS) return;
+        for (k = 0; k < tc && ntg < ML979_MAXTHREADS; k++) {
+            arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            uint64_t bb = 0;
+            if (tl[k] == self_port) continue;
+            if (thread_suspend( tl[k] ) != KERN_SUCCESS) continue;
+            /* ml981: a guest thread is one whose frame yields a plausible RIP at
+             * x28+0x18 -- the same test the sampling loop uses, so a thread can
+             * never be selected here and then fail to resolve below. */
+            if (thread_get_state( tl[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS
+                && ios_ts_read( st.__x[28] + 0x18, &bb, 8 )
+                && bb > 0x10000 && bb < 0x8000000000ull
+                && ios_ts_teb( pthread_from_mach_thread_np( tl[k] ) ))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
+            {
+                tg[ntg] = tl[k];
+                mach_port_mod_refs( mach_task_self(), tl[k], MACH_PORT_RIGHT_SEND, 1 ); /* keep it */
+                ntg++;
+            }
+            thread_resume( tl[k] );
+        }
+        for (k = 0; k < tc; k++) mach_port_deallocate( mach_task_self(), tl[k] );
+        vm_deallocate( mach_task_self(), (vm_address_t)tl, tc * sizeof(*tl) );
+    }
+    if (!ntg) {
+        wine_log_write( "[rip-profile] ml981 gen=%d: no guest threads found (no plausible RIP at x28+0x18)", gen );
+        return;
+    }
+
+    /* ml1111: the ml981 histogram counted every guest thread, parked or not, so
+     * 40-67 % of it was threads asleep in a wait. Keep a SECOND histogram of
+     * RUNNING threads only (thread_basic_info.run_state), and for running
+     * threads whose RIP is a native address (the guest is inside an ARM64EC
+     * callee: our runtime, ntdll, the pool copies) bucket the HOST pc too, so
+     * the native hot spots have names (symbolise offline: [jit-pool] image
+     * lines + llvm-objdump --syms on the DLL). */
+    struct { uint64_t base; unsigned n; } rb[ML979_BUCKETS], hb[ML979_BUCKETS];
+    int nrb = 0, nhb = 0; unsigned rtotal = 0, htotal = 0;
+    struct { uint64_t pc, lr, x16; } hcaller[24]; int hcaller_n = 0;   /* ml1115 */
+    /* ml1123: CPU split of RUNNING Wine-thread samples by HOST pc:
+     * 0 = FEX-compiled x64 (pool, not an image copy), 1 = ARM64EC image copy
+     * (keyed by PE address: ntdll/kernelbase/libarm64ecfex/madeira_d3d12 ...),
+     * 2 = native (Madeira dylib = Wine unix + madsync + bridge, system libs). */
+    extern void *ios_jit_rx_base_global; extern size_t ios_jit_pool_size_global;
+    extern int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out);
+    unsigned cls[3] = {0, 0, 0};
+    struct { uint64_t key; unsigned n; } ib[48], xnb[48], jb[64]; int nib = 0, nnb = 0, njb = 0;   /* ml1124: jb = JIT host pc /64 */
+    memset( rb, 0, sizeof(rb) ); memset( hb, 0, sizeof(hb) );
+    memset( b, 0, sizeof(b) );
+    for (pass = 0; pass < ML979_PASSES; pass++) {
+        int t;
+        for (t = 0; t < ntg; t++) {
+            arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+            uint64_t bb = 0, rip; const char *why = "";
+            thread_basic_info_data_t bi; mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT; int running = 0;
+            if (thread_info( tg[t], THREAD_BASIC_INFO, (thread_info_t)&bi, &bic ) == KERN_SUCCESS) running = (bi.run_state == TH_STATE_RUNNING);
+            if (thread_suspend( tg[t] ) != KERN_SUCCESS) continue;
+            /* ml981: read the guest RIP DIRECTLY out of the FEX frame, not via
+             * ios_native_rip_from_hostpc().
+             *
+             * That helper infers the guest RIP from the HOST pc plus block
+             * metadata, which only works when the pc happens to sit inside a
+             * block whose tail is intact -- at arbitrary sampling points it is
+             * usually in a dispatcher or thunk instead, and it returns 0 with
+             * reasons like "hostPC outside block". ml980 measured that directly:
+             * 6 profiles found 2-3 guest threads each and resolved ZERO RIPs.
+             * The ml876 sampler has the same weakness (2 resolutions in an
+             * entire run), which is why the earlier data was so sparse.
+             *
+             * The SEGV handler does not infer: it reads the frame, whose layout
+             * it documents as "+0x18 rip, then gregs[0..15]". Do the same -- one
+             * 8-byte read at x28+0x18 is authoritative wherever the host pc is. */
+            if (thread_get_state( tg[t], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS
+                && ios_ts_read( st.__x[28] + 0x18, &bb, 8 )
+                && (rip = bb) > 0x10000 && rip < 0x8000000000ull)
+            {
+                total++;
+                if (rip < lo) lo = rip;
+                if (rip > hi) hi = rip;
+                for (i = 0; i < nb; i++) if (b[i].base == (rip & ~(ML979_GRAIN - 1))) { b[i].n++; break; }
+                if (i == nb) {
+                    if (nb < ML979_BUCKETS) { b[nb].base = rip & ~(ML979_GRAIN - 1); b[nb].n = 1; nb++; distinct++; }
+                    else dropped++;
+                }
+                if (running) {   /* ml1123: host-pc class */
+                    uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global, pe_at = 0; int c;
+                    if (st.__pc >= rx0 && st.__pc < rx0 + ios_jit_pool_size_global)
+                        c = ios_jit_pool_image_pc( st.__pc, &pe_at ) ? 1 : 0;
+                    else c = 2;
+                    cls[c]++;
+                    if (c == 0) {   /* ml1124 */
+                        uint64_t key = st.__pc & ~0x3full; int q;
+                        for (q = 0; q < njb; q++) if (jb[q].key == key) { jb[q].n++; break; }
+                        if (q == njb && njb < 64) { jb[njb].key = key; jb[njb].n = 1; njb++; }
+                    }
+                    if (c == 1) {
+                        uint64_t key = pe_at & ~0xffull; int q;
+                        for (q = 0; q < nib; q++) if (ib[q].key == key) { ib[q].n++; break; }
+                        if (q == nib && nib < 48) { ib[nib].key = key; ib[nib].n = 1; nib++; }
+                    } else if (c == 2) {
+                        uint64_t key = st.__pc & ~0x3full; int q;
+                        for (q = 0; q < nnb; q++) if (xnb[q].key == key) { xnb[q].n++; break; }
+                        if (q == nnb && nnb < 48) { xnb[nnb].key = key; xnb[nnb].n = 1; nnb++; }
+                    }
+                }
+                if (running) {   /* ml1111 */
+                    uint64_t k = rip & ~(ML979_GRAIN - 1), hp = st.__pc & ~(ML979_GRAIN - 1);
+                    rtotal++;
+                    for (i = 0; i < nrb; i++) if (rb[i].base == k) { rb[i].n++; break; }
+                    if (i == nrb && nrb < ML979_BUCKETS) { rb[nrb].base = k; rb[nrb].n = 1; nrb++; }
+                    if (rip < 0x140000000ull || rip >= 0x148000000ull) {   /* not in the game image: native callee */
+                        htotal++;
+                        for (i = 0; i < nhb; i++) if (hb[i].base == hp) { hb[i].n++; break; }
+                        if (i == nhb && nhb < ML979_BUCKETS) { hb[nhb].base = hp; hb[nhb].n = 1; nhb++; }
+                        /* ml1115: a trap stub tells nothing by itself; keep the CALLER (lr)
+                         * and the trap number (x16) of the first few samples per bucket. */
+                        if (i < nhb && hcaller_n < 24) { hcaller[hcaller_n].pc = hp; hcaller[hcaller_n].lr = st.__lr; hcaller[hcaller_n].x16 = st.__x[16]; hcaller_n++; }
+                    }
+                }
+            }
+            thread_resume( tg[t] );
+        }
+        usleep( 5000 );                       /* 200 x 5ms = ~1s of profiling */
+    }
+    for (i = 0; i < ntg; i++) mach_port_deallocate( mach_task_self(), tg[i] );
+    if (!total) {
+        wine_log_write( "[rip-profile] ml981 gen=%d: %d guest thread(s) but no RIP resolved", gen, ntg );
+        return;
+    }
+
+    /* crude descending sort, tiny N */
+    for (i = 0; i < nb; i++) { int j, m = i; for (j = i + 1; j < nb; j++) if (b[j].n > b[m].n) m = j;
+        if (m != i) { uint64_t tb = b[i].base; unsigned tn = b[i].n; b[i] = b[m]; b[m].base = tb; b[m].n = tn; } }
+
+    {
+        char line[900]; int n;
+        n = snprintf( line, sizeof(line),
+                      "[rip-profile] ml981 gen=%d threads=%d samples=%u buckets=%u%s span=0x%llx [%#llx..%#llx] top:",
+                      gen, ntg, total, distinct, dropped ? "(+overflow)" : "",
+                      (unsigned long long)(hi - lo), (unsigned long long)lo, (unsigned long long)hi );
+        for (i = 0; i < nb && i < 8 && n < (int)sizeof(line) - 60; i++)
+            n += snprintf( line + n, sizeof(line) - n, " %#llx=%u%%",
+                           (unsigned long long)b[i].base, (b[i].n * 100) / total );
+        wine_log_write( "%s", line );
+        /* ml1111: RUNNING-only histograms (CPU profile), guest RIP then host pc */
+        for (i = 0; i < nrb; i++) { int j, m = i; for (j = i + 1; j < nrb; j++) if (rb[j].n > rb[m].n) m = j;
+            if (m != i) { uint64_t tb = rb[i].base; unsigned tn = rb[i].n; rb[i] = rb[m]; rb[m].base = tb; rb[m].n = tn; } }
+        for (i = 0; i < nhb; i++) { int j, m = i; for (j = i + 1; j < nhb; j++) if (hb[j].n > hb[m].n) m = j;
+            if (m != i) { uint64_t tb = hb[i].base; unsigned tn = hb[i].n; hb[i] = hb[m]; hb[m].base = tb; hb[m].n = tn; } }
+        n = snprintf( line, sizeof(line), "[rip-profile] ml1111 RUNNING samples=%u (%u%% of all) guest top:", rtotal, total ? rtotal * 100 / total : 0 );
+        for (i = 0; i < nrb && i < 10 && n < (int)sizeof(line) - 60; i++)
+            n += snprintf( line + n, sizeof(line) - n, " %#llx=%u%%", (unsigned long long)rb[i].base, rtotal ? (rb[i].n * 100) / rtotal : 0 );
+        wine_log_write( "%s", line );
+        n = snprintf( line, sizeof(line), "[rip-profile] ml1111 RUNNING in native callees=%u (%u%% of running) host pc top:", htotal, rtotal ? htotal * 100 / rtotal : 0 );
+        for (i = 0; i < nhb && i < 10 && n < (int)sizeof(line) - 60; i++)
+            n += snprintf( line + n, sizeof(line) - n, " %#llx=%u%%", (unsigned long long)hb[i].base, htotal ? (hb[i].n * 100) / htotal : 0 );
+        wine_log_write( "%s", line );
+        /* ml1112: name the native host pcs (dladdr covers the shared cache and our
+         * dylib; pool addresses stay numeric, symbolise them from the [jit-pool]
+         * image table + llvm-objdump --syms offline). */
+        for (i = 0; i < nhb && i < 6; i++) {
+            Dl_info di;
+            if (dladdr( (void *)(uintptr_t)hb[i].base, &di ) && di.dli_fname) {
+                const char *f = strrchr( di.dli_fname, '/' );
+                wine_log_write( "[rip-profile] ml1112 host %#llx = %s`%s+0x%llx", (unsigned long long)hb[i].base, f ? f + 1 : di.dli_fname,
+                                di.dli_sname ? di.dli_sname : "?", (unsigned long long)(hb[i].base - (uintptr_t)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)) );
+            }
+        }
+        {   /* ml1123: the CPU split */
+            unsigned tot = cls[0] + cls[1] + cls[2];
+            for (i = 0; i < nib; i++) { int j, m = i; for (j = i + 1; j < nib; j++) if (ib[j].n > ib[m].n) m = j;
+                if (m != i) { uint64_t tk = ib[i].key; unsigned tn = ib[i].n; ib[i] = ib[m]; ib[m].key = tk; ib[m].n = tn; } }
+            for (i = 0; i < nnb; i++) { int j, m = i; for (j = i + 1; j < nnb; j++) if (xnb[j].n > xnb[m].n) m = j;
+                if (m != i) { uint64_t tk = xnb[i].key; unsigned tn = xnb[i].n; xnb[i] = xnb[m]; xnb[m].key = tk; xnb[m].n = tn; } }
+            wine_log_write( "[cpu-split] ml1123 gen=%d running samples=%u: x64 JIT %u%%, ARM64EC images %u%%, native %u%%", gen, tot,
+                            tot ? cls[0] * 100 / tot : 0, tot ? cls[1] * 100 / tot : 0, tot ? cls[2] * 100 / tot : 0 );
+            for (i = 0; i < njb; i++) { int j, m = i; for (j = i + 1; j < njb; j++) if (jb[j].n > jb[m].n) m = j;
+                if (m != i) { uint64_t tk = jb[i].key; unsigned tn = jb[i].n; jb[i] = jb[m]; jb[m].key = tk; jb[m].n = tn; } }
+            n = snprintf( line, sizeof(line), "[cpu-split] ml1124 JIT host-pc top (/64, %d distinct):", njb );
+            for (i = 0; i < njb && i < 16 && n < (int)sizeof(line) - 40; i++)
+                n += snprintf( line + n, sizeof(line) - n, " %#llx=%u", (unsigned long long)jb[i].key, jb[i].n );
+            wine_log_write( "%s", line );
+            for (i = 0; i < njb && i < 6; i++) {   /* the hottest compiled code itself, for offline disassembly */
+                uint32_t code[48]; int k2;
+                if (jb[i].n < 2 || !ios_ts_read( jb[i].key - 64, code, sizeof(code) )) continue;
+                n = snprintf( line, sizeof(line), "[cpu-split] ml1124 JIT code @%#llx-64 (%u):", (unsigned long long)jb[i].key, jb[i].n );
+                for (k2 = 0; k2 < 48 && n < (int)sizeof(line) - 12; k2++) n += snprintf( line + n, sizeof(line) - n, " %08x", code[k2] );
+                wine_log_write( "%s", line );
+            }
+            n = snprintf( line, sizeof(line), "[cpu-split] ml1123 image top (PE address/256):" );
+            for (i = 0; i < nib && i < 14 && n < (int)sizeof(line) - 40; i++)
+                n += snprintf( line + n, sizeof(line) - n, " %#llx=%u", (unsigned long long)ib[i].key, ib[i].n );
+            wine_log_write( "%s", line );
+            n = snprintf( line, sizeof(line), "[cpu-split] ml1123 native top:" );
+            for (i = 0; i < nnb && i < 10 && n < (int)sizeof(line) - 120; i++) {
+                Dl_info di; const char *f = "?", *sn = "?"; unsigned long long off = 0;
+                if (dladdr( (void *)(uintptr_t)xnb[i].key, &di )) {
+                    if (di.dli_fname) { f = strrchr( di.dli_fname, '/' ); f = f ? f + 1 : di.dli_fname; }
+                    if (di.dli_sname) { sn = di.dli_sname; off = xnb[i].key - (uintptr_t)di.dli_saddr; }
+                }
+                n += snprintf( line + n, sizeof(line) - n, " %s`%s+%#llx=%u", f, sn, off, xnb[i].n );
+            }
+            wine_log_write( "%s", line );
+        }
+        /* ml1115: callers of the native samples, symbolised */
+        for (i = 0; i < hcaller_n; i++) {
+            Dl_info dp, dl; const char *pn = "?", *ln = "?";
+            if (dladdr( (void *)(uintptr_t)hcaller[i].pc, &dp ) && dp.dli_sname) pn = dp.dli_sname;
+            if (dladdr( (void *)(uintptr_t)hcaller[i].lr, &dl ) && dl.dli_sname) ln = dl.dli_sname;
+            wine_log_write( "[rip-profile] ml1115 native sample pc=%#llx (%s) x16=%lld lr=%#llx (%s)", (unsigned long long)hcaller[i].pc, pn,
+                            (long long)hcaller[i].x16, (unsigned long long)hcaller[i].lr, ln );
+        }
+        /* ml1112: for the hottest RUNNING guest buckets, resolve every `call [rip+disp]`
+         * (ff 15) in the bucket: the IAT slot and the pointer in it name the import
+         * the game is inside (the RIP of a thread in an ARM64EC callee stays at the
+         * call site). */
+        for (i = 0; i < nrb && i < 6; i++) {
+            unsigned char code[80]; int k;
+            if (rb[i].base < 0x140000000ull || rb[i].base >= 0x148000000ull) continue;
+            if (!ios_ts_read( rb[i].base, code, sizeof(code) )) continue;
+            for (k = 0; k + 6 <= 64; k++) {
+                if (code[k] == 0xff && code[k + 1] == 0x15) {
+                    int32_t disp; uint64_t slot, target = 0;
+                    memcpy( &disp, code + k + 2, 4 );
+                    slot = rb[i].base + k + 6 + (int64_t)disp;
+                    ios_ts_read( slot, &target, 8 );
+                    wine_log_write( "[rip-profile] ml1112 bucket %#llx: call [%#llx] -> %#llx (%u%% of running)",
+                                    (unsigned long long)rb[i].base, (unsigned long long)slot, (unsigned long long)target, rtotal ? (rb[i].n * 100) / rtotal : 0 );
+                }
+            }
+        }
+        /* ml1110: the guest code at the hottest buckets, so the loop can be read
+         * (x86-64 bytes; disassemble offline). Only guest-image addresses. */
+        for (i = 0; i < nb && i < 6; i++) {
+            unsigned char code[64]; int k;
+            if (b[i].base < 0x140000000ull || b[i].base >= 0x7f0000000000ull) continue;
+            if (!ios_ts_read( b[i].base, code, sizeof(code) )) continue;
+            n = snprintf( line, sizeof(line), "[rip-profile] ml1110 code @%#llx (%u%%):", (unsigned long long)b[i].base, (b[i].n * 100) / total );
+            for (k = 0; k < 64 && n < (int)sizeof(line) - 4; k++) n += snprintf( line + n, sizeof(line) - n, " %02x", code[k] );
+            wine_log_write( "%s", line );
+        }
+    }
+}
+
+/* ml1128: TRANSITION PROBE (measurement only; changes no behaviour).
+ * RDR2 holds 60 fps for 7-10 s after the full scene appears, then drops to
+ * 25-35 with GPU time per frame unchanged (ph-rdr79/80/81, HANDOFF §117). The
+ * 20 s thread-sample bursts never landed in the fast window. Every 250 ms this
+ * records, on one clock:
+ *  - process counters (proc_pid_rusage v6): CPU time, P-core time, runnable
+ *    time, page-wait time, instructions/cycles (total and P), energy;
+ *  - for EVERY thread, PROC_PIDTHREADCOUNTS: time/instructions/cycles per perf
+ *    level, so a thread moving from P to E cores, running at a lower clock, or
+ *    retiring more instructions per frame is visible directly;
+ *  - madeira_d3d12's counters (MadeiraCtl op 5): Present enqueues and
+ *    completions, worker time per job kind, and inside Present the flush,
+ *    frame-latency GPU wait, nextDrawable and commit times.
+ * Roles (MadeiraCtl op 4, registered by the thread itself): W = submission
+ * worker, P = Present caller, E = ExecuteCommandLists caller.
+ * Units: rusage and thread times are Mach ticks; the [xp] line prints both the
+ * rusage CPU time and the per-thread sum so the conversion can be checked. */
+#include <sys/resource.h>
+#include <sys/sysctl.h>
+extern int proc_pid_rusage( int pid, int flavor, void *buffer );
+extern int proc_pidinfo( int pid, int flavor, uint64_t arg, void *buffer, int buffersize );
+volatile uint64_t ios_xp_pe_block, ios_xp_pe_len;
+static struct { uint64_t tid; uint32_t wtid; char role[6]; } ios_xp_roles[32];
+static volatile int ios_xp_nroles;
+static pthread_mutex_t ios_xp_role_lock = PTHREAD_MUTEX_INITIALIZER;
+void ios_xp_set_role( int role, uint64_t wtid )
+{
+    uint64_t tid = 0; int i, n;
+    pthread_threadid_np( NULL, &tid );
+    pthread_mutex_lock( &ios_xp_role_lock );
+    n = ios_xp_nroles;
+    for (i = 0; i < n; i++) if (ios_xp_roles[i].tid == tid) break;
+    if (i == n && n < 32) { ios_xp_roles[n].tid = tid; ios_xp_roles[n].wtid = (uint32_t)wtid; ios_xp_roles[n].role[0] = 0; ios_xp_nroles = n + 1; }
+    if (i < 32) { size_t l = strlen( ios_xp_roles[i].role ); if (l < 5 && !strchr( ios_xp_roles[i].role, role )) { ios_xp_roles[i].role[l] = (char)role; ios_xp_roles[i].role[l + 1] = 0; } }
+    pthread_mutex_unlock( &ios_xp_role_lock );
+    wine_log_write( "[xp] ml1128 role %c = thread %llu (win tid %04x)", role, (unsigned long long)tid, (unsigned)wtid );
+}
+struct ios_xp_pe { int64_t magic, qpf, pres_enq, pres_done, t_thr, n_ecl, t_ecl, n_sig, t_sig, n_wait, t_wait, t_prs,
+                   t_flush, n_lat, t_lat, t_draw, t_cmt, t_pool, ecl_calls, t_ecl_caller; };
+struct ios_xp_tcd { uint64_t instr, cyc, ut, st, nj; };
+struct ios_xp_tc { uint16_t len, r0; uint32_t r1; struct ios_xp_tcd c[4]; };
+struct ios_xp_prev { uint64_t tid; uint32_t gen; struct ios_xp_tcd c[2]; };
+struct ios_xp_row { uint64_t tid; uint32_t wtid; double p_ms, e_ms, p_ghz, e_ghz, minst; const char *role; };
+static struct ios_xp_prev ios_xp_tab[2048];
+
+/* ml1131: [xp-api] REPORTER (measurement only). Once a second, from the xprobe
+ * thread: FEX's x64->EC transition counters and sampled call targets (exported
+ * IosXpFex in xtajit64.dll), the PE ntdll's contended-lock / wait-on-address /
+ * QPC-gap counters (exported ios_xp_nt), and the unix sync syscall counters.
+ * Everything is found through the GAME process's own loader list (private map,
+ * not the thread sampler's shared cache, which that sampler resets every pass)
+ * and read with vm_read_overwrite, so an unloaded module cannot fault us. */
+struct ios_xp_nt_view_qpc { uint32_t tid, pad; uint64_t last, calls, hist[5]; };
+struct ios_xp_nt_view
+{
+    uint64_t magic, freq;
+    int64_t cs_contended, cs_contended_spin0, cs_spin_acquired, cs_wait_ticks, cs_wait_hist[6], cs_wakes;
+    int64_t woa_waits, woa_wake_single, woa_wake_all, cs_ring_idx;
+    uint64_t cs_ring[1024];
+    struct ios_xp_nt_view_qpc qpc[256];
+};
+#define IOS_XP_FEX_WORDS 4496
+struct ios_xp_mod { uint64_t base, size; char name[40]; };
+static struct ios_xp_mod ios_xp_mods[160];
+static int ios_xp_nmods;
+static uint64_t ios_xp_peb, ios_xp_heap, ios_xp_fex_addr, ios_xp_nt_addr;
+static volatile uint64_t ios_xp_game_teb;   /* set by the xprobe loop from a P/E role thread */
+
+struct ios_xp_expc { uint64_t base; uint32_t exp_rva, exp_size, nfunc, nname; uint32_t *funcs, *names; uint16_t *ords; };
+static struct ios_xp_expc ios_xp_expcache[32];
+static int ios_xp_nexpc;
+
+static void ios_xp_modmap( uint64_t teb )
+{
+    uint64_t peb = 0, ldr = 0, head, cur; int guard = 0, n = 0;
+    if (!teb || !ios_ts_read( teb + 0x60, &peb, 8 ) || !peb || !ios_ts_read( peb + 0x18, &ldr, 8 ) || !ldr) return;
+    ios_ts_read( peb + 0x30, &ios_xp_heap, 8 );
+    head = ldr + 0x10;
+    if (!ios_ts_read( head, &cur, 8 )) return;
+    while (cur && cur != head && guard++ < 400 && n < 160)
+    {
+        uint64_t base = 0, buf = 0, next = 0; uint32_t size = 0; uint16_t len = 0, w[40]; int k;
+        if (!ios_ts_read( cur + 0x30, &base, 8 ) || !ios_ts_read( cur + 0x40, &size, 4 ) ||
+            !ios_ts_read( cur + 0x58, &len, 2 ) || !ios_ts_read( cur + 0x60, &buf, 8 )) break;
+        if (base && size)
+        {
+            struct ios_xp_mod *m = &ios_xp_mods[n++];
+            m->base = base; m->size = size; len /= 2; if (len > 39) len = 39;
+            if (len && ios_ts_read( buf, w, len * 2 )) { for (k = 0; k < len; k++) m->name[k] = w[k] < 128 ? (char)tolower( w[k] ) : '?'; m->name[len] = 0; }
+            else strcpy( m->name, "?" );
+        }
+        if (!ios_ts_read( cur, &next, 8 )) break;
+        cur = next;
+    }
+    ios_xp_nmods = n; ios_xp_peb = peb;
+}
+static struct ios_xp_mod *ios_xp_mod_by_name( const char *name )
+{
+    int i;
+    for (i = 0; i < ios_xp_nmods; i++) if (!strcmp( ios_xp_mods[i].name, name )) return &ios_xp_mods[i];
+    return NULL;
+}
+static struct ios_xp_mod *ios_xp_mod_by_addr( uint64_t a )
+{
+    int i;
+    for (i = 0; i < ios_xp_nmods; i++) if (a >= ios_xp_mods[i].base && a < ios_xp_mods[i].base + ios_xp_mods[i].size) return &ios_xp_mods[i];
+    return NULL;
+}
+static struct ios_xp_expc *ios_xp_exports( uint64_t base )
+{
+    struct ios_xp_expc *c; uint32_t lfanew = 0, dir[2] = {0}, ed[10];
+    int i;
+    for (i = 0; i < ios_xp_nexpc; i++) if (ios_xp_expcache[i].base == base) return &ios_xp_expcache[i];
+    if (ios_xp_nexpc >= 32) return NULL;
+    if (!ios_ts_read( base + 0x3c, &lfanew, 4 ) || lfanew > 0x1000) return NULL;
+    if (!ios_ts_read( base + lfanew + 24 + 112, dir, 8 ) || !dir[0] || dir[1] < 40) return NULL;   /* PE32+ export directory */
+    if (!ios_ts_read( base + dir[0], ed, sizeof(ed) )) return NULL;
+    c = &ios_xp_expcache[ios_xp_nexpc];
+    memset( c, 0, sizeof(*c) );
+    c->base = base; c->exp_rva = dir[0]; c->exp_size = dir[1];
+    c->nfunc = ed[5] > 16384 ? 16384 : ed[5]; c->nname = ed[6] > 16384 ? 16384 : ed[6];
+    c->funcs = malloc( (size_t)c->nfunc * 4 + 4 ); c->names = malloc( (size_t)c->nname * 4 + 4 ); c->ords = malloc( (size_t)c->nname * 2 + 2 );
+    if (!c->funcs || !c->names || !c->ords ||
+        !ios_ts_read( base + ed[7], c->funcs, (size_t)c->nfunc * 4 ) ||
+        !ios_ts_read( base + ed[8], c->names, (size_t)c->nname * 4 ) ||
+        !ios_ts_read( base + ed[9], c->ords, (size_t)c->nname * 2 ))
+    {
+        free( c->funcs ); free( c->names ); free( c->ords ); memset( c, 0, sizeof(*c) );
+        return NULL;
+    }
+    ios_xp_nexpc++;
+    return c;
+}
+static uint64_t ios_xp_export_addr( uint64_t base, const char *name )
+{
+    struct ios_xp_expc *c = ios_xp_exports( base );
+    uint32_t j; size_t nl = strlen( name );
+    if (!c) return 0;
+    for (j = 0; j < c->nname; j++)
+    {
+        char buf[64];
+        if (!ios_ts_read( base + c->names[j], buf, nl + 1 < sizeof(buf) ? nl + 1 : sizeof(buf) )) continue;
+        if (!memcmp( buf, name, nl ) && !buf[nl] && c->ords[j] < c->nfunc) return base + c->funcs[c->ords[j]];
+    }
+    return 0;
+}
+/* "module!export" (nearest export at or below the address; "+0x.." when not exact) */
+static void ios_xp_symbol( uint64_t a, char *out, size_t cap )
+{
+    extern int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out);
+    struct ios_xp_mod *m; struct ios_xp_expc *c; uintptr_t pe = 0;
+    uint32_t rva, i, best = ~0u, bestrva = 0, j;
+    if (ios_jit_pool_image_pc( (uintptr_t)a, &pe )) a = pe;
+    if (!(m = ios_xp_mod_by_addr( a ))) { snprintf( out, cap, "0x%llx", (unsigned long long)a ); return; }
+    rva = (uint32_t)(a - m->base);
+    if (!(c = ios_xp_exports( m->base ))) { snprintf( out, cap, "%s+0x%x", m->name, rva ); return; }
+    for (i = 0; i < c->nfunc; i++)
+    {
+        uint32_t f = c->funcs[i];
+        if (!f || f > rva || (f >= c->exp_rva && f < c->exp_rva + c->exp_size)) continue;   /* forwarder strings */
+        if (best == ~0u || f > bestrva) { best = i; bestrva = f; }
+    }
+    if (best == ~0u) { snprintf( out, cap, "%s+0x%x", m->name, rva ); return; }
+    for (j = 0; j < c->nname; j++)
+        if (c->ords[j] == best)
+        {
+            char nm[64] = {0};
+            ios_ts_read( m->base + c->names[j], nm, sizeof(nm) - 1 );
+            nm[sizeof(nm) - 1] = 0;
+            if (rva == bestrva) snprintf( out, cap, "%s!%s", m->name, nm );
+            else snprintf( out, cap, "%s!%s+0x%x", m->name, nm, rva - bestrva );
+            return;
+        }
+    snprintf( out, cap, "%s!#%u+0x%x", m->name, best, rva - bestrva );
+}
+static int ios_xp_cmp_u64( const void *a, const void *b )
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void ios_xp_api_report( const char *wall, double wall_s )
+{
+    extern volatile long long ios_xp_set_event, ios_xp_reset_event, ios_xp_pulse_event;
+    extern volatile long long ios_xp_wait_single, ios_xp_wait_multi, ios_xp_wait_zero, ios_xp_wait_zero_timeout;
+    extern volatile long long ios_xp_yield, ios_xp_yield_slept, ios_xp_delay, ios_xp_delay_hist[6];
+    extern volatile long long ios_alert_wakes, ios_alert_waits;
+    static uint64_t *fex, *fex_prev; static struct ios_xp_nt_view *nt, *nt_prev;
+    static long long u_prev[18]; static int have_fex, have_nt, have_u, map_age = 1000, said_nf;
+    static double last_s;
+    static uint64_t sorted[4096];
+    long long u[18]; double dt; char line[3000]; int n, i;
+
+    if (!fex) { fex = calloc( IOS_XP_FEX_WORDS, 8 ); fex_prev = calloc( IOS_XP_FEX_WORDS, 8 ); nt = calloc( 1, sizeof(*nt) ); nt_prev = calloc( 1, sizeof(*nt) ); }
+    if (!fex || !fex_prev || !nt || !nt_prev) return;
+    if (++map_age > 10 || !ios_xp_fex_addr || !ios_xp_nt_addr)   /* every ~10 s, or until both are found */
+    {
+        struct ios_xp_mod *m;
+        map_age = 0;
+        ios_xp_modmap( ios_xp_game_teb );
+        /* ml1131b: code runs from the JIT pool's COPY of each image, and its
+         * globals are reached PC-relative, so the LIVE .data is the pool copy's.
+         * The PE mapping's .data is a stale snapshot (ph-rdr86 read all zeros
+         * there). Translate each export into the game process's pool copy. */
+        {
+            extern void *ios_jit_translate_addr_for_owner( void *addr, void *owner_peb );
+            uint64_t pe_fex = 0, pe_nt = 0, live_fex = 0, live_nt = 0, mg_fex = 0, mg_nt = 0;
+            if (!ios_xp_fex_addr && ((m = ios_xp_mod_by_name( "xtajit64.dll" )) || (m = ios_xp_mod_by_name( "libarm64ecfex.dll" )))
+                && (pe_fex = ios_xp_export_addr( m->base, "IosXpFex" )))
+            {
+                live_fex = (uint64_t)(uintptr_t)ios_jit_translate_addr_for_owner( (void *)(uintptr_t)pe_fex, (void *)(uintptr_t)ios_xp_peb );
+                ios_ts_read( live_fex, &mg_fex, 8 );
+                if (mg_fex == 0x5845465058444d41ull) ios_xp_fex_addr = live_fex;
+            }
+            if (!ios_xp_nt_addr && (m = ios_xp_mod_by_name( "ntdll.dll" )) && (pe_nt = ios_xp_export_addr( m->base, "ios_xp_nt" )))
+            {
+                live_nt = (uint64_t)(uintptr_t)ios_jit_translate_addr_for_owner( (void *)(uintptr_t)pe_nt, (void *)(uintptr_t)ios_xp_peb );
+                ios_ts_read( live_nt, &mg_nt, 8 );
+                if (mg_nt == 0x31544e5058444d41ull) ios_xp_nt_addr = live_nt;
+            }
+            if ((pe_fex || pe_nt || ios_xp_nmods) && said_nf++ < 6)
+                wine_log_write( "[xp-api] ml1131b blocks: IosXpFex pe=0x%llx live=0x%llx magic=0x%llx%s | ios_xp_nt pe=0x%llx live=0x%llx magic=0x%llx%s"
+                                " (game teb 0x%llx peb 0x%llx, %d modules)",
+                                (unsigned long long)pe_fex, (unsigned long long)live_fex, (unsigned long long)mg_fex, ios_xp_fex_addr ? " OK" : "",
+                                (unsigned long long)pe_nt, (unsigned long long)live_nt, (unsigned long long)mg_nt, ios_xp_nt_addr ? " OK" : "",
+                                (unsigned long long)ios_xp_game_teb, (unsigned long long)ios_xp_peb, ios_xp_nmods );
+        }
+    }
+    dt = last_s > 0 ? wall_s - last_s : 0;
+    last_s = wall_s;
+    u[0] = ios_xp_set_event; u[1] = ios_xp_reset_event; u[2] = ios_xp_pulse_event; u[3] = ios_xp_wait_single; u[4] = ios_xp_wait_multi;
+    u[5] = ios_xp_wait_zero; u[6] = ios_xp_wait_zero_timeout; u[7] = ios_xp_yield; u[8] = ios_xp_yield_slept; u[9] = ios_xp_delay;
+    for (i = 0; i < 6; i++) u[10 + i] = ios_xp_delay_hist[i];
+    u[16] = ios_alert_waits; u[17] = ios_alert_wakes;
+    {
+        int got_fex = ios_xp_fex_addr && ios_ts_read( ios_xp_fex_addr, fex, IOS_XP_FEX_WORDS * 8 ) && fex[0] == 0x5845465058444d41ull;
+        int got_nt = ios_xp_nt_addr && ios_ts_read( ios_xp_nt_addr, nt, sizeof(*nt) ) && nt->magic == 0x31544e5058444d41ull;
+        if (dt > 0.2)
+        {
+            double ecc = 0, fp = 0, cb = 0, cfreq = nt->freq ? (double)nt->freq : 24e6;
+            #define XPR(x) ((double)(x) / dt)
+            if (got_fex && have_fex)
+                for (i = 0; i < 16; i++) { ecc += fex[8 + i * 8] - fex_prev[8 + i * 8]; fp += fex[136 + i * 8] - fex_prev[136 + i * 8]; cb += fex[264 + i * 8] - fex_prev[264 + i * 8]; }
+            n = snprintf( line, sizeof(line), "[xp-api] %s x64->EC %.0f/s FPCR-writes %.0f/s EC->x64 %.0f/s", wall, ecc / dt, fp / dt, cb / dt );
+            if (got_nt && have_nt)
+            {
+                double waitms = (double)(nt->cs_wait_ticks - nt_prev->cs_wait_ticks) / cfreq * 1000.0;
+                n += snprintf( line + n, sizeof(line) - n,
+                               " | CS contended %.0f/s (spin0 %.0f%%) spin-won %.0f/s wait %.1f ms/s [<2us %.0f <10 %.0f <50 %.0f <200 %.0f <1ms %.0f >=1ms %.0f]/s wakes %.0f/s"
+                               " | WaitOnAddress %.0f/s wake1 %.0f/s wakeAll %.0f/s",
+                               XPR(nt->cs_contended - nt_prev->cs_contended),
+                               nt->cs_contended > nt_prev->cs_contended ? 100.0 * (nt->cs_contended_spin0 - nt_prev->cs_contended_spin0) / (nt->cs_contended - nt_prev->cs_contended) : 0.0,
+                               XPR(nt->cs_spin_acquired - nt_prev->cs_spin_acquired), waitms / dt,
+                               XPR(nt->cs_wait_hist[0] - nt_prev->cs_wait_hist[0]), XPR(nt->cs_wait_hist[1] - nt_prev->cs_wait_hist[1]),
+                               XPR(nt->cs_wait_hist[2] - nt_prev->cs_wait_hist[2]), XPR(nt->cs_wait_hist[3] - nt_prev->cs_wait_hist[3]),
+                               XPR(nt->cs_wait_hist[4] - nt_prev->cs_wait_hist[4]), XPR(nt->cs_wait_hist[5] - nt_prev->cs_wait_hist[5]),
+                               XPR(nt->cs_wakes - nt_prev->cs_wakes),
+                               XPR(nt->woa_waits - nt_prev->woa_waits), XPR(nt->woa_wake_single - nt_prev->woa_wake_single), XPR(nt->woa_wake_all - nt_prev->woa_wake_all) );
+            }
+            if (have_u)
+                n += snprintf( line + n, sizeof(line) - n,
+                               " | SetEvent %.0f/s ResetEvent %.0f/s Pulse %.0f/s | wait1 %.0f/s waitN %.0f/s polls %.0f/s (empty %.0f/s)"
+                               " | yield %.0f/s (slept %.0f/s) | delay %.0f/s [0 %.0f <1ms %.0f <5ms %.0f <20ms %.0f >=20ms %.0f inf %.0f] | alert wait %.0f/s wake %.0f/s",
+                               XPR(u[0] - u_prev[0]), XPR(u[1] - u_prev[1]), XPR(u[2] - u_prev[2]), XPR(u[3] - u_prev[3]), XPR(u[4] - u_prev[4]),
+                               XPR(u[5] - u_prev[5]), XPR(u[6] - u_prev[6]), XPR(u[7] - u_prev[7]), XPR(u[8] - u_prev[8]), XPR(u[9] - u_prev[9]),
+                               XPR(u[10] - u_prev[10]), XPR(u[11] - u_prev[11]), XPR(u[12] - u_prev[12]), XPR(u[13] - u_prev[13]), XPR(u[14] - u_prev[14]),
+                               XPR(u[15] - u_prev[15]), XPR(u[16] - u_prev[16]), XPR(u[17] - u_prev[17]) );
+            wine_log_write( "%s", line );
+
+            /* top x64->EC call targets from the ring entries appended since the last report */
+            if (got_fex && have_fex && ecc > 0)
+            {
+                uint64_t idx = fex[392], pidx = fex_prev[392], newn = idx - pidx, k, run = 0;
+                int shown = 0;
+                if (newn > 4096) newn = 4096;
+                for (k = 0; k < newn; k++) sorted[k] = fex[400 + ((idx - 1 - k) & 4095)];
+                qsort( sorted, (size_t)newn, 8, ios_xp_cmp_u64 );
+                n = snprintf( line, sizeof(line), "[xp-api-top] %s %llu samples:", wall, (unsigned long long)newn );
+                while (shown < 28 && newn)
+                {
+                    uint64_t best = 0, bestn = 0, cnt = 0;
+                    for (k = 0; k <= newn; k++)
+                    {
+                        if (k < newn && k > 0 && sorted[k] == sorted[k - 1]) { cnt++; continue; }
+                        if (k > 0 && cnt > bestn && sorted[k - 1] != ~0ull) { bestn = cnt; best = sorted[k - 1]; }
+                        cnt = 1;
+                    }
+                    if (!bestn) break;
+                    {
+                        char sym[160];
+                        ios_xp_symbol( best, sym, sizeof(sym) );
+                        if (n > (int)sizeof(line) - 200) { wine_log_write( "%s", line ); n = snprintf( line, sizeof(line), "[xp-api-top] %s (cont):", wall ); }
+                        n += snprintf( line + n, sizeof(line) - n, " %s=%.0f/s", sym, ecc / dt * (double)bestn / (double)newn );
+                    }
+                    for (k = 0; k < newn; k++) if (sorted[k] == best) sorted[k] = ~0ull;   /* retire it */
+                    shown++;
+                }
+                (void)run;
+                wine_log_write( "%s", line );
+            }
+            /* QPC: per-thread gap distribution, busiest four slots */
+            if (got_nt && have_nt)
+            {
+                double tot = 0, h[5] = {0};
+                int order[256], cnt = 0, j;
+                for (i = 0; i < 256; i++)
+                {
+                    const struct ios_xp_nt_view_qpc *q = &nt->qpc[i], *pq = &nt_prev->qpc[i];
+                    double c = (q->tid == pq->tid && q->calls >= pq->calls) ? (double)(q->calls - pq->calls) : (double)q->calls;
+                    if (c <= 0) continue;
+                    tot += c; order[cnt++] = i;
+                    for (j = 0; j < 5; j++) h[j] += (q->tid == pq->tid && q->hist[j] >= pq->hist[j]) ? (double)(q->hist[j] - pq->hist[j]) : (double)q->hist[j];
+                }
+                if (tot > 0)
+                {
+                    double ht = h[0] + h[1] + h[2] + h[3] + h[4];
+                    n = snprintf( line, sizeof(line), "[xp-api-qpc] %s QPC %.0f/s gaps <1us %.0f%% <10us %.0f%% <100us %.0f%% <1ms %.0f%% >=1ms %.0f%%; top threads:",
+                                  wall, tot / dt, ht ? 100 * h[0] / ht : 0, ht ? 100 * h[1] / ht : 0, ht ? 100 * h[2] / ht : 0, ht ? 100 * h[3] / ht : 0, ht ? 100 * h[4] / ht : 0 );
+                    for (j = 0; j < 4; j++)
+                    {
+                        int b = -1, x; double bc = 0;
+                        for (x = 0; x < cnt; x++)
+                        {
+                            const struct ios_xp_nt_view_qpc *q, *pq; double c;
+                            if (order[x] < 0) continue;   /* already printed */
+                            q = &nt->qpc[order[x]]; pq = &nt_prev->qpc[order[x]];
+                            c = (q->tid == pq->tid && q->calls >= pq->calls) ? (double)(q->calls - pq->calls) : (double)q->calls;
+                            if (c > bc) { bc = c; b = x; }
+                        }
+                        if (b < 0) break;
+                        {
+                            const struct ios_xp_nt_view_qpc *q = &nt->qpc[order[b]], *pq = &nt_prev->qpc[order[b]];
+                            double g[5], gt = 0; int z;
+                            for (z = 0; z < 5; z++) { g[z] = (q->tid == pq->tid && q->hist[z] >= pq->hist[z]) ? (double)(q->hist[z] - pq->hist[z]) : (double)q->hist[z]; gt += g[z]; }
+                            n += snprintf( line + n, sizeof(line) - n, " %04x=%.0f/s(<1us %.0f%% <10us %.0f%%)", q->tid, bc / dt, gt ? 100 * g[0] / gt : 0, gt ? 100 * g[1] / gt : 0 );
+                            order[b] = -1;
+                        }
+                    }
+                    wine_log_write( "%s", line );
+                }
+                /* top contended critical sections (ring entries since the last report) */
+                {
+                    uint64_t idx = (uint64_t)nt->cs_ring_idx >> 2, pidx = (uint64_t)nt_prev->cs_ring_idx >> 2, newn = idx - pidx, k;
+                    int shown = 0;
+                    if (newn > 1024) newn = 1024;
+                    for (k = 0; k < newn; k++) sorted[k] = nt->cs_ring[(idx - k) & 1023];
+                    if (newn)
+                    {
+                        qsort( sorted, (size_t)newn, 8, ios_xp_cmp_u64 );
+                        n = snprintf( line, sizeof(line), "[xp-api-cs] %s %llu sampled contended enters (process heap 0x%llx):",
+                                      wall, (unsigned long long)newn, (unsigned long long)ios_xp_heap );
+                        while (shown < 8)
+                        {
+                            uint64_t best = 0, bestn = 0, cnt = 0;
+                            for (k = 0; k <= newn; k++)
+                            {
+                                if (k < newn && k > 0 && sorted[k] == sorted[k - 1]) { cnt++; continue; }
+                                if (k > 0 && cnt > bestn && sorted[k - 1] != ~0ull && sorted[k - 1]) { bestn = cnt; best = sorted[k - 1]; }
+                                cnt = 1;
+                            }
+                            if (!bestn) break;
+                            {
+                                uint64_t cs[5] = {0}, dbg[6] = {0}; char nm[48] = "", where[48] = "";
+                                struct ios_xp_mod *m;
+                                ios_ts_read( best, cs, sizeof(cs) );   /* DebugInfo, LockCount|Recursion, Owner, Semaphore, SpinCount */
+                                if (cs[0] && cs[0] != ~0ull && ios_ts_read( cs[0], dbg, sizeof(dbg) ) && dbg[5] > 0x10000)
+                                {
+                                    ios_ts_read( dbg[5], nm, sizeof(nm) - 1 ); nm[sizeof(nm) - 1] = 0;
+                                    for (i = 0; nm[i]; i++) if ((unsigned char)nm[i] < 32 || (unsigned char)nm[i] > 126) { nm[i] = 0; break; }
+                                }
+                                uintptr_t pe_of = 0;
+                                extern int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out);
+                                if (ios_jit_pool_image_pc( (uintptr_t)best, &pe_of ) && pe_of) ; else pe_of = (uintptr_t)best;   /* a global in a pool copy */
+                                if (ios_xp_heap && best >= ios_xp_heap && best < ios_xp_heap + 0x2000) snprintf( where, sizeof(where), " heap+0x%llx", (unsigned long long)(best - ios_xp_heap) );
+                                else if ((m = ios_xp_mod_by_addr( pe_of ))) snprintf( where, sizeof(where), " %s+0x%llx", m->name, (unsigned long long)(pe_of - m->base) );
+                                n += snprintf( line + n, sizeof(line) - n, " 0x%llx=%.0f%%(spin %u contention %u%s%s%s)",
+                                               (unsigned long long)best, 100.0 * bestn / newn, (unsigned)(cs[4] & 0xffffffff),
+                                               (cs[0] && cs[0] != ~0ull) ? (unsigned)(dbg[4] >> 32) : 0u, where, nm[0] ? " " : "", nm );
+                            }
+                            for (k = 0; k < newn; k++) if (sorted[k] == best) sorted[k] = ~0ull;
+                            shown++;
+                        }
+                        wine_log_write( "%s", line );
+                    }
+                }
+            }
+            #undef XPR
+        }
+        if (got_fex) { memcpy( fex_prev, fex, IOS_XP_FEX_WORDS * 8 ); have_fex = 1; }
+        if (got_nt) { memcpy( nt_prev, nt, sizeof(*nt) ); have_nt = 1; }
+        memcpy( u_prev, u, sizeof(u) ); have_u = 1;
+    }
+}
+
+static void ios_xprobe_main( void )
+{
+    static struct ios_xp_row rows[1024];
+    mach_timebase_info_data_t tb;
+    struct rusage_info_v6 ru, pru;
+    struct ios_xp_pe pe, ppe;
+    uint64_t t_start, t_prev;
+    uint32_t gen = 0; int have_ru = 0, have_pe = 0, used = 0, ru_rc;
+    char n0[32] = "?", n1[32] = "?"; size_t sz; int nlev = 0;
+
+    if (ios_ts_tsd_off < 0) ios_ts_calibrate();
+    mach_timebase_info( &tb );
+    sz = sizeof(nlev); sysctlbyname( "hw.nperflevels", &nlev, &sz, NULL, 0 );
+    sz = sizeof(n0); sysctlbyname( "hw.perflevel0.name", n0, &sz, NULL, 0 );
+    sz = sizeof(n1); sysctlbyname( "hw.perflevel1.name", n1, &sz, NULL, 0 );
+    memset( &ru, 0, sizeof(ru) );
+    ru_rc = proc_pid_rusage( getpid(), 6 /* RUSAGE_INFO_V6 */, &ru );
+    wine_log_write( "[xp] ml1128 armed: 250 ms; perf levels %d (0=%s, 1=%s); rusage v6 rc=%d errno=%d; timebase %u/%u",
+                    nlev, n0, n1, ru_rc, ru_rc ? errno : 0, tb.numer, tb.denom );
+    t_start = t_prev = mach_absolute_time();
+    memset( &ppe, 0, sizeof(ppe) );
+    for (;;)
+    {
+        thread_act_array_t th = NULL; mach_msg_type_number_t nth = 0, k;
+        uint64_t now; double dt_ms, sum_thr_ms = 0; int nrows = 0, i, j;
+#define XP_MS(ticks) ((double)(ticks) * tb.numer / tb.denom / 1e6)
+        usleep( 250000 );
+        now = mach_absolute_time();
+        dt_ms = XP_MS( now - t_prev );
+        gen++;
+        if (used > 1400) { memset( ios_xp_tab, 0, sizeof(ios_xp_tab) ); used = 0; wine_log_write( "[xp] ml1128 thread table reset (gen %u)", gen ); }
+
+        /* per-thread counters */
+        if (task_threads( mach_task_self(), &th, &nth ) == KERN_SUCCESS)
+        {
+            for (k = 0; k < nth; k++)
+            {
+                thread_identifier_info_data_t idi; mach_msg_type_number_t cnt = THREAD_IDENTIFIER_INFO_COUNT;
+                struct ios_xp_tc tc; int got, h, lv;
+                struct ios_xp_prev *pv = NULL;
+                if (thread_info( th[k], THREAD_IDENTIFIER_INFO, (thread_info_t)&idi, &cnt ) == KERN_SUCCESS)
+                {
+                    memset( &tc, 0, sizeof(tc) );
+                    got = proc_pidinfo( getpid(), 34 /* PROC_PIDTHREADCOUNTS */, idi.thread_id, &tc, sizeof(tc) );
+                    if (got > 0 && tc.len >= 1)
+                    {
+                        struct ios_xp_tcd cur[2]; int nl = tc.len > 2 ? 2 : tc.len;
+                        memset( cur, 0, sizeof(cur) );
+                        for (lv = 0; lv < nl; lv++) cur[lv] = tc.c[lv];
+                        for (h = (int)(idi.thread_id * 2654435761u) & 2047, j = 0; j < 2048; j++, h = (h + 1) & 2047)
+                            if (!ios_xp_tab[h].tid || ios_xp_tab[h].tid == idi.thread_id) { pv = &ios_xp_tab[h]; break; }
+                        if (pv && pv->tid == idi.thread_id && pv->gen == gen - 1 && nrows < 1024)
+                        {
+                            struct ios_xp_row *r = &rows[nrows];
+                            double pt = XP_MS( (cur[0].ut + cur[0].st) - (pv->c[0].ut + pv->c[0].st) );
+                            double et = XP_MS( (cur[1].ut + cur[1].st) - (pv->c[1].ut + pv->c[1].st) );
+                            double pcy = (double)(cur[0].cyc - pv->c[0].cyc), ecy = (double)(cur[1].cyc - pv->c[1].cyc);
+                            if (pt + et > 0.05)
+                            {
+                                pthread_t pt_ = pthread_from_mach_thread_np( th[k] );
+                                uint64_t teb = pt_ ? ios_ts_teb( pt_ ) : 0; uint32_t w = 0;
+                                if (teb) ios_ts_read( teb + 0x48, &w, 4 );
+                                r->tid = idi.thread_id; r->wtid = w; r->p_ms = pt; r->e_ms = et;
+                                r->p_ghz = pt > 0 ? pcy / (pt * 1e6) : 0; r->e_ghz = et > 0 ? ecy / (et * 1e6) : 0;
+                                r->minst = (double)((cur[0].instr - pv->c[0].instr) + (cur[1].instr - pv->c[1].instr)) / 1e6;
+                                r->role = NULL;
+                                for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
+                                if (r->role && teb && (strchr( r->role, 'P' ) || strchr( r->role, 'E' ))) ios_xp_game_teb = teb;   /* ml1131 */
+                                sum_thr_ms += pt + et; nrows++;
+                            }
+                        }
+                        if (pv) { if (!pv->tid) used++; pv->tid = idi.thread_id; pv->gen = gen; pv->c[0] = cur[0]; pv->c[1] = cur[1]; }
+                    }
+                }
+                mach_port_deallocate( mach_task_self(), th[k] );
+            }
+            vm_deallocate( mach_task_self(), (vm_address_t)th, nth * sizeof(*th) );
+        }
+
+        /* process counters + PE counters */
+        memset( &ru, 0, sizeof(ru) );
+        ru_rc = proc_pid_rusage( getpid(), 6, &ru );
+        if (ios_xp_pe_block && ios_xp_pe_len >= sizeof(pe)) { memcpy( &pe, (void *)(uintptr_t)ios_xp_pe_block, sizeof(pe) ); }
+        else memset( &pe, 0, sizeof(pe) );
+        if (!ru_rc && have_ru)
+        {
+            char wall[16], line[1400]; int n; struct timeval tv; struct tm tmv;
+            double cpu = XP_MS( (ru.ri_user_time + ru.ri_system_time) - (pru.ri_user_time + pru.ri_system_time) );
+            double pms = XP_MS( (ru.ri_user_ptime + ru.ri_system_ptime) - (pru.ri_user_ptime + pru.ri_system_ptime) );
+            double ems = cpu - pms;
+            double pcy = (double)(ru.ri_pcycles - pru.ri_pcycles), cy = (double)(ru.ri_cycles - pru.ri_cycles);
+            double ins = (double)(ru.ri_instructions - pru.ri_instructions);
+            double qf = (have_pe && pe.magic == 0x3130305058444d4dLL && pe.qpf) ? 1000.0 / (double)pe.qpf : 0;
+            gettimeofday( &tv, NULL ); localtime_r( &tv.tv_sec, &tmv );
+            snprintf( wall, sizeof(wall), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000) );
+            n = snprintf( line, sizeof(line),
+                          "[xp] %s +%.2f dt=%.0f cpu=%.0f (thr %.0f) P=%.0f E=%.0f run=%.0f pgw=%.1f GHz P=%.2f E=%.2f Minst=%.0f IPC=%.2f mJ=%.0f pin=%llu rdKB=%llu fpMB=%llu",
+                          wall, XP_MS( now - t_start ) / 1000.0, dt_ms, cpu, sum_thr_ms, pms, ems,
+                          XP_MS( ru.ri_runnable_time - pru.ri_runnable_time ), XP_MS( ru.ri_page_wait_time_mach - pru.ri_page_wait_time_mach ),
+                          pms > 0 ? pcy / (pms * 1e6) : 0, ems > 0 ? (cy - pcy) / (ems * 1e6) : 0, ins / 1e6, cy > 0 ? ins / cy : 0,
+                          (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6,
+                          (unsigned long long)(ru.ri_pageins - pru.ri_pageins), (unsigned long long)((ru.ri_diskio_bytesread - pru.ri_diskio_bytesread) >> 10),
+                          (unsigned long long)(ru.ri_phys_footprint >> 20) );
+            if (qf && n < (int)sizeof(line))
+                snprintf( line + n, sizeof(line) - n,
+                          " | pres %lld/%lld thr=%.1f ecl %lld/%.1f sig %lld/%.1f wait %lld/%.1f prs=%.1f (flush %.1f lat %lld/%.1f draw %.1f cmt %.1f) pool=%.1f caller-ecl %lld/%.1f",
+                          (long long)(pe.pres_enq - ppe.pres_enq), (long long)(pe.pres_done - ppe.pres_done), (pe.t_thr - ppe.t_thr) * qf,
+                          (long long)(pe.n_ecl - ppe.n_ecl), (pe.t_ecl - ppe.t_ecl) * qf, (long long)(pe.n_sig - ppe.n_sig), (pe.t_sig - ppe.t_sig) * qf,
+                          (long long)(pe.n_wait - ppe.n_wait), (pe.t_wait - ppe.t_wait) * qf, (pe.t_prs - ppe.t_prs) * qf,
+                          (pe.t_flush - ppe.t_flush) * qf, (long long)(pe.n_lat - ppe.n_lat), (pe.t_lat - ppe.t_lat) * qf,
+                          (pe.t_draw - ppe.t_draw) * qf, (pe.t_cmt - ppe.t_cmt) * qf, (pe.t_pool - ppe.t_pool) * qf,
+                          (long long)(pe.ecl_calls - ppe.ecl_calls), (pe.t_ecl_caller - ppe.t_ecl_caller) * qf );
+            wine_log_write( "%s", line );
+            /* threads: roles always, then the busiest; role + Windows TID : P ms / E ms : P GHz / E GHz : M instructions */
+            {
+                int printed[1024] = {0}, shown = 0;
+                n = snprintf( line, sizeof(line), "[xp-t] %s", wall );
+                for (i = 0; i < nrows && n < (int)sizeof(line) - 48; i++)
+                    if (rows[i].role) { printed[i] = 1; shown++;
+                        n += snprintf( line + n, sizeof(line) - n, " %s%04x:%.0f/%.0f:%.1f/%.1f:%.0f", rows[i].role, rows[i].wtid,
+                                       rows[i].p_ms, rows[i].e_ms, rows[i].p_ghz, rows[i].e_ghz, rows[i].minst ); }
+                while (shown < 14 && n < (int)sizeof(line) - 48)
+                {
+                    int best = -1;
+                    for (i = 0; i < nrows; i++)
+                        if (!printed[i] && (best < 0 || rows[i].p_ms + rows[i].e_ms > rows[best].p_ms + rows[best].e_ms)) best = i;
+                    if (best < 0 || rows[best].p_ms + rows[best].e_ms < 2.0) break;
+                    printed[best] = 1; shown++;
+                    if (rows[best].wtid)
+                        n += snprintf( line + n, sizeof(line) - n, " -%04x:%.0f/%.0f:%.1f/%.1f:%.0f", rows[best].wtid,
+                                       rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
+                    else
+                        n += snprintf( line + n, sizeof(line) - n, " m%llu:%.0f/%.0f:%.1f/%.1f:%.0f", (unsigned long long)rows[best].tid,
+                                       rows[best].p_ms, rows[best].e_ms, rows[best].p_ghz, rows[best].e_ghz, rows[best].minst );
+                }
+                wine_log_write( "%s", line );
+            }
+            if (!(gen & 3)) ios_xp_api_report( wall, XP_MS( now - t_start ) / 1000.0 );   /* ml1131: ~1 s */
+        }
+        else if (ru_rc && gen < 4) wine_log_write( "[xp] ml1128 proc_pid_rusage v6 failed rc=%d errno=%d", ru_rc, errno );
+        if (!ru_rc) { pru = ru; have_ru = 1; }
+        if (pe.magic == 0x3130305058444d4dLL) { ppe = pe; have_pe = 1; }
+        t_prev = now;
+#undef XP_MS
+    }
+}
+
+/* ml1129: WORKER PROFILER (measurement only). The submission worker (role W)
+ * retires ~52 M instructions per frame on P-cores (ph-rdr82): the largest
+ * single consumer under the power cap. Every 15 s: a 3 s burst at ~1 kHz over
+ * the W threads, sampling only while RUNNING, walking the frame-pointer chain.
+ *   leaf    : where the pc is (PE module+rva / dylib`symbol / x64-JIT)
+ *   d3d12   : first madeira_d3d12.dll frame on the chain (inclusive, our code)
+ *   unix    : first Madeira dylib frame on the chain (which bridge call)
+ * Symbolize madeira_d3d12 RVAs offline with llvm-objdump --syms of the same DLL. */
+struct ios_wp_b { char key[96]; unsigned n; };
+static int ios_wp_add( struct ios_wp_b *b, int *nb, int cap, const char *key )
+{
+    int i;
+    for (i = 0; i < *nb; i++) if (!strcmp( b[i].key, key )) { b[i].n++; return 1; }
+    if (*nb >= cap) return 0;
+    snprintf( b[*nb].key, sizeof(b[*nb].key), "%s", key ); b[*nb].n = 1; (*nb)++;
+    return 1;
+}
+static void ios_wp_print( const char *title, struct ios_wp_b *b, int nb, unsigned total, int top )
+{
+    int shown = 0; char line[1600]; int n = snprintf( line, sizeof(line), "[wprof] ml1129 %s:", title );
+    while (shown < top)
+    {
+        int i, best = -1;
+        for (i = 0; i < nb; i++) if (b[i].n && (best < 0 || b[i].n > b[best].n)) best = i;
+        if (best < 0) break;
+        if (n > (int)sizeof(line) - 140) { wine_log_write( "%s", line ); n = snprintf( line, sizeof(line), "[wprof] ml1129 %s (cont):", title ); }
+        n += snprintf( line + n, sizeof(line) - n, " %s=%.1f%%", b[best].key, total ? 100.0 * b[best].n / total : 0.0 );
+        b[best].n = 0; shown++;
+    }
+    wine_log_write( "%s", line );
+}
+/* describe one code address: PE image copy -> "mod+rva", native -> "lib`sym+off", else class */
+static int ios_wp_desc( uint64_t a, struct ios_ts_map *mp, char *out, size_t cap, int *kind, uint64_t *rva_out )
+{
+    extern void *ios_jit_rx_base_global; extern size_t ios_jit_pool_size_global;
+    extern int ios_jit_pool_image_pc(uintptr_t pc, uintptr_t *pe_addr_out);
+    uintptr_t rx0 = (uintptr_t)ios_jit_rx_base_global, pe = 0; uint64_t rva = 0; const char *mod;
+    Dl_info di;
+    *kind = 0;
+    if (a >= rx0 && a < rx0 + ios_jit_pool_size_global)
+    {
+        if (!ios_jit_pool_image_pc( a, &pe )) { snprintf( out, cap, "x64-JIT" ); *kind = 3; return 1; }
+        a = pe;
+    }
+    if ((mod = ios_ts_mod_for( mp, a, &rva )))
+    {
+        snprintf( out, cap, "%s+%llx", mod, (unsigned long long)(rva & ~0xfull) ); *kind = 1;
+        if (rva_out) *rva_out = rva;
+        if (!strncasecmp( mod, "madeira_d3d12", 13 ) || !strcasecmp( mod, "d3d12.dll" )) *kind = 2;   /* the game loads us as D3D12.DLL */
+        return 1;
+    }
+    if (dladdr( (void *)a, &di ) && di.dli_fname)
+    {
+        const char *img = strrchr( di.dli_fname, '/' ); img = img ? img + 1 : di.dli_fname;
+        if (di.dli_sname) snprintf( out, cap, "%s`%s", img, di.dli_sname );
+        else snprintf( out, cap, "%s+%llx", img, (unsigned long long)((a - (uint64_t)di.dli_fbase) & ~0xffull) );
+        *kind = strstr( img, "Madeira" ) ? 4 : 5;
+        return 1;
+    }
+    snprintf( out, cap, "?%llx", (unsigned long long)(a & ~0xfffull) ); *kind = 6;
+    return 1;
+}
+static void ios_wprof_main( void )
+{
+    static struct ios_wp_b leaf[400], inc[300], unx[200], cls[8];
+    if (ios_ts_tsd_off < 0) ios_ts_calibrate();
+    for (;;)
+    {
+        thread_act_array_t th = NULL; mach_msg_type_number_t nth = 0, k;
+        mach_port_t tw[4]; uint64_t tw_teb[4]; int ntw = 0, s, i;
+        int nleaf = 0, ninc = 0, nunx = 0, ncls = 0; unsigned total = 0, walked = 0;
+        sleep( 15 );
+        if (task_threads( mach_task_self(), &th, &nth ) != KERN_SUCCESS) continue;
+        for (k = 0; k < nth; k++)
+        {
+            thread_identifier_info_data_t idi; mach_msg_type_number_t cnt = THREAD_IDENTIFIER_INFO_COUNT; int keep = 0;
+            if (ntw < 4 && thread_info( th[k], THREAD_IDENTIFIER_INFO, (thread_info_t)&idi, &cnt ) == KERN_SUCCESS)
+                for (i = 0; i < ios_xp_nroles; i++)
+                    if (ios_xp_roles[i].tid == idi.thread_id && strchr( ios_xp_roles[i].role, 'W' ))
+                    {
+                        pthread_t pt = pthread_from_mach_thread_np( th[k] );
+                        tw[ntw] = th[k]; tw_teb[ntw] = pt ? ios_ts_teb( pt ) : 0; ntw++; keep = 1; break;
+                    }
+            if (!keep) mach_port_deallocate( mach_task_self(), th[k] );
+        }
+        vm_deallocate( mach_task_self(), (vm_address_t)th, nth * sizeof(*th) );
+        if (!ntw) continue;
+        for (s = 0; s < 3000; s++)
+        {
+            int t;
+            for (t = 0; t < ntw; t++)
+            {
+                arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                thread_basic_info_data_t bi; mach_msg_type_number_t bic = THREAD_BASIC_INFO_COUNT;
+                uint64_t chain[16]; int nch = 0, f, kind, have_inc = 0, have_unx = 0; char key[96];
+                struct ios_ts_map *mp = ios_ts_map_for_teb( tw_teb[t] );
+                if (thread_info( tw[t], THREAD_BASIC_INFO, (thread_info_t)&bi, &bic ) != KERN_SUCCESS || bi.run_state != TH_STATE_RUNNING) continue;
+                if (thread_suspend( tw[t] ) != KERN_SUCCESS) continue;
+                if (thread_get_state( tw[t], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS)
+                {
+                    uint64_t fp = st.__fp, lr = st.__lr;
+                    chain[nch++] = st.__pc;
+                    if (lr) chain[nch++] = lr;
+                    for (f = 0; f < 14 && fp && !(fp & 7) && nch < 16; f++)
+                    {
+                        uint64_t rec[2];
+                        if (!ios_ts_read( fp, rec, 16 )) break;
+                        if (rec[1] && rec[1] != lr) chain[nch++] = rec[1] & 0x0000ffffffffffffull;
+                        if (rec[0] <= fp) break;
+                        fp = rec[0];
+                    }
+                }
+                thread_resume( tw[t] );
+                if (!nch) continue;
+                total++;
+                ios_wp_desc( chain[0], mp, key, sizeof(key), &kind, NULL );
+                ios_wp_add( leaf, &nleaf, 400, key );
+                {
+                    static const char *cn[7] = { "?", "PE-other", "madeira_d3d12", "x64-JIT", "Madeira-dylib", "system-lib", "unknown" };
+                    const char *c = cn[kind < 7 ? kind : 6]; char ck[96];
+                    if (kind == 1) { snprintf( ck, sizeof(ck), "PE:%s", key ); { char *plus = strchr( ck, '+' ); if (plus) *plus = 0; } c = ck; }
+                    else if (kind == 5) { snprintf( ck, sizeof(ck), "lib:%s", key ); { char *e = strpbrk( ck + 4, "`+" ); if (e) *e = 0; } c = ck; }
+                    ios_wp_add( cls, &ncls, 8, c ) || ios_wp_add( cls, &ncls, 8, "other" );
+                }
+                for (f = 0; f < nch; f++)
+                {
+                    char k2[96]; int kd;
+                    ios_wp_desc( chain[f], mp, k2, sizeof(k2), &kd, NULL );
+                    if (!have_inc && kd == 2) { ios_wp_add( inc, &ninc, 300, k2 ); have_inc = 1; }
+                    if (!have_unx && kd == 4) { ios_wp_add( unx, &nunx, 200, k2 ); have_unx = 1; }
+                }
+                if (nch > 2) walked++;
+            }
+            usleep( 1000 );
+        }
+        for (i = 0; i < ntw; i++) mach_port_deallocate( mach_task_self(), tw[i] );
+        wine_log_write( "[wprof] ml1129 burst: %u running samples over %d W thread(s), %u with a frame chain", total, ntw, walked );
+        if (!total) continue;
+        ios_wp_print( "class", cls, ncls, total, 8 );
+        ios_wp_print( "leaf", leaf, nleaf, total, 45 );
+        ios_wp_print( "d3d12-inclusive", inc, ninc, total, 45 );
+        ios_wp_print( "unix-inclusive", unx, nunx, total, 30 );
+    }
+}
+
+static void ios_thread_sampler_main(void)
+{
+    int gen = 0;
+    ios_ts_calibrate();
+    wine_log_write("[thread-sample] ml876 armed (task-wide: burst of 4 passes / 250 ms every 20 s)");
+    for (;;) {
+        int b;
+        sleep(20);
+        for (b = 0; b < 4; b++) { ios_thread_sampler_pass(b); usleep(250000); }
+        wine_log_write("[thread-sample] ml876 burst done");
+        {   /* ml1115: alert (futex) traffic since the last burst, per second */
+            extern volatile long long ios_alert_wakes, ios_alert_waits, ios_qpc_syscalls, ios_affinity_sets; extern volatile int ios_srv_req_count;
+            extern volatile long long ios_alert_lat_n, ios_alert_lat_ticks, ios_alert_lat_hist[6], ios_alert_spin_tries, ios_alert_spin_hits;
+            static long long l_n, l_t, l_h[6], l_st, l_sh; long long dn = ios_alert_lat_n - l_n; int hb;
+            {
+                mach_timebase_info_data_t tb; double tpu; mach_timebase_info( &tb ); tpu = 1000.0 * tb.denom / tb.numer;
+                wine_log_write( "[sync-census] ml1122 alert wake latency: %lld samples, avg %.1f us, <5us %lld, <20 %lld, <50 %lld, <100 %lld, <500 %lld, >=500 %lld; spin %lld tries %lld hits",
+                                dn, dn ? (ios_alert_lat_ticks - l_t) / tpu / dn : 0.0,
+                                ios_alert_lat_hist[0] - l_h[0], ios_alert_lat_hist[1] - l_h[1], ios_alert_lat_hist[2] - l_h[2],
+                                ios_alert_lat_hist[3] - l_h[3], ios_alert_lat_hist[4] - l_h[4], ios_alert_lat_hist[5] - l_h[5],
+                                ios_alert_spin_tries - l_st, ios_alert_spin_hits - l_sh );
+                l_n = ios_alert_lat_n; l_t = ios_alert_lat_ticks; for (hb = 0; hb < 6; hb++) l_h[hb] = ios_alert_lat_hist[hb];
+                l_st = ios_alert_spin_tries; l_sh = ios_alert_spin_hits;
+            }
+            static long long last_wakes, last_waits, last_qpc, last_aff; static int last_req; static struct timespec last_t;
+            struct timespec now; double dt;
+            clock_gettime( CLOCK_MONOTONIC, &now );
+            dt = last_t.tv_sec ? (now.tv_sec - last_t.tv_sec) + (now.tv_nsec - last_t.tv_nsec) / 1e9 : 0;
+            if (dt > 0)
+                wine_log_write( "[sync-census] ml1115 thread alerts: %.0f wakes/s, %.0f waits/s; ml1117 server requests %.0f/s, "
+                                "QPC syscalls %.0f/s, SetThreadAffinityMask %.0f/s (over %.1f s)",
+                                (ios_alert_wakes - last_wakes) / dt, (ios_alert_waits - last_waits) / dt,
+                                (ios_srv_req_count - last_req) / dt, (ios_qpc_syscalls - last_qpc) / dt,
+                                (ios_affinity_sets - last_aff) / dt, dt );
+            last_wakes = ios_alert_wakes; last_waits = ios_alert_waits; last_qpc = ios_qpc_syscalls;
+            last_aff = ios_affinity_sets; last_req = ios_srv_req_count; last_t = now;
+        }
+        /* ml979: profile the guest every third burst (~once a minute). Two
+         * successive profiles are what distinguish a loop from a sweep: a
+         * sweep's span and bucket set move, a loop's do not. */
+        ++gen; ios_guest_rip_profile( gen );   /* ml1123: every burst (was every third) */
+    }
+}
+
+
 /* iOS-Madeira 2026-07-05: per-present frame-anatomy counters, read by
  * winemetal_unix's Present-cadence log line (same binary). The wait
  * accounting is gated to the GAME thread (main Wine thread, captured in
@@ -1003,6 +2208,9 @@ static void invoke_system_apc( const union apc_call *call, union apc_result *res
 unsigned int server_select( const union select_op *select_op, data_size_t size, UINT flags,
                             timeout_t abs_timeout, struct context_data *context, struct user_apc *user_apc )
 {
+#ifdef WINE_IOS
+    { extern void ios_tls38_poll( const char * ); ios_tls38_poll( "wait" ); }
+#endif
     unsigned int ret;
     int cookie;
     obj_handle_t apc_handle = 0;
@@ -1246,6 +2454,9 @@ NTSTATUS WINAPI NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
     struct user_apc apc;
     NTSTATUS status;
     BOOL alertable;
+#ifdef WINE_IOS
+    { extern void ios_tlswatch_rearm( const char * ); ios_tlswatch_rearm( "NtContinue" ); }
+#endif
 
     if ((UINT_PTR)args > 0xff)
         alertable = args->ContinueFlags & KCONTINUE_FLAG_TEST_ALERT;
@@ -1596,6 +2807,7 @@ static struct ios_fd_cache *ios_get_fd_cache(void)
  * its cached fds and pinned the unlinked inodes behind them. */
 void ios_fd_cache_release( void *peb )
 {
+    { extern void ios_inproc_cache_release( void *peb ); ios_inproc_cache_release( peb ); }   /* ml1058 */
     int i, j, n, closed = 0;
     struct ios_fd_cache *c = NULL;
 
@@ -1617,19 +2829,55 @@ void ios_fd_cache_release( void *peb )
         union fd_cache_entry *block = c->blocks[i];
         if (!block) continue;
         for (j = 0; j < FD_CACHE_BLOCK_SIZE; j++)
-            if (block[j].s.type != FD_TYPE_INVALID && block[j].s.fd > 0)
-            {
-                /* Match add/get/remove_fd_from_cache: zero is unset, valid
-                 * descriptors are encoded as fd+1, INVALID holds an error. */
-                int fd = block[j].s.fd - 1;
-                ios_fdt_note_close( fd, "fd-cache-release", peb );
-                close( fd );
-                closed++;
-            }
-        if (block != c->initial_block) free( block );
+        {
+            /* ml961: `s.fd` holds fd+1, not fd. add_fd_to_cache stores it that
+             * way so 0 can mean "unset" ("store fd+1 so that 0 can be used as
+             * the unset value"), and both readers decode it: get_cached_fd does
+             * `*fd = cache.s.fd - 1` and remove_fd_from_cache does
+             * `fd = cache.s.fd - 1`. This loop was the only place that passed
+             * the stored word straight to close(), so it closed the descriptor
+             * AFTER the one this pseudo-process owned -- leaking the real one
+             * and closing an unrelated live fd.
+             *
+             * Measured in rdr25, three consecutive lines:
+             *   CROSS! close fd=30 why=fd-cache-release kind=request_wr
+             *          owner_peb=0x6fdff0000 closer_tid=007c dead_peb=0x48ff84000
+             *   read_request EOF tid=0024 pid=0020 request_unixfd=27 -> kill_thread
+             *   kill_thread tid=0024 pid=0020 violent=0
+             * The exiting launcher closed another pseudo-process's request-pipe
+             * write end, and wineserver killed that thread on the EOF. The
+             * other entries show the same shift (221/225/229 closed for real
+             * fds 220/224/228).
+             *
+             * Decode ONCE and use the same value for the ownership log and the
+             * close, so the two can never disagree. Descriptor 0 is a valid
+             * descriptor (stored as 1), so the populated test is on the stored
+             * word being non-zero, not on the decoded fd being positive.
+             *
+             * FD_TYPE_INVALID entries do not hold a descriptor at all -- they
+             * cache an NTSTATUS ("if fd type is invalid, fd stores an error
+             * value"), so closing them closes an arbitrary number. Skip them. */
+            int stored = block[j].s.fd;
+            int real_fd;
+
+            if (!stored) continue;                              /* unset entry      */
+            if (block[j].s.type == FD_TYPE_INVALID) continue;   /* cached NTSTATUS  */
+            real_fd = stored - 1;
+            ios_fdt_note_close( real_fd, "fd-cache-release", peb );
+            close( real_fd );
+            closed++;
+        }
+        /* ml961: secondary blocks come from anon_mmap_alloc (mmap), so they must
+         * be released with munmap at the same size -- free() on an mmap'd
+         * pointer is undefined and corrupts the malloc heap. Only the enclosing
+         * cache object below belongs to free(); initial_block is an inline
+         * array inside *c and is released with it. */
+        if (block != c->initial_block)
+            munmap( block, FD_CACHE_BLOCK_SIZE * sizeof(union fd_cache_entry) );
     }
     free( c );
-    dprintf( 2, "[fd-cache] rev=ml571 released peb=%p, closed %d cached fd(s)\n", peb, closed );
+    dprintf( 2, "[fd-cache] rev=ml961 released peb=%p, closed %d cached fd(s) (decoded fd+1; "
+             "skipped FD_TYPE_INVALID; munmap for secondary blocks)\n", peb, closed );
 }
 
 #define fd_cache           (ios_get_fd_cache()->blocks)
@@ -2233,9 +3481,14 @@ void process_exit_wrapper( int status )
     if (i >= 0)
     {
         extern void ios_jit_reclaim_process( void *peb );
+        extern void ios_retire_own_fixed_base_image( void *peb );
         void *dead_peb = ios_proc_sockets[i].peb;
         wine_log_write("[Wine ntdll/server] process_exit_wrapper(%d): closing child fd_socket=%d",
                        status, ios_proc_sockets[i].fd);
+        /* ml987: hand back the fixed-base main image BEFORE the socket closes.
+         * NtUnmapViewOfSection needs a live server connection, and this is the
+         * last moment we have one while still on the owning process's thread. */
+        ios_retire_own_fixed_base_image( dead_peb );
         ios_fdt_note_close( ios_proc_sockets[i].fd, "exit-master", dead_peb );
         close( ios_proc_sockets[i].fd );
         ios_proc_sockets[i].peb = NULL;
@@ -2251,6 +3504,13 @@ void process_exit_wrapper( int status )
          * the session (else-branch) lives as long as the app. Reuse is
          * grace-delayed inside the allocator for laggard exit threads. */
         ios_jit_reclaim_process( dead_peb );
+        /* ml988 phase 2: only now may the retired fixed base be handed on. Until
+         * this point the old generation's pool mappings and FEX translations are
+         * still live, so a new claimant taking the same VA would race them. */
+        {
+            extern void ios_exe_win_mark_ready( void *peb );
+            ios_exe_win_mark_ready( dead_peb );
+        }
     }
     else close( fd_socket );
 #else
@@ -2494,8 +3754,9 @@ size_t server_init_process(void)
             supported_machines_count = wine_server_reply_size( reply ) / sizeof(*supported_machines);
             if (reply->inproc_device)
             {
-                inproc_device_fd = wine_server_receive_fd( &handle );
-                assert( handle == reply->inproc_device );
+                /* ml1058: userspace ntsync (build/madsync). The "device" is a constant
+                 * pseudo fd and the server sends nothing for it. */
+                inproc_device_fd = 0x6fffffff /* MADSYNC_DEVICE_FD */;
             }
         }
     }
@@ -2604,9 +3865,8 @@ size_t server_init_process_child( int child_fd_socket )
             info_size = reply->info_size;
             if (reply->inproc_device)
             {
-                int devfd = wine_server_receive_fd( &handle );
-                /* child doesn't need its own inproc device, close it */
-                if (devfd >= 0) close( devfd );
+                /* ml1058: nothing was sent, so nothing to receive or close. */
+                if (inproc_device_fd < 0) inproc_device_fd = 0x6fffffff /* MADSYNC_DEVICE_FD */;
             }
         }
     }
@@ -2779,6 +4039,15 @@ void server_init_process_done(void)
          * (unix side), or elsewhere — mapping the hot buckets tells us
          * where the ~1.4s/frame actually goes. Counts halve at each print
          * so the histogram tracks the current phase. */
+        /* ml875 [thread-sample]: ONE task-wide sampler (ml873 armed seven, one
+         * per pseudo-process, each suspending the others' threads). Body in
+         * ios_thread_sampler_main() above. */
+        if (__sync_bool_compare_and_swap(&ios_ts_armed, 0, 1))
+        {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_thread_sampler_main(); });
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_xprobe_main(); });   /* ml1128 */
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_wprof_main(); });   /* ml1129 */
+        }
         if (!getenv("MADEIRA_QUIET"))
         {
             /* iOS-Madeira 2026-07-05 quiet mode: the sampler thread_suspends

@@ -33,7 +33,7 @@
  *    the same handle. An older client that sent the 8-byte queue payload
  *    got an error it ignored and then used a device as a queue, which
  *    terminated the host. Refuse the version rather than misread it. */
-#define RM_VERSION 12u
+#define RM_VERSION 14u
 #define RM_PORT    47821
 
 enum rm_op {
@@ -186,6 +186,35 @@ enum rm_op {
     RM_OP_BLIT_INTO,             /* encoder + packed blit batch -> replayed      */
     RM_OP_SET_LABEL,             /* encoder, [utf8 label] -> status              */
     RM_OP_BUFFER_NEW_TEXTURE,    /* buffer, WMTTextureInfo, offset, bpr -> handle */
+
+    /* Compute. A modern engine does much of its frame here, so an unrouted
+     * compute encoder is not a missing corner -- it is most of the work
+     * silently not happening. Commands travel verbatim like the blit stream,
+     * with one exception: SetBytes carries a guest pointer, so its payload is
+     * inlined after the struct. */
+    RM_OP_COMPUTE_ENCODER,       /* cmdbuf -> compute encoder handle             */
+    RM_OP_COMPUTE_INTO,          /* encoder + packed compute batch -> replayed   */
+    RM_OP_TEXTURE_MIPLEVELS,     /* texture -> u64 mip count                     */
+    RM_OP_NEW_MESH_PSO_INFO,     /* device, WMTMeshRenderPipelineInfo -> handle  */
+
+    /* ml821: coalesced messages. ROUND-TRIP COUNT, not bytes, is what bounds
+     * the frame rate. One late gameplay interval spent 369 ms of a 524 ms frame
+     * on 2,197 serialized calls; 1,153 were buffer uploads averaging 1,179
+     * bytes against an 8 MB cap. These carry many operations per round trip and
+     * differ in NO other way from the single-operation forms. */
+    RM_OP_BUFFER_UPLOAD_MULTI,   /* header, data, range descriptors -> status    */
+    RM_OP_RELEASE_MULTI,         /* header, handles -> status                    */
+
+    /* ml880: residency sets. A D3D12 title reaches most of its resources
+     * through descriptors, i.e. indirectly; declaring them per draw with
+     * useResource was capped at 256 and the GPU faulted on the first
+     * compute dispatch that touched an undeclared buffer. One set on the
+     * queue, every allocation added once, committed when it changes. */
+    RM_OP_NEW_RESIDENCY_SET,     /* device, u64 capacity -> handle              */
+    RM_OP_RESIDENCY_ADD,         /* set, allocation -> status                    */
+    RM_OP_RESIDENCY_COMMIT,      /* set -> status                                */
+    RM_OP_QUEUE_ADD_RESIDENCY,   /* queue, set -> status                         */
+    RM_OP_NEW_GEOM_PSO_INFO,     /* ml927: device, WMTMeshRenderPipelineInfo + WMTGeometryEmulationInfo -> handle (converter geometry emulation) */
 };
 
 struct rm_buf_texture { uint64_t buffer; uint64_t offset; uint64_t bytes_per_row; };
@@ -226,6 +255,57 @@ struct rm_os_version { uint32_t major, minor, patch, pad; };
 
 struct rm_buffer_create { uint64_t device; uint64_t length; uint32_t options; uint32_t pad; };
 struct rm_buffer_range  { uint64_t handle; uint64_t offset; uint64_t length; };
+
+/* ml821 coalesced upload. Layout is: this header, then `data_bytes` of packed
+ * payload, then `count` rm_buffer_range descriptors whose lengths sum to
+ * data_bytes and whose data appears in the SAME ORDER.
+ *
+ * Descriptors trail the data so a sender can append payload as it walks its
+ * buffers without ever moving what it already wrote. */
+struct rm_buffer_multi { uint32_t count; uint32_t data_bytes; };
+struct rm_release_multi { uint32_t count; uint32_t reserved; };
+#define RM_MULTI_MAX_RANGES  512u
+#define RM_MULTI_MAX_HANDLES 256u
+
+/* THE framing validator for a coalesced upload. Both sides call this one
+ * function: a host that walks the message its own way would only prove that the
+ * host works. Checks self-consistency -- descriptor area present, lengths
+ * summing to data_bytes, nothing overflowing -- in 64-bit arithmetic, because
+ * 32-bit sums of attacker-controlled lengths wrap. Handle validity and buffer
+ * bounds need the host registry and are NOT checked here. */
+static inline int rm_multi_ok(const void *payload, uint32_t payload_len,
+                              const struct rm_buffer_range **ranges_out,
+                              const uint8_t **data_out) {
+    if (payload_len < sizeof(struct rm_buffer_multi)) return 0;
+    const struct rm_buffer_multi *m = (const struct rm_buffer_multi *)payload;
+    if (m->count == 0 || m->count > RM_MULTI_MAX_RANGES) return 0;
+    uint64_t need = (uint64_t)sizeof *m + (uint64_t)m->data_bytes
+                  + (uint64_t)m->count * sizeof(struct rm_buffer_range);
+    if (need != (uint64_t)payload_len) return 0;
+    const uint8_t *data = (const uint8_t *)payload + sizeof *m;
+    const struct rm_buffer_range *r = (const struct rm_buffer_range *)(data + m->data_bytes);
+    uint64_t sum = 0;
+    for (uint32_t i = 0; i < m->count; i++) {
+        if (r[i].length == 0 || r[i].length > RM_CHUNK_BYTES) return 0;
+        sum += r[i].length;
+        if (sum > (uint64_t)m->data_bytes) return 0;
+    }
+    if (sum != (uint64_t)m->data_bytes) return 0;
+    if (ranges_out) *ranges_out = r;
+    if (data_out) *data_out = data;
+    return 1;
+}
+
+static inline int rm_release_multi_ok(const void *payload, uint32_t payload_len,
+                                     const uint64_t **handles_out) {
+    if (payload_len < sizeof(struct rm_release_multi)) return 0;
+    const struct rm_release_multi *m = (const struct rm_release_multi *)payload;
+    if (m->count == 0 || m->count > RM_MULTI_MAX_HANDLES) return 0;
+    uint64_t need = (uint64_t)sizeof *m + (uint64_t)m->count * sizeof(uint64_t);
+    if (need != (uint64_t)payload_len) return 0;
+    if (handles_out) *handles_out = (const uint64_t *)((const uint8_t *)payload + sizeof *m);
+    return 1;
+}
 
 /* Submit a REAL packed winemetal batch: this prologue, then the wmtw_batch
  * payload the guest packer produced. The host validates it with the same

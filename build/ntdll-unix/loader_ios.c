@@ -1358,6 +1358,7 @@ extern NTSTATUS unixcall_ios_push_jit_aliases(void *args);  /* virtual_ios.c */
 extern NTSTATUS unixcall_ios_register_hold_release(void *args);  /* ml618, virtual_ios.c */
 extern NTSTATUS unixcall_ios_jit_alias_probe(void *args);        /* ml631, virtual_ios.c */
 extern NTSTATUS unixcall_ios_mono_bridge_ptr(void *args);        /* ml648, virtual_ios.c */
+extern NTSTATUS unixcall_ios_get_fex_arena(void *args);          /* ml800, virtual_ios.c */
 
 static NTSTATUS ios_wrap_0(void *a) { return ios_wrap_unix_call(0, a, load_so_dll); }
 static NTSTATUS ios_wrap_1(void *a) { return ios_wrap_unix_call(1, a, unwind_builtin_dll); }
@@ -1371,12 +1372,14 @@ static NTSTATUS ios_wrap_8(void *a) { return ios_wrap_unix_call(8, a, unixcall_i
 static NTSTATUS ios_wrap_9(void *a) { return ios_wrap_unix_call(9, a, unixcall_ios_register_hold_release); }
 static NTSTATUS ios_wrap_10(void *a) { return ios_wrap_unix_call(10, a, unixcall_ios_jit_alias_probe); }
 static NTSTATUS ios_wrap_11(void *a) { return ios_wrap_unix_call(11, a, unixcall_ios_mono_bridge_ptr); }
+static NTSTATUS ios_wrap_12(void *a) { return ios_wrap_unix_call(12, a, unixcall_ios_get_fex_arena); }
 
 static const unixlib_entry_t unix_call_funcs[] =
 {
     ios_wrap_0, ios_wrap_1, ios_wrap_2, ios_wrap_3,
     ios_wrap_4, ios_wrap_5, ios_wrap_6, ios_wrap_7,
     ios_wrap_8, ios_wrap_9, ios_wrap_10, ios_wrap_11,   /* ml648 */
+    ios_wrap_12,                                        /* ml800 */
 };
 #else
 static const unixlib_entry_t unix_call_funcs[] =
@@ -1393,6 +1396,7 @@ static const unixlib_entry_t unix_call_funcs[] =
     unixcall_ios_register_hold_release,
     unixcall_ios_jit_alias_probe,
     unixcall_ios_mono_bridge_ptr,   /* ml648 */
+    unixcall_ios_get_fex_arena,     /* ml800 */
 };
 #endif
 
@@ -1416,6 +1420,7 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
     unixcall_ios_register_hold_release,  /* iOS only — wow64 case unreachable */
     unixcall_ios_jit_alias_probe,        /* ml631 — keep table lengths in step */
     unixcall_ios_mono_bridge_ptr,        /* ml648 — keep table lengths in step */
+    unixcall_ios_get_fex_arena,          /* ml800 — keep table lengths in step */
 };
 
 #endif  /* _WIN64 */
@@ -2024,6 +2029,26 @@ static void load_ntdll_functions( HMODULE module )
                 *pios_teb_tsd_offset, pios_teb_tsd_offset);
         }
     }
+    /* ml797: hand the FEX arena to the PE side as plain data. It cannot travel
+     * as an environment variable -- its consumer runs before any CRT or TEB
+     * exists. Publishing zero is normal and means "no arena"; the emulator then
+     * selects its own band exactly as before. */
+    {
+        extern ULONG_PTR ios_fex_arena_base_unix, ios_fex_arena_end_unix;
+        ULONG_PTR *pbase = (ULONG_PTR *)find_named_export( module, exports, "ios_fex_arena_base" );
+        ULONG_PTR *pend  = (ULONG_PTR *)find_named_export( module, exports, "ios_fex_arena_end" );
+        if (pbase && pend)
+        {
+            *pbase = ios_fex_arena_base_unix;
+            *pend  = ios_fex_arena_end_unix;
+            ERR("[fex-arena] ml800 legacy ntdll-global write (NOT the live channel; the "
+                "dispatcher now uses unix_ios_get_fex_arena) base=%p end=%p%s\n",
+                (void *)*pbase, (void *)*pend,
+                *pbase ? "" : " (no arena reserved this run -- emulator selects its own band)");
+        }
+        else ERR("[fex-arena] ml797 channel BROKEN: ntdll exports ios_fex_arena_base/end NOT FOUND "
+                 "(base=%p end=%p) -- the arena can never reach the emulator\n", pbase, pend);
+    }
     ERR("syscall_dispatcher: p=%p *p=%p (unix func=%p)\n",
         p__wine_syscall_dispatcher, *p__wine_syscall_dispatcher, __wine_syscall_dispatcher);
     ERR("unix_call_dispatcher: p=%p *p=%p\n",
@@ -2366,6 +2391,20 @@ static int ios_load_child_ec_ntdll( PEB *child_peb )
                 dprintf(2, "[teb-tsd] ec-child published offset=0x%x\n", *pios_teb_tsd_offset);
             }
             else dprintf(2, "[teb-tsd] ec-child export ios_teb_tsd_offset NOT FOUND\n");
+        }
+        {
+            /* ml797: same arena hand-off for a pseudo-process's own ntdll. */
+            extern ULONG_PTR ios_fex_arena_base_unix, ios_fex_arena_end_unix;
+            ULONG_PTR *pbase = (ULONG_PTR *)find_named_export( module, exports, "ios_fex_arena_base" );
+            ULONG_PTR *pend  = (ULONG_PTR *)find_named_export( module, exports, "ios_fex_arena_end" );
+            if (pbase && pend)
+            {
+                *pbase = ios_fex_arena_base_unix;
+                *pend  = ios_fex_arena_end_unix;
+                dprintf(2, "[fex-arena] ml797 ec-child channel WIRED base=%p end=%p\n",
+                        (void *)*pbase, (void *)*pend);
+            }
+            else dprintf(2, "[fex-arena] ml797 ec-child exports ios_fex_arena_base/end NOT FOUND\n");
         }
         if (p__wine_unix_call_dispatcher_arm64ec)
         {
@@ -2731,6 +2770,15 @@ static void start_main_thread(void)
      * first PE placement. */
     WINE_IOS_LOG("ios_reserve_fex_arena...");
     ios_reserve_fex_arena();
+    /* ml997: the guest jumbo holdback runs AFTER the arena, never before.
+     * rdr65 held 9216 MB at jit-pool-init and the arena then found nothing in 9
+     * candidates ("ml774 NO ARENA RESERVED"), which cost FEX its private band
+     * and produced 683 failed 64KB RWX CodeBuffer allocations. The arena is
+     * small and must win; the holdback takes what is left. */
+    {
+        extern void ios_jumbo_holdback_init( void );
+        ios_jumbo_holdback_init();
+    }
 
     WINE_IOS_LOG("load_ntdll...");
     load_ntdll();

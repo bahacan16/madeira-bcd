@@ -1973,6 +1973,15 @@ static void init_peb( RTL_USER_PROCESS_PARAMETERS *params, void *module )
     dprintf(2, "[init-peb] thread_peb=%p global_peb=%p params=%p module=%p%s\n",
             (void *)peb, (void *)global_peb_snapshot, (void *)params, module,
             peb == global_peb_snapshot ? "" : "  <-- MISMATCH (raced child; old code dropped params)");
+    /* ml983: bind the fixed-base executable window's occupant to this
+     * pseudo-process. This is the first point where the owning PEB and the main
+     * module base are both known -- the image is mapped before the PEB is
+     * published, so the mapping thread cannot name its owner. No-op unless
+     * `module` is the image that actually claimed the window. */
+    {
+        extern void ios_exe_win_note_owner( void *module, void *owner_peb );
+        ios_exe_win_note_owner( module, peb );
+    }
     peb->ImageBaseAddress           = module;
     peb->ProcessParameters          = params;
     peb->OSMajorVersion             = 10;

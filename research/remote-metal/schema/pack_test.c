@@ -89,11 +89,16 @@ int main(void) {
           "large ring terminates (cycle or cap)");
 
     /* unsupported opcode is NAMED */
+    /* A value the packer CANNOT know, rather than a real opcode that merely is
+     * not implemented yet. Naming a real one made this test fail the moment
+     * that opcode was implemented, which says nothing about the behaviour under
+     * test: that an UNKNOWN opcode is refused and named. */
+    enum { WMT_OPCODE_THAT_CANNOT_EXIST = 0xBEEF };
     static struct node uns; memset(&uns, 0, sizeof uns);
-    uns.n.type = WMTRenderCommandDrawMeshThreadgroups;
+    uns.n.type = (enum WMTRenderCommandType)WMT_OPCODE_THAT_CANNOT_EXIST;
     st = run((struct wmtcmd_base *)&uns, &r);
     CHECK(st == WMTW_PACK_UNSUPPORTED_OP, "unsupported opcode rejected");
-    CHECK(r.opcode == WMTRenderCommandDrawMeshThreadgroups, "failure names the opcode");
+    CHECK(r.opcode == WMT_OPCODE_THAT_CANNOT_EXIST, "failure names the opcode");
     CHECK(r.record_index == 0, "failure names the record index");
 
     /* --- packed output must satisfy the PRODUCTION validator --- */

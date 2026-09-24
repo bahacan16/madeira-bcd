@@ -8,11 +8,11 @@
 #include <stdint.h>
 #include <string.h>
 
-#define WMTW_VERSION 1
+#define WMTW_VERSION 2
 
-#define WMTW_MAX_BATCH_BYTES 1048576u
-#define WMTW_MAX_RECORDS 4096u
-#define WMTW_MAX_SIDECAR_BYTES 65536u
+#define WMTW_MAX_BATCH_BYTES 8388608u
+#define WMTW_MAX_RECORDS 65536u
+#define WMTW_MAX_SIDECAR_BYTES 1048576u
 #define WMTW_MAX_ARRAY_COUNT 256u
 
 /* Static assertions fire at compile time on BOTH sides, so a layout change
@@ -29,7 +29,6 @@ enum wmtw_op {
     WMTW_OP_UseResource                  = 1,
     WMTW_OP_SetVertexBuffer              = 2,
     WMTW_OP_SetVertexBufferOffset        = 3,
-    WMTW_OP_SetFragmentBufferOffset      = 21,
     WMTW_OP_SetFragmentBuffer            = 4,
     WMTW_OP_SetFragmentTexture           = 10,
     WMTW_OP_SetFragmentBytes             = 11,
@@ -41,11 +40,22 @@ enum wmtw_op {
     WMTW_OP_SetBlendFactorAndStencilRef  = 17,
     WMTW_OP_Draw                         = 19,
     WMTW_OP_DrawIndexed                  = 20,
+    WMTW_OP_SetFragmentBufferOffset      = 21,
+    WMTW_OP_SetObjectBufferOffset        = 22,
+    WMTW_OP_SetVisibilityMode            = 23,
+    WMTW_OP_DrawIndexedIndirect          = 24,
+    WMTW_OP_SetMeshBuffer                = 25,
+    WMTW_OP_SetMeshBufferOffset          = 26,
+    WMTW_OP_SetObjectBuffer              = 27,
+    WMTW_OP_DrawMeshThreadgroups         = 28,
+    WMTW_OP_DrawMeshThreadgroupsIndirect = 29,
+    WMTW_OP_MemoryBarrier                = 30,
+    WMTW_OP_DrawIndirect                 = 31,
     /* one past the highest opcode -- NOT the number of record types,
        since opcodes are sparse (winemetal's numbering is preserved) */
     WMTW_OP__MAX
 };
-#define WMTW_OP_COUNT 15   /* record types actually implemented */
+#define WMTW_OP_COUNT 26   /* record types actually implemented */
 
 /* Every record starts with this. `size` covers the header and body but NOT
  * sidecar data, which lives in a separate region addressed by offset -- so a
@@ -95,13 +105,6 @@ struct wmtw_setvertexbufferoffset {
     uint64_t  index;
 };
 WMTW_ASSERT(sizeof(struct wmtw_setvertexbufferoffset) == 24, "wmtw_setvertexbufferoffset layout changed on one side only");
-
-struct wmtw_setfragmentbufferoffset {
-    struct wmtw_hdr h;
-    uint64_t  offset;
-    uint64_t  index;
-};
-WMTW_ASSERT(sizeof(struct wmtw_setfragmentbufferoffset) == 24, "wmtw_setfragmentbufferoffset layout changed on one side only");
 
 struct wmtw_setfragmentbuffer {
     struct wmtw_hdr h;
@@ -200,5 +203,107 @@ struct wmtw_drawindexed {
     uint64_t  base_instance;
 };
 WMTW_ASSERT(sizeof(struct wmtw_drawindexed) == 72, "wmtw_drawindexed layout changed on one side only");
+
+struct wmtw_setfragmentbufferoffset {
+    struct wmtw_hdr h;
+    uint64_t  offset;
+    uint64_t  index;
+};
+WMTW_ASSERT(sizeof(struct wmtw_setfragmentbufferoffset) == 24, "wmtw_setfragmentbufferoffset layout changed on one side only");
+
+struct wmtw_setobjectbufferoffset {
+    struct wmtw_hdr h;
+    uint64_t  offset;
+    uint64_t  index;
+};
+WMTW_ASSERT(sizeof(struct wmtw_setobjectbufferoffset) == 24, "wmtw_setobjectbufferoffset layout changed on one side only");
+
+struct wmtw_setvisibilitymode {
+    struct wmtw_hdr h;
+    uint64_t  offset;
+    uint32_t  mode;
+    uint32_t  pad;
+};
+WMTW_ASSERT(sizeof(struct wmtw_setvisibilitymode) == 24, "wmtw_setvisibilitymode layout changed on one side only");
+
+struct wmtw_drawindexedindirect {
+    struct wmtw_hdr h;
+    uint64_t  index_buffer;
+    uint64_t  index_buffer_offset;
+    uint64_t  indirect_args_buffer;
+    uint64_t  indirect_args_offset;
+    uint32_t  primitive_type;
+    uint32_t  index_type;
+};
+WMTW_ASSERT(sizeof(struct wmtw_drawindexedindirect) == 48, "wmtw_drawindexedindirect layout changed on one side only");
+
+struct wmtw_setmeshbuffer {
+    struct wmtw_hdr h;
+    uint64_t  buffer;
+    uint64_t  offset;
+    uint64_t  index;
+};
+WMTW_ASSERT(sizeof(struct wmtw_setmeshbuffer) == 32, "wmtw_setmeshbuffer layout changed on one side only");
+
+struct wmtw_setmeshbufferoffset {
+    struct wmtw_hdr h;
+    uint64_t  offset;
+    uint64_t  index;
+};
+WMTW_ASSERT(sizeof(struct wmtw_setmeshbufferoffset) == 24, "wmtw_setmeshbufferoffset layout changed on one side only");
+
+struct wmtw_setobjectbuffer {
+    struct wmtw_hdr h;
+    uint64_t  buffer;
+    uint64_t  offset;
+    uint64_t  index;
+};
+WMTW_ASSERT(sizeof(struct wmtw_setobjectbuffer) == 32, "wmtw_setobjectbuffer layout changed on one side only");
+
+struct wmtw_drawmeshthreadgroups {
+    struct wmtw_hdr h;
+    uint32_t  grid_w;
+    uint32_t  grid_h;
+    uint32_t  grid_d;
+    uint32_t  obj_w;
+    uint32_t  obj_h;
+    uint32_t  obj_d;
+    uint32_t  mesh_w;
+    uint32_t  mesh_h;
+    uint32_t  mesh_d;
+    uint32_t  pad;
+};
+WMTW_ASSERT(sizeof(struct wmtw_drawmeshthreadgroups) == 48, "wmtw_drawmeshthreadgroups layout changed on one side only");
+
+struct wmtw_drawmeshthreadgroupsindirect {
+    struct wmtw_hdr h;
+    uint64_t  indirect_buffer;
+    uint64_t  indirect_offset;
+    uint32_t  obj_w;
+    uint32_t  obj_h;
+    uint32_t  obj_d;
+    uint32_t  mesh_w;
+    uint32_t  mesh_h;
+    uint32_t  mesh_d;
+};
+WMTW_ASSERT(sizeof(struct wmtw_drawmeshthreadgroupsindirect) == 48, "wmtw_drawmeshthreadgroupsindirect layout changed on one side only");
+
+struct wmtw_memorybarrier {
+    struct wmtw_hdr h;
+    uint32_t  scope;
+    uint32_t  stages_after;
+    uint32_t  stages_before;
+    uint32_t  pad0;
+};
+WMTW_ASSERT(sizeof(struct wmtw_memorybarrier) == 24, "wmtw_memorybarrier layout changed on one side only");
+
+struct wmtw_drawindirect {
+    struct wmtw_hdr h;
+    uint64_t  indirect_buffer;
+    uint64_t  indirect_offset;
+    uint32_t  primitive;
+    uint32_t  pad0;
+};
+WMTW_ASSERT(sizeof(struct wmtw_drawindirect) == 32, "wmtw_drawindirect layout changed on one side only");
 
 #endif

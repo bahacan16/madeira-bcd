@@ -95,4 +95,14 @@ void jit_set_log_callback(jit_log_callback_t callback);
 }
 #endif
 
+
+/* ml1040: address space claimed by a constructor at image load, before the app's
+ * own runtime allocations can fragment the scarce low gap. See JITAllocator.m. */
+extern unsigned long madeira_early_window_base;   /* 0x140000000 if held, else 0 */
+extern unsigned long madeira_early_window_size;
+extern unsigned long madeira_early_pool_base;     /* placeholder directly above the window, else 0 */
+extern unsigned long madeira_early_intruder_base, madeira_early_intruder_size;   /* ml1135: first mapping above the window when no placeholder fit */
+extern unsigned madeira_early_intruder_tag, madeira_early_intruder_prot;
+extern unsigned long madeira_early_pool_size;
+
 #endif // JIT_ALLOCATOR_H

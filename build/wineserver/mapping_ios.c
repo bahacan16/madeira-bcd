@@ -50,6 +50,11 @@ extern void ws_log(const char *fmt, ...);
 #include "request.h"
 #include "security.h"
 
+/* ml936: iOS reserves the low 4GB of every task; no PE can be mapped below it.
+ * Measured four ways -- see reference_ios_va_budget and the ml938 block in
+ * signal_arm64_ios.c. */
+#define PE_LOW_BASE_FLOOR 0x100000000ull
+
 /* list of memory ranges, used to store committed info */
 struct ranges
 {
@@ -813,6 +818,7 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
     } cfg;
     off_t pos;
     int size, has_relocs;
+    int reloc_dir = 0;   /* ml936: directory PRESENCE alone, ignoring RELOCS_STRIPPED */
     size_t mz_size, clr_va = 0, clr_size = 0, exp_va, exp_size, cfg_va, cfg_size, align_mask;
     unsigned int i, ret;
 
@@ -880,10 +886,10 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
         mapping->image.header_size     = nt.opt.hdr32.SizeOfHeaders;
         mapping->image.checksum        = nt.opt.hdr32.CheckSum;
 
-        has_relocs = (nt.opt.hdr32.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
+        reloc_dir  = (nt.opt.hdr32.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
                       nt.opt.hdr32.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress &&
-                      nt.opt.hdr32.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size &&
-                      !(nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED));
+                      nt.opt.hdr32.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size);
+        has_relocs = (reloc_dir && !(nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED));
         break;
 
     case IMAGE_NT_OPTIONAL_HDR64_MAGIC:
@@ -928,10 +934,10 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
         mapping->image.header_size     = nt.opt.hdr64.SizeOfHeaders;
         mapping->image.checksum        = nt.opt.hdr64.CheckSum;
 
-        has_relocs = (nt.opt.hdr64.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
+        reloc_dir  = (nt.opt.hdr64.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
                       nt.opt.hdr64.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress &&
-                      nt.opt.hdr64.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size &&
-                      !(nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED));
+                      nt.opt.hdr64.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size);
+        has_relocs = (reloc_dir && !(nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED));
         break;
 
     default:
@@ -959,6 +965,26 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
     else if ((mapping->image.dll_charact & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) &&
              (has_relocs || mapping->image.contains_code) && !(clr_va && clr_size))
         mapping->image.image_flags |= IMAGE_FLAGS_ImageDynamicallyRelocated;
+    /* ml936: an image whose preferred base is below PE_LOW_BASE_FLOOR can never
+     * be mapped there -- for it the choice is not "preferred base or relocated",
+     * it is "relocated or cannot load at all". Gate on reloc_dir, NOT has_relocs:
+     * RELOCS_STRIPPED images are exactly the interesting case, and moving one
+     * leaves its uncovered absolute addresses pointing at the preferred base.
+     * That is deliberate and it is SAFE, because ml938 registers the vacated
+     * range as a sub-floor window and services accesses to it against this
+     * mapping -- fixups that were applied resolve high, the rest resolve through
+     * the window, and both reach the same bytes. Without ml938 this branch
+     * would be producing a half-relocated image; with it, the image is whole. */
+    else if (reloc_dir && mapping->image.base && mapping->image.base < PE_LOW_BASE_FLOOR)
+    {
+        fprintf( stderr, "ml936: image base %#llx below the %#llx floor, unmappable here; "
+                 "relocating anyway (dynamic_base=%d relocs_stripped=%d) -- ml938 will "
+                 "service the vacated range\n",
+                 (unsigned long long)mapping->image.base, (unsigned long long)PE_LOW_BASE_FLOOR,
+                 !!(mapping->image.dll_charact & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE),
+                 !!(nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) );
+        mapping->image.image_flags |= IMAGE_FLAGS_ImageDynamicallyRelocated;
+    }
 
     align_mask = max( mapping->image.alignment - 1, page_mask );
     mapping->image.map_size = round_size( mapping->image.map_size, align_mask );

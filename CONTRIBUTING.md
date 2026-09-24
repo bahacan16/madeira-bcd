@@ -14,3 +14,13 @@ Do not remove or alter upstream copyright or licence notices in any of them.
 Changes intended for an upstream project should be sent to that project against
 its own tree, under its own licence. Note that FEX-Emu's contribution policy
 prohibits AI-generated code; see the note in `README.md`.
+
+## Additional permission for Apple's Metal Shader Converter
+
+Madeira links with Apple's proprietary Metal Shader Converter library and
+Apple system frameworks. Contributions to this repository are accepted under
+GPL-3.0-or-later **with the Madeira Converter Exception, version 1** (the
+additional permission in `LICENSE-EXCEPTION.md`, prepared 2026-09-16 and
+adopted on 2026-09-24, before any public push), so that the combination
+can be conveyed. By submitting a contribution you
+agree that your contribution carries that additional permission too.

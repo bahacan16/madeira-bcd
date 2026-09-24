@@ -56,6 +56,16 @@ static inline uint32_t wmtw_min_size(uint16_t op) {
     case WMTW_OP_SetVertexBuffer:            return sizeof(struct wmtw_setvertexbuffer);
     case WMTW_OP_SetVertexBufferOffset:      return sizeof(struct wmtw_setvertexbufferoffset);
     case WMTW_OP_SetFragmentBufferOffset:    return sizeof(struct wmtw_setfragmentbufferoffset);
+    case WMTW_OP_SetObjectBufferOffset:      return sizeof(struct wmtw_setobjectbufferoffset);
+    case WMTW_OP_SetMeshBuffer:              return sizeof(struct wmtw_setmeshbuffer);
+    case WMTW_OP_SetMeshBufferOffset:        return sizeof(struct wmtw_setmeshbufferoffset);
+    case WMTW_OP_SetObjectBuffer:            return sizeof(struct wmtw_setobjectbuffer);
+    case WMTW_OP_DrawMeshThreadgroups:       return sizeof(struct wmtw_drawmeshthreadgroups);
+    case WMTW_OP_SetVisibilityMode:          return sizeof(struct wmtw_setvisibilitymode);
+    case WMTW_OP_DrawIndexedIndirect:        return sizeof(struct wmtw_drawindexedindirect);
+    case WMTW_OP_DrawMeshThreadgroupsIndirect: return sizeof(struct wmtw_drawmeshthreadgroupsindirect);
+    case WMTW_OP_MemoryBarrier:              return sizeof(struct wmtw_memorybarrier);
+    case WMTW_OP_DrawIndirect:               return sizeof(struct wmtw_drawindirect);
     case WMTW_OP_SetFragmentBuffer:          return sizeof(struct wmtw_setfragmentbuffer);
     case WMTW_OP_SetFragmentTexture:         return sizeof(struct wmtw_setfragmenttexture);
     case WMTW_OP_SetFragmentBytes:           return sizeof(struct wmtw_setfragmentbytes);

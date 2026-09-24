@@ -952,11 +952,58 @@ void winios_dump_srcbits(const void *bits, int w, int h, int stride) {
 }
 
 /* Called from winios_surface_flush (wine thread) with the surface's
- * whole DIB. Copy immediately — `bits` is only valid for this call. */
-void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
-                            int sw, int sh, int stride, const void *bits) {
-    if (sw <= 0 || sh <= 0 || !bits) return;
-    NSData *data = [NSData dataWithBytes:bits length:(size_t)stride * sh];
+ * whole DIB. Copy immediately — `bits` is only valid for this call.
+ *
+ * ml1028: returns 0 if the snapshot could not be allocated, 1 otherwise.
+ *
+ * This used to be void and took its copy with [NSData dataWithBytes:], whose
+ * allocator is NSAllocateMemoryPages -- which THROWS on failure and cannot
+ * return nil. rdr95 and rdr98 both died here, identically:
+ *
+ *   [surf-flush] #48 hwnd=0x80054 rect={0,0,1024,640} dirty={0,0,968,572}
+ *   *** Terminating app due to uncaught exception 'NSInvalidArgumentException',
+ *       reason: '*** NSAllocateMemoryPages(2621440) failed'
+ *
+ * 1024 * 640 * 4 = 2,621,440 exactly. The uncaught ObjC exception killed the
+ * pseudo-process, whose teardown took down the PROCESS-WIDE remote-Metal
+ * socket, after which the render thread spun in _MTLCommandBuffer_commit
+ * forever -- a 2.5MB copy failing turned into a whole-app hang.
+ *
+ * Note what it is NOT: the census at that moment reports free=609 MB with a
+ * 366 MB largest hole, so this is not an exhausted map. (The "NO GAP FITS"
+ * verdict elsewhere in the log belongs to a different, 8960 MB request.) It is
+ * a 2.5MB allocation failing through one specific allocator.
+ *
+ * So: allocate the snapshot with a CHECKED allocator, hand ownership to NSData
+ * with freeWhenDone (CGDataProviderCreateWithCFData retains the CFData, so the
+ * bytes outlive this call for as long as any consumer holds the image), and on
+ * failure report it. Wine's dce.c only calls reset_bounds() when flush returns
+ * TRUE, so returning 0 PRESERVES the dirty region and the frame is repainted
+ * later -- no lost damage, and nothing dies.
+ *
+ * WARNING: the snapshot must OWN its bytes. Wrapping `bits` with no-copy would
+ * be cheaper and wrong: it is only valid for the duration of this call. */
+int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
+                           int sw, int sh, int stride, const void *bits) {
+    if (sw <= 0 || sh <= 0 || !bits) return 1;   /* nothing to paint */
+    size_t snap_len = (size_t)stride * (size_t)sh;
+    void *snap = malloc(snap_len);
+    if (!snap) {
+        static unsigned nfail;
+        unsigned n = ++nfail;
+        if (n <= 16 || (n % 256) == 0)
+            dprintf(STDERR_FILENO,
+                    "[surf-snap] ml1028 #%u ALLOC FAILED %zu bytes (%dx%d stride=%d "
+                    "hwnd=%p) -- returning failure so Wine KEEPS the dirty bounds and "
+                    "repaints; this used to throw and kill the pseudo-process\n",
+                    n, snap_len, sw, sh, stride, hwnd);
+        return 0;
+    }
+    memcpy(snap, bits, snap_len);
+    /* freeWhenDone:YES => NSData calls free() on `snap`, which is what malloc
+     * wants. Ownership now belongs to `data` and, through it, to every CGImage
+     * CoreGraphics builds from it. */
+    NSData *data = [NSData dataWithBytesNoCopy:snap length:snap_len freeWhenDone:YES];
     static int dumpSurf = -1;
     if (dumpSurf < 0) dumpSurf = getenv("MADEIRA_DUMP_SURFACES") != NULL;
     /* ml537: complete an armed src/surface pair with the FIRST present after the
@@ -1153,6 +1200,11 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
     }
     dispatch_async(dispatch_get_main_queue(), ^{
         winios_ensure_compositor();
+        /* ml1028: this block is dispatch_block_t (void). The snapshot copy has
+         * already SUCCEEDED by the time we get here, so the function's own
+         * result stays 1 -- only the presentation is skipped. `data` is captured
+         * and released with the block, which is exactly why the snapshot has to
+         * own its bytes: this runs AFTER winios_surface_present has returned. */
         if (!g_compositor_view) return;
         CALayer *l = winios_layer_for(hwnd, true);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -1176,6 +1228,7 @@ void winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
         CGDataProviderRelease(dp);
         CGColorSpaceRelease(cs);
     });
+    return 1;
 }
 
 /* ============================================================ *

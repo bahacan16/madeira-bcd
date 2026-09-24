@@ -1,0 +1,39 @@
+Madeira third-party notices (shipped in every built package)
+
+Madeira itself: GPL-3.0-or-later (LICENSE-MADEIRA-GPL-3.0.txt) with the
+Madeira Converter Exception, version 1 (LICENSE-MADEIRA-EXCEPTION.txt),
+which is a DRAFT and not in effect until adopted in a tagged release.
+
+Statically linked into the application binary:
+- Wine (fork branch madeira-lgpl, from upstream wine-11.4): LGPL-2.1-or-later
+  (LGPL-2.1.txt). Madeira's modifications: LGPL-2.1-or-later, (C) 2026 Will
+  Faust. Source: the wine submodule of the Madeira repository.
+- FEX-Emu (fork): MIT (FEX-MIT.txt); Madeira's modifications GPL-3.0-or-later
+  with the exception. rpmalloc (fork): 0BSD (rpmalloc-0BSD.txt); Madeira's
+  modifications GPL-3.0-or-later with the exception.
+- DXMT (fork): MIT (DXMT-MIT.txt); Madeira's modifications GPL-3.0-or-later
+  with the exception. Bundled LLVM: Apache-2.0 with LLVM exception
+  (LLVM-Apache-2.0-with-exception.txt).
+- GnuTLS 3.8.9: LGPL-2.1-or-later (LGPL-2.1.txt).
+- Nettle 3.10.1 and Hogweed 3.10.1: dual-licensed LGPL-3.0-or-later /
+  GPL-2.0-or-later; Madeira elects LGPL-3.0-or-later (LGPL-3.0.txt).
+- GMP 6.3.0: dual-licensed LGPL-3.0-or-later / GPL-2.0-or-later; Madeira
+  elects LGPL-3.0-or-later (LGPL-3.0.txt).
+  Source tarballs and SHA-256 sums for GnuTLS, Nettle and GMP: the Madeira
+  repository, build/gnutls-ios/src, built by build/gnutls-ios/build.sh.
+
+Dynamically loaded at runtime:
+- Apple Metal Shader Converter dynamic library: Apple proprietary, under the
+  agreement in d3d12/METAL-SHADER-CONVERTER-AGREEMENT.txt (section 2.B:
+  distribution solely for shader conversion). Its headers: Apache-2.0
+  (d3d12/LICENSE-metal-shader-converter-headers.txt).
+
+LGPL notice: this application uses the LGPL-licensed libraries above. Their
+complete corresponding source, and the application's own source and build
+scripts, are in the Madeira repository. The procedure for rebuilding the
+application against modified versions of those libraries is documented in
+docs/BUILDING.md in that repository, together with the inputs it needs that
+the repository does not contain and the verification status of each step;
+as of 2026-09-16 that end-to-end rebuild has not been demonstrated from a
+clean checkout. Reverse engineering the combined work for debugging such
+modifications is permitted.

@@ -1111,20 +1111,16 @@ struct ContentView: View {
         .transition(.opacity)
     }
 
+    /// ml896: NOT a Button. A Button's press highlight is an implicit animation,
+    /// and SwiftUI renders animations on its AsyncRenderer thread, which needs a
+    /// CAPresentationModifierGroup, whose shared memory comes from a tagged
+    /// purgable vm_allocate that fails once a game is running (three crash
+    /// reports, all in commitAsyncValues force-unwrapping that nil). HoldKeyView
+    /// changes only a colour with no animation, so it stays on the main-thread
+    /// render path the rest of this UI already uses for minutes without harm.
+    /// Down at touch, up at lift, which is also the correct key semantics.
     private func keyButton(_ label: String, vk: Int32) -> some View {
-        Button(action: {
-            winios_post_key(vk, 1)
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.06) {
-                winios_post_key(vk, 0)
-            }
-        }) {
-            Text(label)
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white)
-                .frame(minWidth: 34, minHeight: 30)
-                .background(Color.white.opacity(0.15))
-                .cornerRadius(6)
-        }
+        HoldKeyView(label: label, vk: vk)
     }
 
     private func entitlementBadges(_ ents: EntitlementStatus) -> some View {
@@ -1498,7 +1494,13 @@ struct ContentView: View {
                     // Known risk: if shellwindows_init beats services.exe's
                     // RPC_Init, OpenSCManager fails → watch whether that
                     // fails fast or hits the RaiseException→CS wedge again.
-                    let (deskW, deskH) = Self.desktopSize(desktopRes)
+                    // ml1127: `desktop-size = WxH` in madeira.cfg wins; otherwise the
+                    // size picked beside this button (960x540 by default).
+                    var (deskW, deskH) = Self.desktopSize(desktopRes)
+                    if let txt = MadeiraConfig.get("desktop-size") {
+                        let p = txt.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                        if p.count == 2, p[0] >= 640, p[1] >= 360, p[0] <= 3840, p[1] <= 2160 { deskW = p[0]; deskH = p[1] }
+                    }
                     setenv("MADEIRA_EXE", "explorer.exe", 1)
                     setenv("MADEIRA_ARGS",
                            "/desktop=shell,\(deskW)x\(deskH) C:\\windows\\system32\\services.exe", 1)
@@ -1542,8 +1544,7 @@ struct ContentView: View {
                     setenv("MADEIRA_EXE",
                            "C:\\Program Files\\Stray\\Hk_project\\Binaries\\Win64\\Stray-Win64-Shipping.exe", 1)
                     var args = "Hk_project -dx11 -windowed"
-                    if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-                       let txt = try? String(contentsOf: d.appendingPathComponent("madeira-args.txt"), encoding: .utf8) {
+                    if let txt = MadeiraConfig.get("args") {
                         let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !v.isEmpty { args = v }
                     }
@@ -1554,6 +1555,36 @@ struct ContentView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
+
+                // Valley of the Ancient (UE5). Like Stray, the LAUNCHER builds its
+                // own child command line and passes only the project name, so any
+                // flag we want has to go on the shipping binary directly. Measured
+                // from a real run: AncientGame.exe spawns
+                //   AncientGame-Win64-Shipping.exe ValleyoftheAncient
+                // and nothing else, which is why the launcher is skipped here.
+                //
+                // Flags come from Documents/madeira-valley-args.txt so a UE switch
+                // can be tried without rebuilding and reinstalling. The default
+                // carries -ansimalloc because the first two runs both died with
+                //   FMallocBinned2 Attempt to free an unrecognized block 885560000
+                // at the same address, before any RHI work. Selecting a different
+                // allocator says whether that is Binned2's own bookkeeping or a
+                // genuine bad free; delete the flag to reproduce the fatal.
+                Button("Valley of the Ancient (UE5)") {
+                    setenv("MADEIRA_EXE",
+                           "C:\\Program Files\\Valley of the Ancient - DX12\\ValleyoftheAncient\\Binaries\\Win64\\AncientGame-Win64-Shipping.exe", 1)
+                    var args = "ValleyoftheAncient -windowed -ansimalloc"
+                    if let txt = MadeiraConfig.get("valley-args") {
+                        let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !v.isEmpty { args = v }
+                    }
+                    setenv("MADEIRA_ARGS", args, 1)
+                    unsetenv("MADEIRA_DESKTOP")
+                    logStore.log("Valley: args = \(args)")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.mint)
 
                 Button("Thumper (standalone)") {
                     // Game lives at Documents/wine/drive_c/Program Files/Thumper/
@@ -1620,6 +1651,33 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.purple)
 
+                // madeira-d3d12 M2: an x86-64 guest driving the ARM64EC D3D12
+                // runtime. Creates device/queue/allocator/list/fence, records
+                // and closes an empty list, executes it, signals a fence and
+                // wakes an event waiter, plus the refusal cases. Prints a build
+                // marker naming which architecture it actually reached, which
+                // states the loader question as evidence rather than assumption.
+                // The visible one: an x86-64 Windows program drawing a rotating
+                // cube through our D3D12 interfaces and presenting into the
+                // host window. Shaders are still matched fixtures rather than
+                // runtime-converted DXIL, which the window title states.
+                Button("D3D12 cube") {
+                    setenv("MADEIRA_EXE", "d3d12-cube-x64.exe", 1)
+                    unsetenv("MADEIRA_ARGS")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.indigo)
+
+                Button("D3D12 M2 ABI") {
+                    setenv("MADEIRA_EXE", "d3d12-m2-x64.exe", 1)
+                    unsetenv("MADEIRA_ARGS")
+                    unsetenv("MADEIRA_DESKTOP")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
                 // ml731c: one-second check of the Windows clock contract
                 // (GetTickCount64 / system time / unbiased interrupt time /
                 // QueryPerformanceCounter). Verifying this by hand previously
@@ -1629,6 +1687,19 @@ struct ContentView: View {
                 // itself: QPC passing alone is the shared-page signature.
                 Button("x64 clock test") {
                     setenv("MADEIRA_EXE", "clocktest-x64.exe", 1)
+                    unsetenv("MADEIRA_ARGS")
+                    unsetenv("MADEIRA_DESKTOP")
+                    runWineFullSequence()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.teal)
+
+                // ml1131: per-call cost of the imports the game's critical threads
+                // live in (GetLastError, QPC, SetEvent, critical sections, heap,
+                // event ping-pong, contended sections). Results in the log and in
+                // C:\calltest.txt.
+                Button("x64 call cost") {
+                    setenv("MADEIRA_EXE", "calltest-x64.exe", 1)
                     unsetenv("MADEIRA_ARGS")
                     unsetenv("MADEIRA_DESKTOP")
                     runWineFullSequence()
@@ -1930,6 +2001,15 @@ struct ContentView: View {
             return
         }
         Self.wineSequenceStarted = true
+        /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
+        MadeiraConfig.migrateLegacy { self.logStore.log($0) }
+        MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
+        if MadeiraConfig.present {
+            let cfg = MadeiraConfig.all().sorted { $0.key < $1.key }
+            logStore.log("madeira.cfg: " + (cfg.isEmpty ? "(empty)" : cfg.map { "\($0.key)=\($0.value)" }.joined(separator: " ")))
+        } else {
+            logStore.log("madeira.cfg absent: legacy madeira-*.txt files apply")
+        }
 
         logStore.log("Running full Wine sequence...")
 
@@ -2039,23 +2119,21 @@ struct ContentView: View {
             // the file reverts to the proven default. Clamped to sane values --
             // a typo here would otherwise move the VA floor with it.
             var poolSizeMB = 896
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-pool.txt"), encoding: .utf8),
+            if let txt = MadeiraConfig.get("pool"),
                let mb = Int(txt.trimmingCharacters(in: .whitespacesAndNewlines)),
                mb >= 256, mb <= 1152 {
                 poolSizeMB = mb
-                logStore.log("JIT pool overridden to \(mb)MB via madeira-pool.txt")
+                logStore.log("JIT pool overridden to \(mb)MB via madeira.cfg pool")
             }
             // ml694: W^X A/B switch. Documents/madeira-wx.txt containing "0"
             // disables page demotion for the SAME binary, so the on/off
             // comparison needs one rebuild, not two. The previous gate read
             // container paths that can never exist, so it silently forced
             // ENABLED and no A/B was actually possible.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-wx.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("wx") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("MADEIRA_WX", v, 1)
-                logStore.log("W^X override: MADEIRA_WX=\(v) via madeira-wx.txt")
+                logStore.log("W^X override: MADEIRA_WX=\(v) via madeira.cfg wx")
             }
 
             // ml727: wine-mono backpatcher bridge A/B. Documents/madeira-mono-bridge.txt
@@ -2067,12 +2145,11 @@ struct ContentView: View {
             // Worth arming here: the dominant fault site emits SWPAL, which is exactly
             // what FEX generates for a guest XCHG, and the patching XCHGs sit inside
             // libmono -- so the bridge's "RIP must lie inside Mono" test should pass.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-mono-bridge.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("mono-bridge") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_WINEMONO_BRIDGE", v, 1)
-                    logStore.log("Mono bridge: MADEIRA_WINEMONO_BRIDGE=\(v) via madeira-mono-bridge.txt")
+                    logStore.log("Mono bridge: MADEIRA_WINEMONO_BRIDGE=\(v) via madeira.cfg mono-bridge")
                 }
             }
 
@@ -2081,12 +2158,11 @@ struct ContentView: View {
             // using its saved Wine syscall frame (TEB+0x378) instead of the Mach-O
             // registers it happens to be executing. Off by default; native code reads
             // only the environment variable.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-ctx-frame.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("ctx-frame") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_CTX_FRAME", v, 1)
-                    logStore.log("Context source: MADEIRA_CTX_FRAME=\(v) via madeira-ctx-frame.txt")
+                    logStore.log("Context source: MADEIRA_CTX_FRAME=\(v) via madeira.cfg ctx-frame")
                 }
             }
 
@@ -2096,12 +2172,11 @@ struct ContentView: View {
             // d3d11.mipClampBC=N is the one that matters for memory: this GPU cannot
             // sample BC, so those textures are expanded to uncompressed and cost 2-8x
             // their shipped size.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-dxmt.txt"), encoding: .utf8) {
-                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let txt = MadeiraConfig.get("dxmt") {
+                let v = txt.replacingOccurrences(of: ";", with: "\n").trimmingCharacters(in: .whitespacesAndNewlines)   /* ml1095: "a=b;c=d" on one line */
                 if !v.isEmpty {
                     setenv("DXMT_CONFIG", v, 1)
-                    logStore.log("DXMT config: \(v) via madeira-dxmt.txt")
+                    logStore.log("DXMT config: \(v) via madeira.cfg dxmt")
                 }
             }
 
@@ -2113,12 +2188,11 @@ struct ContentView: View {
             // leaves VideoContext. File EOF is not decoder EOS, and a call
             // count cannot tell "tf_eos returns false forever" from "it returns
             // true and the managed side ignores it". Only the return value can.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-tf-trace.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("tf-trace") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_TF_TRACE", v, 1)
-                    logStore.log("Theorafile tracer: MADEIRA_TF_TRACE=\(v) via madeira-tf-trace.txt")
+                    logStore.log("Theorafile tracer: MADEIRA_TF_TRACE=\(v) via madeira.cfg tf-trace")
                 }
             }
 
@@ -2129,12 +2203,11 @@ struct ContentView: View {
             // every time-gated transition in a managed game waits forever while the
             // renderer keeps drawing. Opt-in only because the old code claimed the
             // write faulted; this should become unconditional once proven.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-usd-time.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("usd-time") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_USD_TIME", v, 1)
-                    logStore.log("Shared-data clock: MADEIRA_USD_TIME=\(v) via madeira-usd-time.txt")
+                    logStore.log("Shared-data clock: MADEIRA_USD_TIME=\(v) via madeira.cfg usd-time")
                 }
             }
 
@@ -2148,12 +2221,11 @@ struct ContentView: View {
             // freezing a thread that holds the malloc lock or FEX's CodeInvalidationMutex
             // can deadlock whoever suspended it. Windows apps tolerate preemptive suspend
             // because the suspender does not share their heap; here it does.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-real-suspend.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("real-suspend") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MADEIRA_REAL_SUSPEND", v, 1)
-                    logStore.log("Thread suspension: MADEIRA_REAL_SUSPEND=\(v) via madeira-real-suspend.txt")
+                    logStore.log("Thread suspension: MADEIRA_REAL_SUSPEND=\(v) via madeira.cfg real-suspend")
                 }
             }
 
@@ -2170,12 +2242,11 @@ struct ContentView: View {
             // mid-JIT-block, and that path has never been exercised under FEX. It may
             // trade a deadlock for a worse failure. If it does get in-game, that is NOT
             // evidence for any particular theory of the deadlock.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-mono-suspend.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("mono-suspend") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !v.isEmpty {
                     setenv("MONO_THREADS_SUSPEND", v, 1)
-                    logStore.log("Mono suspend policy: MONO_THREADS_SUSPEND=\(v) via madeira-mono-suspend.txt")
+                    logStore.log("Mono suspend policy: MONO_THREADS_SUSPEND=\(v) via madeira.cfg mono-suspend")
                 }
             }
 
@@ -2187,23 +2258,92 @@ struct ContentView: View {
             winios_phase("pool-ready")
             logStore.log("BRK suspension lasted \(String(format: "%.2f", elapsed))s")
 
+            // Arena carver self-test. Documents/madeira-arena-test.txt holds
+            // "churn:N", "ramp:N" or "random:N". Deliberately a SEPARATE file
+            // from madeira-arena.txt: a test that only runs when the feature is
+            // enabled cannot be used to decide whether to enable it.
+            if let txt = MadeiraConfig.get("arena-test") {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    setenv("MADEIRA_ARENA_TEST", v, 1)
+                    logStore.log("arena carver self-test: \(v)", level: .success)
+                }
+            }
+
+            // ml787: deterministic call-ret allocation failure injection.
+            // Documents/madeira-fexfail.txt holds "reserve:N" or "commit:N".
+            // The containment path it exercises only occurs naturally when a
+            // title exhausts the emulator's address band, and only the reserve
+            // half occurs at all -- an untested cleanup path is an assumption,
+            // so this makes both reproducible on demand. Absent the file
+            // nothing is injected.
+            if let txt = MadeiraConfig.get("fexfail") {
+                let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !v.isEmpty {
+                    setenv("MADEIRA_FEX_FAIL_CALLRET", v, 1)
+                    logStore.log("call-ret failure injection: \(v) via madeira.cfg fexfail", level: .error)
+                }
+            }
+
             // ml762: remote Metal backend. Documents/madeira-remote.txt holds
             // "<host-ip> <token>" and routes winemetal to a Metal daemon on that
             // host instead of the local device. The mode is decided ONCE per
             // process: flipping it later would leave handles from two address
             // spaces alive at the same time, which is precisely what the handle
             // tag exists to make impossible.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-remote.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("remote") {
                 let parts = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                                 .split(separator: " ", maxSplits: 1).map(String.init)
                 if parts.count == 2 {
                     setenv("DXMT_REMOTE_METAL", parts[0], 1)
                     setenv("RMETAL_TOKEN", parts[1], 1)
-                    logStore.log("remote Metal: host=\(parts[0]) via madeira-remote.txt", level: .success)
+                    logStore.log("remote Metal: host=\(parts[0]) via madeira.cfg remote", level: .success)
                 } else if !parts.isEmpty {
-                    logStore.log("madeira-remote.txt needs '<host-ip> <token>'", level: .error)
+                    logStore.log("madeira.cfg remote needs '<host-ip> <token>'", level: .error)
                 }
+            }
+
+            // madeira-d3d12: M1 shader-converter gate, in-app.
+            // Documents/madeira-d3d12.txt == "1" runs the same canary that
+            // passes standalone on macOS and over SSH on this device, but from
+            // inside Madeira -- which is the only way to test bundling, signing
+            // and dlopen under the app's own sandbox. Results go to the log.
+            // Reports its decision either way. A gate that stays silent when it
+            // declines to run is indistinguishable from one that never executed,
+            // which cost a device run to work out.
+            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                let raw = MadeiraConfig.get("d3d12")   /* ml1095 */
+                let val = raw ?? ""
+                if val == "1" {
+                    let dir = Bundle.main.bundlePath + "/d3d12"
+                    let dylib = dir + "/libmetalirconverter.dylib"
+                    let haveDylib = FileManager.default.fileExists(atPath: dylib)
+                    let transcript = d.appendingPathComponent("madeira-d3d12-canary.log").path
+                    logStore.log("madeira-d3d12: running the M1 canary in-app (dylib present: \(haveDylib))", level: .info)
+                    let fails = madeira_d3d12_canary_run_log(
+                        dir, dylib, nil, transcript,
+                        (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String) ?? "?")
+                    if fails == 0 {
+                        logStore.log("madeira-d3d12: M1 canary PASSED in-app (transcript: madeira-d3d12-canary.log)", level: .success)
+                    } else {
+                        logStore.log("madeira-d3d12: M1 canary FAILED (\(fails) checks)", level: .error)
+                    }
+                } else {
+                    logStore.log("madeira-d3d12: gate off (madeira.cfg d3d12 \(raw == nil ? "unset" : "= '\(val)'"))", level: .debug)
+                }
+            }
+
+            // ml821: coalesced remote messages. Documents/madeira-remote-batch.txt
+            // == "1" makes the pre-submission flush send many buffer ranges per
+            // round trip and drains autorelease pools in one call. It is OPT-IN
+            // because the measurement it is meant to improve needs a matched
+            // baseline: with the file absent the process behaves exactly as
+            // ml820 did. Round-trip COUNT is the cost being attacked -- one
+            // gameplay frame spent 369 ms of 524 ms on 2,197 serialized calls.
+            if let txt = MadeiraConfig.get("remote-batch"),
+               txt.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
+                setenv("DXMT_REMOTE_BATCH", "1", 1)
+                logStore.log("remote Metal: message coalescing ON via madeira.cfg remote-batch", level: .success)
             }
 
             // ml761: top-level API census. Documents/madeira-apicensus.txt == "1"
@@ -2213,11 +2353,10 @@ struct ContentView: View {
             // batch carries GUEST handles -- raw pointer casts, meaningless on
             // another machine -- so every handle producer and consumer has to
             // be redirected together.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-apicensus.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("apicensus") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("DXMT_API_CENSUS", v, 1)
-                logStore.log("API census: DXMT_API_CENSUS=\(v) via madeira-apicensus.txt")
+                logStore.log("API census: DXMT_API_CENSUS=\(v) via madeira.cfg apicensus")
             }
 
             // ml760: shadow-pack mode. Documents/madeira-shadow.txt == "1" packs
@@ -2227,11 +2366,10 @@ struct ContentView: View {
             // check that matters is packed counts equalling census counts: a
             // silently skipped command would otherwise surface as a subtly wrong
             // frame on another machine.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-shadow.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("shadow") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("DXMT_SHADOW_PACK", v, 1)
-                logStore.log("shadow pack: DXMT_SHADOW_PACK=\(v) via madeira-shadow.txt")
+                logStore.log("shadow pack: DXMT_SHADOW_PACK=\(v) via madeira.cfg shadow")
             }
 
             // ml758: wmtcmd census. Documents/madeira-census.txt == "1" counts
@@ -2240,11 +2378,10 @@ struct ContentView: View {
             // before serialising wmtcmd_* for the remote Metal transport --
             // building a schema for all 59 on speculation would be weeks of
             // work for commands no title may ever issue.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-census.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("census") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("DXMT_CMD_CENSUS", v, 1)
-                logStore.log("wmtcmd census: DXMT_CMD_CENSUS=\(v) via madeira-census.txt")
+                logStore.log("wmtcmd census: DXMT_CMD_CENSUS=\(v) via madeira.cfg census")
             }
 
             // ml757: FEX arena placeholder. Documents/madeira-arena.txt == "1"
@@ -2254,11 +2391,10 @@ struct ContentView: View {
             // x64 before the first window. Proven correct on the research VM
             // (8GB held, 0 of 123 guest images inside it) -- turn on only once
             // FEX consumes WINE_IOS_FEX_ARENA_BASE/SIZE instead of choosing.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-arena.txt"), encoding: .utf8) {
+            if let txt = MadeiraConfig.get("arena") {
                 let v = txt.trimmingCharacters(in: .whitespacesAndNewlines)
                 setenv("MADEIRA_FEX_ARENA", v, 1)
-                logStore.log("FEX arena placeholder: MADEIRA_FEX_ARENA=\(v) via madeira-arena.txt")
+                logStore.log("FEX arena placeholder: MADEIRA_FEX_ARENA=\(v) via madeira.cfg arena")
             }
 
             // ml748: W^X A/B probe. Documents/madeira-wxprobe.txt == "1" runs it.
@@ -2272,10 +2408,9 @@ struct ContentView: View {
             // machines can. Runs here because it needs the real container, the
             // real sandbox and a live cs_wx_enabled map -- a standalone binary
             // over SSH already answered this wrongly once.
-            if let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
-               let txt = try? String(contentsOf: d.appendingPathComponent("madeira-wxprobe.txt"), encoding: .utf8),
+            if let txt = MadeiraConfig.get("wxprobe"),
                txt.trimmingCharacters(in: .whitespacesAndNewlines) == "1" {
-                logStore.log("W^X probe armed via madeira-wxprobe.txt", level: .success)
+                logStore.log("W^X probe armed via madeira.cfg wxprobe", level: .success)
                 jit_wx_probe()
             }
 
@@ -2975,7 +3110,10 @@ struct TouchControlButton: View {
                                  lineWidth: isSelected ? 2 : 1))
         // A stick must not shrink under the thumb; only round buttons do that.
         .scaleEffect(!isStick && isDown ? 0.92 : 1.0)
-        .animation(.easeOut(duration: 0.08), value: isDown)
+        // ml890: no press animation. Pressing the on-screen Enter key killed the
+        // whole process with a SwiftUI trap on com.apple.SwiftUI.AsyncRenderer
+        // (DisplayList.ViewUpdater.ViewCache.commitAsyncValues) while this
+        // glass control animated its press; the state change now applies at once.
         // ml646: the springy knob, same curve as the portrait pad overlay.
         .animation(.spring(response: 0.22, dampingFraction: 0.58), value: stickDir)
         .overlay(alignment: .topTrailing) {

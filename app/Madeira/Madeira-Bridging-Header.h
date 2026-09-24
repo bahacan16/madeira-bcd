@@ -15,6 +15,12 @@ void wine_set_ui_log_callback(wine_ui_log_callback_t cb);
 // DXMT present counter (winemetal_unix.c) — for SwiftUI FPS overlay
 #include <stdint.h>
 uint64_t madeira_get_present_count(void);
+// ml1098: ask the D3D12 runtime to capture the next N frames (winemetal_unix.c)
+void madeira_capture_request(int frames);
+// ml1133: ECO switch (ntdll unix sync.c). 1 = every guest thread drops to a
+// low QoS class (efficiency cores, lower clocks) to save the SoC burst budget.
+void madeira_set_eco(int on);
+int madeira_get_eco(void);
 
 // DXMT vsync-lock toggle (winemetal_unix.c) — 1 = pace presents to 60
 // via afterMinimumDuration, 0 = free-run to display max (120 ProMotion,
@@ -25,3 +31,15 @@ int madeira_get_vsync_locked(void);
 
 /* ml526: startup phase timeline (Winios.m) */
 void winios_phase(const char *name);
+
+/* madeira-d3d12: M1 shader-converter canary, compiled into libdxmt.
+ * Returns the number of failed checks; 0 means the gate passed. Output goes to
+ * stderr, which is already captured into madeira-log.txt. */
+int madeira_d3d12_canary_run(const char *fixture_dir, const char *dylib_path,
+                             void (*sink)(const char *));
+/* Same run, but also writes the full per-check transcript to log_path, which is
+ * how the in-app detail is captured: stderr is not redirected into
+ * madeira-log.txt until later in startup. */
+int madeira_d3d12_canary_run_log(const char *fixture_dir, const char *dylib_path,
+                                 void (*sink)(const char *), const char *log_path,
+                                 const char *build_id);

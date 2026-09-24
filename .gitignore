@@ -101,6 +101,7 @@ build/gnutls-ios/obj/
 # re-included; git will not descend into a directory ignored with a trailing
 # slash, which makes any negation inside it silently ineffective.
 research/*
+!research/madeira-d3d12/
 !research/remote-metal/
 *.bak
 photorec.se2
@@ -126,3 +127,18 @@ research/remote-metal/guest/rmreplay
 research/remote-metal/guest/rmres
 research/remote-metal/guest/rmclient_test
 research/remote-metal/host/rmetald
+
+# madeira-d3d12 build products and host binary snapshots (regenerable)
+build/madeira-d3d12/out/
+build/madeira-d3d12/out-ios/
+build/madeira-d3d12/out-pe/
+research/remote-metal/host/rmetald.*
+
+# Apple Metal Shader Converter dynamic library: TRACKED (decision 2026-09-16).
+# Apple's installer agreement 2.B permits distributing it solely for shader
+# conversion, which is its only use here; see app/Madeira/d3d12/NOTICE.txt.
+
+# Licence copies generated into the bundle by build/stage-licenses.sh (from COPYING and LICENSE-EXCEPTION.md)
+app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
+app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
+research/madeira-d3d12/tests/offline/sm51/
