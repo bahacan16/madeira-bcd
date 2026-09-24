@@ -453,7 +453,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: FEX/build-ios
-          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v1
+          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v2
 
       # FEX 0f8edf8 AllocatorHooks.cpp defines IOS_RPM_GUARD() only inside
       # #ifdef ENABLE_FEX_ALLOCATOR, then uses it (malloc_usable_size) in the
@@ -485,6 +485,10 @@ jobs:
               sys.exit(1)
           PYEOF
 
+      - name: Guard FEX diagnostic probes for the iOS static-lib target
+        if: steps.fexcache.outputs.cache-hit != 'true'
+        run: python3 tools/patch-fex-ios-probes.py
+
       - name: Build FEX for iOS
         if: steps.fexcache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -514,7 +518,7 @@ jobs:
           cmake --build FEX/build-ios -j"$(sysctl -n hw.ncpu)" \
             --target FEXCore FEXCore_Base JemallocLibs \
                      cephes_128bit softfloat_3e fmt xxhash \
-            > "$GITHUB_WORKSPACE/fex-build.log" 2>&1
+            -- -k 0 > "$GITHUB_WORKSPACE/fex-build.log" 2>&1
 
       - name: Verify FEX iOS archives
         if: always()
@@ -540,7 +544,7 @@ jobs:
               if [ -f "$L.log" ]; then
                 # Compiler errors beat a blind tail: the real cause is usually
                 # hundreds of lines above the end of a ninja log.
-                E=$(grep -E "error:|CMake Error" "$L.log" | head -20)
+                E=$(grep -E "error:|CMake Error" "$L.log" | head -40)
                 [ -n "$E" ] || E=$(tail -n 40 "$L.log")
                 echo "::error::$L.log :: $(printf '%s' "$E" | python3 -c "import sys; print('%0A'.join(sys.stdin.read().splitlines()))")"
               else
@@ -551,12 +555,14 @@ jobs:
           fi
           echo "::notice::all 7 FEX archives present"
 
+      # Only a tree that produced the library: build 118 cached a failed one
+      # under -v1, and a cache hit skips the build step for good.
       - name: Save FEX iOS build
-        if: steps.fexcache.outputs.cache-hit != 'true'
+        if: steps.fexcache.outputs.cache-hit != 'true' && hashFiles('FEX/build-ios/FEXCore/Source/libFEXCore.a') != ''
         uses: actions/cache/save@v4
         with:
           path: FEX/build-ios
-          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v1
+          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v2
 
       - name: Restore LLVM 15.0.7 iOS build
         id: llvmcache
@@ -635,7 +641,7 @@ jobs:
           fi
 
       - name: Save LLVM 15.0.7 iOS build
-        if: steps.llvmcache.outputs.cache-hit != 'true'
+        if: steps.llvmcache.outputs.cache-hit != 'true' && hashFiles('toolchains/llvm-ios-build/lib/libLLVMCore.a') != ''
         uses: actions/cache/save@v4
         with:
           path: |
