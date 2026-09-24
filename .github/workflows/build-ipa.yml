@@ -453,7 +453,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: FEX/build-ios
-          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v2
+          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v3
 
       # FEX 0f8edf8 AllocatorHooks.cpp defines IOS_RPM_GUARD() only inside
       # #ifdef ENABLE_FEX_ALLOCATOR, then uses it (malloc_usable_size) in the
@@ -562,7 +562,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: FEX/build-ios
-          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v2
+          key: fex-ios-${{ steps.fexrev.outputs.sha }}-v3
 
       - name: Restore LLVM 15.0.7 iOS build
         id: llvmcache
