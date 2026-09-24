@@ -65,6 +65,24 @@ jobs:
         shell: bash
         run: echo "sha=$(git -C wine rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # willfaust/wine madeira-lgpl e828644: dlls/ntdll/loader.c line 1342
+      # #includes "arm64ec_x64_export_iat.c", which was never committed to the
+      # fork. It sits under #ifdef __arm64ec__ -- the PE ntdll, which this
+      # build does not compile (ntdll.dll is upstream's tracked binary) -- but
+      # configure's makedep scans every include and stops at the missing file,
+      # so no Makefile, no config.h, and nothing after it builds. Give makedep
+      # an empty file; if the fork later commits the real one, this is a no-op.
+      - name: Work around wine's uncommitted arm64ec_x64_export_iat.c
+        shell: bash
+        run: |
+          F=wine/dlls/ntdll/arm64ec_x64_export_iat.c
+          if [ -f "$F" ]; then
+            echo "::notice::$F is present upstream now -- this step can go"
+          else
+            printf '/* placeholder: see build-ipa.yml; PE-side only, never compiled here */\n' > "$F"
+            echo "::warning::$F missing from the wine fork -- empty placeholder written for makedep"
+          fi
+
       - name: Restore native wine tools
         id: winenative
         uses: actions/cache/restore@v4
