@@ -9997,6 +9997,13 @@ __declspec(dllexport) void MadeiraD3D12PresenterPresent(void *ph, ID3D12CommandQ
     struct mad_presenter *p = (struct mad_presenter *)ph;
     struct mad_queue *q = (struct mad_queue *)queue;
     if (!p || !q || !p->drawable) return;
+    /* madeira-bcd: commit the frame's batch FIRST, as swap_Present does (ml884).
+     * Lists accumulate in the queue's open command buffer and are committed only
+     * at a flush or a fence Signal, so without this the present buffer below was
+     * committed ahead of the rendering it shows. On an iPhone 17 Pro Max the
+     * d3d12-cube test then showed a grey, strobing layer at 60 FPS: most frames
+     * presented a drawable nothing had drawn into yet. */
+    mad_device_flush_all(q->device);
     /* Presentation rides its own command buffer, submitted after the frame's
      * work is already on the queue, so ordering comes from the queue itself. */
     obj_handle_t cb = MTLCommandQueue_commandBuffer(q->device->mtl_queue);

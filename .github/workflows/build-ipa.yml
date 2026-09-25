@@ -796,6 +796,13 @@ jobs:
           cp libdxmt_combined.a "$GITHUB_WORKSPACE/app/Madeira/"
           echo "::notice::libdxmt_combined.a $(wc -c < libdxmt_combined.a | tr -d ' ') bytes"
 
+      # The native D3D12 runtime is ours to fix now, so build it from
+      # research/madeira-d3d12 instead of shipping upstream's binary as is. A
+      # failed build keeps the tracked DLL and says so.
+      - name: Build madeira_d3d12.dll from source
+        continue-on-error: true
+        run: bash tools/build-madeira-d3d12-dll.sh
+
       # The PE-side DXMT DLLs (d3d11/dxgi/winemetal/d3d10core) are committed
       # under app/Madeira/aarch64-windows/ despite the README calling them
       # gitignored, so there is nothing to build here -- just confirm they
