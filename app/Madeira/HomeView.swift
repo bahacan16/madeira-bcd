@@ -126,7 +126,9 @@ struct LibraryGame: Identifiable {
 
     /// The exe the card launches: the one chosen in settings, else the biggest.
     /// The biggest is a good default because a game's shipping binary dwarfs
-    /// the launchers and crash reporters next to it.
+    /// the launchers and crash reporters next to it. 32-bit exes sort after
+    /// every 64-bit one (see group), so a folder holding both a 32-bit setup
+    /// or launcher and the 64-bit game defaults to the one that can run.
     var primary: GuestExecutable {
         if let chosen = LibraryPrefs.primaryPath(for: title),
            let exe = executables.first(where: { $0.windowsPath == chosen }) {
@@ -143,7 +145,13 @@ struct LibraryGame: Identifiable {
             byTitle[exe.title, default: []].append(exe)
         }
         return order.map { title in
-            let exes = (byTitle[title] ?? []).sorted { $0.sizeBytes > $1.sizeBytes }
+            // Called off the main thread (rescan), so the PE header reads are fine here.
+            let is32 = Dictionary((byTitle[title] ?? []).map { ($0.windowsPath, PEInfo.archLabel($0.url) == "x86") },
+                                  uniquingKeysWith: { a, _ in a })
+            let exes = (byTitle[title] ?? []).sorted { a, b in
+                let a32 = is32[a.windowsPath] ?? false, b32 = is32[b.windowsPath] ?? false
+                return a32 != b32 ? !a32 : a.sizeBytes > b.sizeBytes
+            }
             return LibraryGame(title: title, executables: exes)
         }
     }
@@ -292,6 +300,7 @@ struct HomeView: View {
     @State private var enablingJIT = false
     @State private var pendingAfterJIT: LaunchRequest?
     @State private var showJITAlert = false
+    @State private var blocked32: LibraryGame?
     @State private var editing: LibraryGame?
     @State private var showSettings = false
     @State private var coverTick = 0
@@ -350,6 +359,20 @@ struct HomeView: View {
             }
             .sheet(isPresented: $showSettings) {
                 AppSettingsSheet(onDeveloper: onDeveloper)
+            }
+            .alert("32-bit program", isPresented: Binding(get: { blocked32 != nil },
+                                                          set: { if !$0 { blocked32 = nil } })) {
+                if let game = blocked32, game.executables.count > 1 {
+                    Button("Choose another exe") { editing = game; blocked32 = nil }
+                }
+                Button("OK", role: .cancel) { blocked32 = nil }
+            } message: {
+                Text((blocked32?.primary.fileName ?? "This exe")
+                     + " is a 32-bit (x86) Windows program. Madeira runs 64-bit programs only: "
+                     + "iOS reserves the low 4 GB of every app's address space, and 32-bit Windows "
+                     + "code has to live below 2 GB. Pick the game's 64-bit exe (often in a Bin64 "
+                     + "or x64 folder). Installers are usually 32-bit, so install on a PC and copy "
+                     + "the installed folder instead.")
             }
             .alert("JIT is not enabled", isPresented: $showJITAlert) {
                 Button("Enable JIT") { enableJIT() }
@@ -571,6 +594,10 @@ struct HomeView: View {
 
     private func launch(_ game: LibraryGame) {
         let exe = game.primary
+        if archs[exe.windowsPath] == "x86" {
+            blocked32 = game
+            return
+        }
         let saved = GameArguments.get(exe.windowsPath)
         let args = saved.isEmpty ? GameArguments.suggestion(for: exe) : saved
         let request: LaunchRequest
@@ -799,6 +826,12 @@ struct GameSettingsSheet: View {
                         }
                     }
                     LabeledContent("Architecture", value: archs[exePath] ?? "unknown")
+                    if archs[exePath] == "x86" {
+                        Label("32-bit programs cannot run in Madeira. Choose a 64-bit exe.",
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                     Text(exePath)
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
@@ -806,7 +839,7 @@ struct GameSettingsSheet: View {
                 } header: {
                     Text("Executable")
                 } footer: {
-                    Text("Biggest first. A game's own binary is almost always the largest exe in its folder.")
+                    Text("64-bit first, then biggest first. A game's own binary is almost always the largest exe in its folder.")
                 }
 
                 Section {
@@ -836,6 +869,9 @@ struct GameSettingsSheet: View {
                             .frame(maxWidth: .infinity)
                             .font(.headline)
                     }
+                    // The library's 32-bit alert cannot show while this sheet is
+                    // still animating away, so refuse here instead.
+                    .disabled(archs[exePath] == "x86")
                 }
             }
             .navigationTitle(game.title)
