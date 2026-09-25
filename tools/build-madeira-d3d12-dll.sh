@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build madeira_d3d12.dll (arm64ec) from research/madeira-d3d12 and ship it in
-# place of upstream's tracked binary, as both madeira_d3d12.dll and d3d12.dll.
+# place of upstream's tracked binary, as both madeira_d3d12.dll and d3d12.dll;
+# then the x64 D3D12 cube test the home screen starts.
 #
 # build/madeira-d3d12/build-pe.sh links against research/dxmt/build-arm64ec's
 # libwinemetal.a, which only a full meson build of DXMT's PE half produces. The
@@ -51,3 +52,14 @@ echo "  all $(wc -l < "$OUT/tracked.exports" | tr -d ' ') tracked exports presen
 cp "$OUT/madeira_d3d12.dll" "$SHIP/madeira_d3d12.dll"
 cp "$OUT/madeira_d3d12.dll" "$SHIP/d3d12.dll"
 echo "::notice::madeira_d3d12.dll and d3d12.dll rebuilt from research/madeira-d3d12 and shipped"
+
+echo "=== d3d12-cube-x64.exe (x86_64 guest, visible) ==="
+TESTS="$R/research/madeira-d3d12/tests/windows"
+if "$MINGW/x86_64-w64-mingw32-clang" -O2 -Wall -mwindows \
+       -o "$OUT/d3d12-cube-x64.exe" "$TESTS/cube_window.c" -I"$TESTS" -luuid -lole32 2> "$OUT/cube.err"; then
+    cp "$OUT/d3d12-cube-x64.exe" "$SHIP/d3d12-cube-x64.exe"
+    echo "::notice::d3d12-cube-x64.exe rebuilt ($(wc -c < "$OUT/d3d12-cube-x64.exe" | tr -d ' ') bytes) and shipped"
+else
+    grep -m 20 "error:" "$OUT/cube.err"
+    echo "::warning::d3d12-cube-x64.exe did not build -- keeping the tracked test"
+fi

@@ -101,6 +101,16 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pd.SampleDesc.Count = 1;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    /* madeira-bcd: a zeroed description leaves RenderTargetWriteMask at 0, i.e.
+     * "write no channel". The runtime ignored the mask when this test was
+     * verified; since b334510 it honours it, as D3D12 does, and the cube drew
+     * every frame without writing a pixel (seen on an iPhone 17 Pro Max: the
+     * clear colour only). Spell out what the zeroed fields used to mean --
+     * solid fill, no culling, no depth test -- plus the write mask. */
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = 0xffffffffu;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     ID3D12PipelineState *pso = NULL;
     hr = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
     if (FAILED(hr) || !pso) { printf("cube: no pipeline %#lx\n", hr); return 1; }
