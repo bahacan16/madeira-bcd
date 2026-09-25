@@ -153,7 +153,16 @@ static int g_occlusion_visible = -1;   /* ml1103: madeira.cfg occlusion-visible 
  * captured BEFORE they run (vertex/index buffers, indirect arguments, every
  * texture the pixel stage samples) and their resolved argument tables logged
  * range by range. Answers "bad source or bad composite" for one draw. */
-static char g_capture_ps[64]; static int g_capture_ps_loaded, g_capture_ps_shots, g_dump_tables;
+static char g_capture_ps[512]; static int g_capture_ps_loaded, g_capture_ps_shots, g_dump_tables;   /* ml1152: a comma list */
+/* ml1141: TARGETED DISPATCH CAPTURE, the compute twin of the above. madeira.cfg
+ * capture-cs = <compute entry name> (capture-cs-indirect = 1 keeps only indirect
+ * dispatches, capture-cs-max = N, default 12): during a CAP frame the first N
+ * matching dispatches get every root argument logged -- each table entry named
+ * SRV / UAV / sampler, with the texture's size, format, mip count and the view's
+ * mip range, or the buffer's size -- and their SRV textures (the view's most
+ * detailed mip) and root CBVs captured BEFORE they run. UE5's Nanite shades
+ * every material in compute, so this is how to see what a material samples. */
+static char g_capture_cs[64]; static int g_capture_cs_shots, g_capture_cs_max = 12, g_capture_cs_ind;
 static LONG g_barrier_renc_closed, g_stencil_srv, g_barrier_seen;
 struct mad_obj {
     void *vtbl;
@@ -274,16 +283,29 @@ struct mad_device {
     struct mad_texheap { obj_handle_t heap; UINT64 size; struct mad_hblk { UINT64 off, size; } *fl; unsigned nfl, fl_cap; } *theaps;
     unsigned ntheaps, theaps_cap;
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
+    struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
+    struct { UINT32 value; obj_handle_t buf; } fillpat[8]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
 static LONG g_resolve_locked, g_resolve_miss;   /* ml1132: address lookups that took live_lock */
 static LONG g_res_added, g_res_removed, g_tess_psos, g_tess_draws, g_tess_built, g_tess_drawn, g_tess_nonidx;
+static LONG g_gs_built, g_gs_drawn;   /* ml1147 */
 static LONG g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts;   /* ml1088 */
 static LONG g_srv_clamped; static float g_srv_clamp_max;   /* ml1089 */
 static LONG g_zero_inst;   /* ml1094 */
 static LONG g_fence_waits, g_fence_updates, g_barriers;   /* ml1091 */
-static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins, g_f6_rclose;   /* ml1134 */   /* ml1083: built pipelines, draws that RAN, non-indexed ones */
+static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins, g_f6_rclose;   /* ml1134 */
+/* ml1137: GPU census, counts only. Barrier entries by the states they move
+ * between, and what a state-aware wait rule would have needed at each
+ * barrier-caused sync of mode 6; attachment bytes loaded / cleared / stored in
+ * 1 of 16 frames, with what happens NEXT to each stored attachment in its list. */
+enum { BC_RAR, BC_RAW_ATT, BC_RAW_COPY, BC_RAW_UAV, BC_ALL, BC_NONE = 255 };
+static LONG g_bc_ent[5], g_f7_bsync, g_f7_none, g_f7_subset, g_f7_all;
+static LONG64 g_f7_fw6, g_f7_fwr;
+static LONG64 g_ac_load, g_ac_clear, g_ac_store, g_ac_st_cleared, g_ac_st_read, g_ac_st_rebound, g_ac_st_write, g_ac_st_none;
+static LONG g_ac_frames, g_discards;
+static volatile LONG g_att_census;   /* ml1083: built pipelines, draws that RAN, non-indexed ones */
 /* ml1057: what our GPU allocations ARE. The process dies at 8.19 GB with ~2.6 GB
  * of IOAccelerator memory against a 1.5 GB advertised budget, and nothing said
  * which kind of resource holds it. Estimated bytes, live and peak, by kind. */
@@ -292,6 +314,8 @@ enum { MAD_CAT_TEX_RT, MAD_CAT_TEX_DS, MAD_CAT_TEX_UAV, MAD_CAT_TEX_PLAIN, MAD_C
 static const char *const g_cat_name[MAD_CAT_N] = { "tex-RT", "tex-DS", "tex-UAV", "tex-sampled", "tex-MSAA", "buf-private", "buf-shared" };
 static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
+static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
+static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
@@ -457,8 +481,8 @@ static void mad_skip_report(void) {
               g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_zero_inst, g_stencil_srv);
     mad_acct_report();
     d3d12_log("[madeira-d3d12] ml1050 residency set: %ld added, %ld removed (%ld members); tessellation: %ld pipelines (%ld built as mesh pipelines), "
-              "%ld draws dropped, %ld drawn (%ld non-indexed)\n", g_res_added, g_res_removed, g_res_added - g_res_removed, g_tess_psos, g_tess_built,
-              g_tess_draws, g_tess_drawn, g_tess_nonidx);   /* ml1083 */
+              "%ld draws dropped, %ld drawn (%ld non-indexed); ml1147 DXBC geometry: %ld mesh pipelines, %ld draws\n", g_res_added, g_res_removed, g_res_added - g_res_removed, g_tess_psos, g_tess_built,
+              g_tess_draws, g_tess_drawn, g_tess_nonidx, g_gs_built, g_gs_drawn);   /* ml1083, ml1147 */
     d3d12_log("[madeira-d3d12] ml1126 views: %ld typed-buffer views live (%ld made; kept OUT of the residency set, their buffer is in it), %ld texture views live\n",
               g_tview_live, g_tview_made, g_xview_live);
     d3d12_log("[madeira-d3d12] ml1132 address lookups on the locked path: %ld (true misses %ld); every other lookup was lock-free\n",
@@ -478,6 +502,7 @@ static void mad_acct_report(void) {
                       (long long)(g_cat_bytes[c] >> 20), g_cat_count[c], (long long)(g_cat_peak[c] >> 20));
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
+    d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
     if (g_hp_dev) d3d12_log("[madeira-d3d12] ml1072 texture heaps: %u (%lld MB reserved, %lld MB live in them), %ld textures placed, %ld fallbacks, %u blocks awaiting GPU\n",
                             g_hp_dev->ntheaps, (long long)(g_hp_dev->hp_total_bytes >> 20), (long long)(g_hp_dev->hp_live_bytes >> 20),
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
@@ -496,11 +521,15 @@ static void mad_note_sampler(struct mad_device *d, obj_handle_t smp) {
  * handed to the backend as the buffer's memory, which is the same arrangement
  * DXMT's ring allocator uses and the one the remote shadow machinery already
  * understands. DEFAULT is GPU-private and deliberately not mappable. */
+struct mad_memheap;
 struct mad_resource {
     ID3D12Resource2Vtbl *vtbl;   /* ml886: Resource2-sized slot table */
     LONG refs;
     const IID *iid;
     const char *name;
+    struct mad_memheap *placed_heap;   /* ml1145: set when the storage IS the heap's, at the placement offset */
+    void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
+    unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
     void *cpu;                 /* NULL for GPU-private */
     UINT64 size;
@@ -619,6 +648,7 @@ struct mad_pso {
     UINT ps_cb_bind, ps_arg_bind, ps_arg_qwords, ps_nair;
     struct madeira_ir_air_range *ps_air;
     struct mad_tess *tess;                          /* ml1083: hull/domain as an object/mesh pipeline, NULL if not built */
+    struct mad_tess *tess_strip;                    /* ml1147b: a DXBC geometry pipeline's STRIP-topology variant */
 };
 
 /* ml1083: TESSELLATION.
@@ -639,6 +669,7 @@ struct mad_tess {
     obj_handle_t ds_lib, ds_fn; struct mad_tess_stage ds;
     UINT threads_per_patch, max_potential, out_prim;
     char obj_name[64], ds_name[64];
+    int is_gs;   /* ml1147: a DXBC geometry pipeline: object = VS for the GS (29/30), mesh = GS (29/30); no hull */
 };
 
 /* ml1008: what the DXBC backend reports back about one stage. */
@@ -721,6 +752,9 @@ static void mad_untrack(struct mad_device *d, struct mad_resource *r);
 static void mad_format_info(DXGI_FORMAT f, UINT *bytes, UINT *block);
 static UINT64 mad_res_row_bytes(const struct mad_resource *r);
 static int mad_map_texture_format(DXGI_FORMAT f, D3D12_RESOURCE_FLAGS flags, enum WMTPixelFormat *out, int *is_depth);
+static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth);   /* ml1145 */
+struct mad_device;
+static void mad_mheap_reclaim(struct mad_device *d, int all);   /* ml1148 */
 struct mad_rootsig;
 static UINT mad_root_layout(const struct mad_rootsig *rs, UINT offsets[32]);
 
@@ -760,9 +794,82 @@ static HRESULT mad_qi(struct mad_obj *o, REFIID riid, void **out, int is_device_
 
 static ULONG mad_addref(struct mad_obj *o) { return (ULONG)InterlockedIncrement(&o->refs); }
 
+/* ml1143: PRIVATE DATA IS STORED. SetPrivateData used to answer S_OK and keep
+ * nothing, and GetPrivateData always said NOT_FOUND. D3DX12's residency manager
+ * (UE's D3D12 RHI submits through it) keeps its per-queue fence in the queue's
+ * private data, so it saw a NEW queue on every ExecuteCommandLists: it created
+ * a fence each time, signalled it once, and gave every later sync point one
+ * entry per fence ever made. ph-empire08: the RHI submission thread made ~5 M
+ * GetCompletedValue calls/s, ~93% of a P core, every sampled one on a fence
+ * parked at 1, growing without bound as the session went on.
+ * Keyed by (object, GUID); SetPrivateDataInterface holds a reference; every
+ * destructor purges its object so a reused address inherits nothing. */
+struct mad_pd { const void *obj; GUID guid; UINT size; void *data; IUnknown *iface; struct mad_pd *next; };
+static struct mad_pd *g_pd[256]; static SRWLOCK g_pd_lock = SRWLOCK_INIT; static LONG g_pd_count;
+static unsigned mad_pd_hash(const void *o) { UINT64 x = (UINT64)(ULONG_PTR)o; x ^= x >> 17; x *= 0x9E3779B97F4A7C15ull; return (unsigned)(x >> 56); }
+static void mad_pd_free_list(struct mad_pd *e) {
+    while (e) { struct mad_pd *n = e->next; if (e->iface) IUnknown_Release(e->iface); free(e->data); free(e); e = n; }
+}
+static struct mad_pd *mad_pd_unlink_locked(const void *obj, REFGUID g) {   /* g NULL = every entry of obj */
+    struct mad_pd **pp = &g_pd[mad_pd_hash(obj)], *out = NULL;
+    while (*pp) {
+        struct mad_pd *e = *pp;
+        if (e->obj == obj && (!g || !memcmp(&e->guid, g, sizeof(GUID)))) { *pp = e->next; e->next = out; out = e; InterlockedDecrement(&g_pd_count); }
+        else pp = &e->next;
+    }
+    return out;
+}
+static HRESULT mad_pd_get(const void *obj, REFGUID g, UINT *n, void *d) {
+    struct mad_pd *e; HRESULT hr = DXGI_ERROR_NOT_FOUND;
+    if (!n || !g) return E_INVALIDARG;
+    AcquireSRWLockShared(&g_pd_lock);
+    for (e = g_pd[mad_pd_hash(obj)]; e; e = e->next) if (e->obj == obj && !memcmp(&e->guid, g, sizeof(GUID))) break;
+    if (!e) *n = 0;
+    else {
+        UINT need = e->iface ? (UINT)sizeof(IUnknown *) : e->size;
+        if (!d) hr = S_OK;
+        else if (*n < need) hr = DXGI_ERROR_MORE_DATA;
+        else {
+            if (e->iface) { IUnknown_AddRef(e->iface); *(IUnknown **)d = e->iface; }
+            else memcpy(d, e->data, e->size);
+            hr = S_OK;
+        }
+        *n = need;
+    }
+    ReleaseSRWLockShared(&g_pd_lock);
+    return hr;
+}
+static HRESULT mad_pd_store(const void *obj, REFGUID g, UINT n, const void *d, IUnknown *iface) {
+    struct mad_pd *old, *e = NULL;
+    if (!g) return E_INVALIDARG;
+    if (iface || (d && n)) {
+        e = calloc(1, sizeof *e);
+        if (!e) return E_OUTOFMEMORY;
+        e->obj = obj; e->guid = *g;
+        if (iface) { IUnknown_AddRef(iface); e->iface = iface; }
+        else { e->data = malloc(n); if (!e->data) { free(e); return E_OUTOFMEMORY; } memcpy(e->data, d, n); e->size = n; }
+    }
+    AcquireSRWLockExclusive(&g_pd_lock);
+    old = mad_pd_unlink_locked(obj, g);
+    if (e) { unsigned h = mad_pd_hash(obj); e->next = g_pd[h]; g_pd[h] = e; InterlockedIncrement(&g_pd_count); }
+    ReleaseSRWLockExclusive(&g_pd_lock);
+    mad_pd_free_list(old);   /* outside the lock: releasing an interface may re-enter */
+    return S_OK;
+}
+static HRESULT mad_pd_set(const void *obj, REFGUID g, UINT n, const void *d) { return mad_pd_store(obj, g, n, d, NULL); }
+static HRESULT mad_pd_set_iface(const void *obj, REFGUID g, const IUnknown *i) { return mad_pd_store(obj, g, 0, NULL, (IUnknown *)i); }
+static void mad_pd_purge(const void *obj) {
+    struct mad_pd *old;
+    if (!g_pd_count) return;
+    AcquireSRWLockExclusive(&g_pd_lock);
+    old = mad_pd_unlink_locked(obj, NULL);
+    ReleaseSRWLockExclusive(&g_pd_lock);
+    mad_pd_free_list(old);
+}
+
 static ULONG mad_release(struct mad_obj *o) {
     LONG r = InterlockedDecrement(&o->refs);
-    if (r == 0) {
+    if (r == 0) { mad_pd_purge(o);   /* ml1143 */
         d3d12_log("[madeira-d3d12] destroyed %s\n", o->name);
         free(o);
     }
@@ -815,12 +922,46 @@ static ULONG STDMETHODCALLTYPE fence_AddRef(ID3D12Fence *This) { return mad_addr
 static ULONG STDMETHODCALLTYPE fence_Release(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
     LONG r = InterlockedDecrement(&f->refs);
-    if (r == 0) { DeleteCriticalSection(&f->lock); d3d12_log("[madeira-d3d12] destroyed %s\n", f->name); free(f); }
+    if (r == 0) { mad_pd_purge(This);   /* ml1143 */ DeleteCriticalSection(&f->lock); d3d12_log("[madeira-d3d12] destroyed %s\n", f->name); free(f); }
     return (ULONG)r;
+}
+/* ml1142: WHO SPINS ON GetCompletedValue. ph-empire07: 4.4 M calls/s from the
+ * ExecuteCommandLists thread (UE's RHI submission thread), ~93% of a P core,
+ * with SetEventOnCompletion called only ~4 times a frame. One call in 2^18 scans
+ * its own stack for return addresses inside the game executable (the x64 frames
+ * sit on the same stack in ARM64EC) and tallies the nearest two, with the
+ * thread's name, so the loop can be read in the executable. Diagnostic only. */
+static LONG g_gcv_calls;
+static struct { ULONG_PTR r0, r1; DWORD tid; LONG n; } g_gcv_site[16];
+static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
+    static ULONG_PTR exe_lo, exe_hi; static LONG samples;
+    ULONG_PTR hit[2] = { 0, 0 }, *p, *end; unsigned nh = 0, i; NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+    volatile ULONG_PTR here = 0;
+    if (!exe_lo) {
+        HMODULE m = GetModuleHandleW(NULL); IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)m;
+        IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)m + dh->e_lfanew);
+        exe_lo = (ULONG_PTR)m; exe_hi = exe_lo + nt->OptionalHeader.SizeOfImage;
+    }
+    p = (ULONG_PTR *)&here; end = p + 4096;
+    if (tib && (ULONG_PTR)tib->StackBase > (ULONG_PTR)p && (ULONG_PTR *)tib->StackBase < end) end = (ULONG_PTR *)tib->StackBase;
+    for (; p < end && nh < 2; p++) if (*p >= exe_lo + 0x1000 && *p < exe_hi) hit[nh++] = *p - exe_lo;
+    for (i = 0; i < 16; i++) {
+        if (g_gcv_site[i].n && g_gcv_site[i].r0 == hit[0] && g_gcv_site[i].r1 == hit[1] && g_gcv_site[i].tid == GetCurrentThreadId()) { g_gcv_site[i].n++; break; }
+        if (!g_gcv_site[i].n) { g_gcv_site[i].r0 = hit[0]; g_gcv_site[i].r1 = hit[1]; g_gcv_site[i].tid = GetCurrentThreadId(); g_gcv_site[i].n = 1; break; }
+    }
+    if ((++samples % 64) == 1) {
+        WCHAR *wn = NULL; char nm[64] = "?";
+        if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &wn)) && wn) { WideCharToMultiByte(CP_UTF8, 0, wn, -1, nm, sizeof nm, NULL, NULL); LocalFree(wn); }
+        d3d12_log("[gcv] ml1142 %ld calls; this thread %04lx '%s' polls %s at %llu (signalled %llu); exe callers (rva) by thread:\n",
+                  (long)g_gcv_calls, GetCurrentThreadId(), nm, f->name ? f->name : "fence", (unsigned long long)v, (unsigned long long)f->value);
+        for (i = 0; i < 16 && g_gcv_site[i].n; i++)
+            d3d12_log("[gcv]   %04lx  +0x%llx <- +0x%llx  x%ld\n", g_gcv_site[i].tid, (unsigned long long)g_gcv_site[i].r0, (unsigned long long)g_gcv_site[i].r1, (long)g_gcv_site[i].n);
+    }
 }
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
     InterlockedIncrement(&g_perf_polls);   /* ml1109 */
+    if ((InterlockedIncrement(&g_gcv_calls) & 0x3ffff) == 0) mad_gcv_sample(f, f->value);   /* ml1142 */
     EnterCriticalSection(&f->lock);
     UINT64 v = f->value;
     LeaveCriticalSection(&f->lock);
@@ -936,7 +1077,7 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT64 off; enum WMTIndexType type; } ib;
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
-        struct { struct mad_resource *res[8]; UINT n; UINT all; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow */
+        struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*) */
         struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared */
         struct { UINT vcount, icount, vstart, istart; } draw;
         struct { UINT icount, inst, start; INT base; UINT istart; } drawi;
@@ -946,7 +1087,7 @@ struct mad_cmd {
         struct { struct mad_resource *dst, *src; UINT dlevel, dslice, slevel, sslice; UINT w, h, d; UINT dx, dy, dz, sx, sy, sz; } tt;
         struct { UINT x, y, z; } dispatch;
         struct { struct mad_resource *args; UINT64 off; UINT count; UINT stride; struct mad_resource *cnt; UINT64 cnt_off; } ind;
-        struct { struct mad_resource *res; UINT64 off, len; UINT8 byte; } fill;
+        struct { struct mad_resource *res; UINT64 off, len; UINT8 byte; obj_handle_t pattern; } fill;   /* ml1151: pattern = exact 32-bit source */
         struct { float rgba[4]; } blend;
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
     } u;
@@ -959,7 +1100,7 @@ struct mad_cmd {
 #define MAD_ARG_VBTABLE_OFF    576u /* ml927: IRRuntimeVertexBuffers (31 x {addr, length, stride} = 496 bytes) at kIRVertexBufferBindPoint, object stage */
 
 struct mad_list {
-    ID3D12GraphicsCommandListVtbl *vtbl;
+    ID3D12GraphicsCommandList7Vtbl *vtbl;   /* ml1144: full List7 slot table, List1..7 answered */
     LONG refs;
     const IID *iid;
     const char *name;
@@ -1004,7 +1145,15 @@ static void mad_list_note_used(struct mad_list *l, struct mad_resource *r) {
 
 static HRESULT STDMETHODCALLTYPE list_QI(ID3D12GraphicsCommandList *This, REFIID riid, void **out) {
     struct mad_obj *o = (struct mad_obj *)This;
-    if (out && (IsEqualGUID(riid, &IID_ID3D12CommandList))) {
+    /* ml1144: every D3D12 runtime answers GraphicsCommandList1..7 whatever the
+     * hardware supports; the optional methods are gated by CheckFeatureSupport,
+     * which reports them all off. UE 5.0 queries List4 for ray tracing whenever
+     * the device answers Device5, and a refusal is a LowLevelFatalError. */
+    if (out && (IsEqualGUID(riid, &IID_ID3D12CommandList) ||
+                IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList1) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList2) ||
+                IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList3) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList4) ||
+                IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList5) || IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList6) ||
+                IsEqualGUID(riid, &IID_ID3D12GraphicsCommandList7))) {
         InterlockedIncrement(&o->refs);
         *out = o;
         return S_OK;
@@ -1015,7 +1164,7 @@ static ULONG STDMETHODCALLTYPE list_AddRef(ID3D12GraphicsCommandList *This) { re
 static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {
     struct mad_list *l = (struct mad_list *)This;
     LONG r = InterlockedDecrement(&l->refs);
-    if (r == 0) {
+    if (r == 0) { mad_pd_purge(This);   /* ml1143 */
         if (l->alloc && !l->closed) InterlockedDecrement(&l->alloc->recording);
         if (l->alloc) ID3D12CommandAllocator_Release((ID3D12CommandAllocator *)l->alloc);
         for (unsigned k = 0; k < l->nrings; k++) NSObject_release(l->rings[k]);
@@ -1140,7 +1289,7 @@ static void mad_queue_drain(struct mad_queue *q);
 static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
     struct mad_queue *q = (struct mad_queue *)This;
     LONG r = InterlockedDecrement(&q->refs);
-    if (r == 0) {
+    if (r == 0) { mad_pd_purge(This);   /* ml1143 */
         struct mad_device *d = q->device;
         unsigned i;
         if (q->sub_thread) {   /* ml1120: finish the FIFO, then stop the worker */
@@ -1209,6 +1358,10 @@ struct mad_exec {
     int f6_enc_synced;          /* the open encoder waited for every pending encoder at its start */
     unsigned f6_cur;            /* pool index of the open encoder's fence */
     struct mad_resource *f6_att[9]; unsigned f6_natt;   /* attachments of the encoder being begun */
+    int mode;                   /* ml1136: fence-chain mode for this whole list (switchable live between lists) */
+    unsigned cur;               /* ml1137: index of the command being replayed */
+    UINT64 f7_mask; int f7_all, f7_open, f7_reason;   /* ml1137: what a state-aware barrier rule would wait for (census only) */
+    int f7_next_rts;            /* ml1137: exec_end called by exec_begin_render: rt/depth are the NEXT pass's targets */
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
                              struct mad_resource *depth, const struct mad_rtvp *dp, unsigned seq);
@@ -1260,6 +1413,15 @@ static obj_handle_t mad_enc_fence(struct mad_device *d) {
     if (!d->enc_fence) d->enc_fence = MTLDevice_newFence(d->mtl_device);
     return d->enc_fence;
 }
+/* ml1136: the device fence whatever the current mode (a list keeps the mode it
+ * started with, so the global may already say something else), and the mode a
+ * new list starts with. */
+static obj_handle_t mad_enc_fence_obj(struct mad_device *d) {
+    if (!d->enc_fence) d->enc_fence = MTLDevice_newFence(d->mtl_device);
+    return d->enc_fence;
+}
+static int mad_fence_mode(struct mad_device *d) { (void)mad_enc_fence(d); return g_fence_chain; }
+static LONG g_f6_used;   /* ml1136: some list ran in mode 6 (Present then waits for the join) */
 static void exec_note_write(struct mad_exec *e, struct mad_resource *r) {   /* ml1116 */
     unsigned i;
     if (!r || e->wr_all) return;
@@ -1329,14 +1491,25 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     struct mad_queue *q = e->q;
     obj_handle_t waits[48];
     unsigned nw = 0, i, j, k;
-    int need = e->f6_sync_needed || q->f6_npend >= 40;
-    for (i = 0; i < q->f6_npend && !need; i++) {
-        if (kind == F6_BLIT && q->f6_pend[i].kind == F6_BLIT) need = 1;
-        for (j = 0; j < q->f6_pend[i].natt && !need; j++)
+    int other = q->f6_npend >= 40, need;
+    for (i = 0; i < q->f6_npend && !other; i++) {
+        if (kind == F6_BLIT && q->f6_pend[i].kind == F6_BLIT) other = 1;
+        for (j = 0; j < q->f6_pend[i].natt && !other; j++)
             for (k = 0; k < e->f6_natt; k++)
-                if (e->f6_att[k] && e->f6_att[k] == q->f6_pend[i].att[j]) { need = 1; InterlockedIncrement(&g_f6_att_sync); break; }
+                if (e->f6_att[k] && e->f6_att[k] == q->f6_pend[i].att[j]) { other = 1; if (!e->f6_sync_needed) InterlockedIncrement(&g_f6_att_sync); break; }
     }
+    need = e->f6_sync_needed || other;
     InterlockedIncrement(&g_f6_begins);
+    g_f6_used = 1;
+    if (need && e->f6_sync_needed && !other && (e->f7_reason & 1) && !(e->f7_reason & 2)) {   /* ml1137: a sync caused only by barriers */
+        unsigned np = q->f6_npend, rw;
+        UINT64 m = e->f7_mask & (np >= 64 ? ~0ull : ((1ull << np) - 1));
+        rw = e->f7_all ? np : (unsigned)__builtin_popcountll(m);
+        InterlockedIncrement(&g_f7_bsync);
+        InterlockedIncrement(e->f7_all ? &g_f7_all : rw ? &g_f7_subset : &g_f7_none);
+        InterlockedExchangeAdd64(&g_f7_fw6, np); InterlockedExchangeAdd64(&g_f7_fwr, rw);
+    }
+    if (need) { e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; }
     if (need) {
         if (e->f6_list_start && q->device->enc_fence) waits[nw++] = q->device->enc_fence;
         for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
@@ -1352,6 +1525,7 @@ static void f6_end(struct mad_exec *e, int kind, obj_handle_t enc) {
     struct mad_f6_pend *p;
     f6_encode(enc, kind, NULL, 0, f6_fence(q, e->f6_cur));
     InterlockedIncrement(&g_fence_updates);
+    if (e->f7_open) { e->f7_mask |= 1ull << q->f6_npend; e->f7_open = 0; }   /* ml1137: the barrier needed this encoder */
     p = &q->f6_pend[q->f6_npend++];   /* < 40 here: a begin with 40 pending syncs and empties the set */
     p->idx = (unsigned char)e->f6_cur; p->kind = (unsigned char)kind; p->natt = (unsigned char)e->f6_natt;
     memcpy(p->att, e->f6_att, sizeof p->att);
@@ -1362,8 +1536,8 @@ static void f6_end(struct mad_exec *e, int kind, obj_handle_t enc) {
 static void f6_join(struct mad_queue *q) {
     obj_handle_t waits[48], benc, dfence;
     unsigned i, nw = 0;
-    if (g_fence_chain != 6 || !q->f6_npend || !q->open_cb) return;
-    dfence = mad_enc_fence(q->device);
+    if (!q->f6_npend || !q->open_cb) return;   /* ml1136: whatever the current mode */
+    dfence = mad_enc_fence_obj(q->device);
     benc = MTLCommandBuffer_blitCommandEncoder(q->open_cb);
     if (!benc) return;
     for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
@@ -1372,12 +1546,69 @@ static void f6_join(struct mad_queue *q) {
     q->f6_npend = 0;
     InterlockedIncrement(&g_f6_joins);
 }
+/* ml1136: a list in another mode that follows mode-6 lists first waits for the
+ * encoders they left pending (the device fence does not cover them until a join). */
+static void f6_drain(struct mad_exec *e, int kind, obj_handle_t enc) {
+    struct mad_queue *q = e->q;
+    obj_handle_t waits[48];
+    unsigned i, n = 0;
+    if (!q->f6_npend) return;
+    for (i = 0; i < q->f6_npend; i++) waits[n++] = f6_fence(q, q->f6_pend[i].idx);
+    f6_encode(enc, kind, waits, n, 0);
+    q->f6_npend = 0;
+}
+/* ml1137: what a STATE-AWARE rule would require for this barrier batch, against
+ * the encoders pending now and the one still open (counted, not applied):
+ *   read -> read: nothing;  render target / depth -> read: the passes that had
+ *   it attached;  copy dest -> read: pending blits;  UAV -> read and UAV
+ *   barriers: pending compute and render encoders;  anything -> write, COMMON,
+ *   aliasing: everything (as mode 6 does). */
+static int f7_has_att(const struct mad_f6_pend *p, const struct mad_resource *r) {
+    unsigned j;
+    for (j = 0; j < p->natt; j++) if (p->att[j] == r) return 1;
+    return 0;
+}
+static void f7_need(struct mad_exec *e, UINT8 cls, const struct mad_resource *r) {
+    struct mad_queue *q = e->q;
+    unsigned i;
+    if (cls == BC_NONE || cls == BC_RAR) return;
+    if (cls == BC_ALL) { e->f7_all = 1; return; }
+    for (i = 0; i < q->f6_npend; i++) {
+        const struct mad_f6_pend *p = &q->f6_pend[i];
+        if ((cls == BC_RAW_ATT && p->kind == F6_RENDER && r && f7_has_att(p, r)) ||
+            (cls == BC_RAW_COPY && p->kind == F6_BLIT) ||
+            (cls == BC_RAW_UAV && p->kind != F6_BLIT)) e->f7_mask |= 1ull << i;
+    }
+    if (cls == BC_RAW_ATT && e->renc && r) {
+        unsigned k;
+        for (k = 0; k < e->enc_nrt; k++) if (e->enc_rt[k] == r) e->f7_open = 1;
+        if (e->enc_depth == r) e->f7_open = 1;
+    }
+    if (cls == BC_RAW_COPY && e->benc) e->f7_open = 1;
+    if (cls == BC_RAW_UAV && (e->cenc || e->renc)) e->f7_open = 1;
+}
+static void f7_census_barrier(struct mad_exec *e, const struct mad_cmd *c) {
+    unsigned k;
+    for (k = 0; k < c->u.barrier.n; k++) {
+        UINT8 cls = c->u.barrier.cls[k];
+        if (cls < 5) InterlockedIncrement(&g_bc_ent[cls]);
+        f7_need(e, cls, c->u.barrier.res[k]);
+    }
+    if (c->u.barrier.cls_noref != BC_NONE) {
+        if (c->u.barrier.cls_noref < 5) InterlockedIncrement(&g_bc_ent[c->u.barrier.cls_noref]);
+        f7_need(e, c->u.barrier.cls_noref, NULL);
+    }
+    e->f7_reason |= 1;
+}
 static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) {
     struct wmtcmd_render_fence_op f;
-    obj_handle_t fence = mad_enc_fence(e->q->device);
-    if (!enc || !fence) return;
-    if (g_fence_chain == 6) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134 */
-    if (!update && (g_fence_chain == 2 || g_fence_chain == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
+    obj_handle_t fence;
+    if (!enc || !e->mode) return;   /* ml1136: the list's own mode */
+    fence = mad_enc_fence_obj(e->q->device);
+    if (!fence) return;
+    if (e->mode == 6) { if (update) f6_end(e, F6_RENDER, enc); else f6_begin(e, F6_RENDER, enc); return; }   /* ml1134 */
+    if (!update) f6_drain(e, F6_RENDER, enc);   /* ml1136 */
+    if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
     f.type = update ? WMTRenderCommandUpdateFence : WMTRenderCommandWaitForFence;
     f.fence = fence;
@@ -1390,7 +1621,7 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
      * vertex-stage wait (skinning, culling, indirect arguments). Hazard it does
      * not cover: a vertex shader reading a texture the previous render pass
      * just drew. */
-    if (!update && g_fence_chain == 5) {
+    if (!update && e->mode == 5) {
         if (InterlockedExchange(&e->q->device->f5_nonrender, 0)) f.stages = (enum WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageObject);
         else f.stages = WMTRenderStageFragment;
     }
@@ -1399,10 +1630,13 @@ static void exec_fence_render(struct mad_exec *e, obj_handle_t enc, int update) 
 }
 static void exec_fence_blit(struct mad_exec *e, obj_handle_t enc, int update) {
     struct wmtcmd_blit_fence_op f;
-    obj_handle_t fence = mad_enc_fence(e->q->device);
-    if (!enc || !fence) return;
-    if (g_fence_chain == 6) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134 */
-    if (!update && (g_fence_chain == 2 || g_fence_chain == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
+    obj_handle_t fence;
+    if (!enc || !e->mode) return;   /* ml1136 */
+    fence = mad_enc_fence_obj(e->q->device);
+    if (!fence) return;
+    if (e->mode == 6) { if (update) f6_end(e, F6_BLIT, enc); else f6_begin(e, F6_BLIT, enc); return; }   /* ml1134 */
+    if (!update) f6_drain(e, F6_BLIT, enc);   /* ml1136 */
+    if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
     if (update) InterlockedExchange(&e->q->device->f5_nonrender, 1);   /* ml1118 */
     f.type = update ? WMTBlitCommandUpdateFence : WMTBlitCommandWaitForFence;
@@ -1412,10 +1646,13 @@ static void exec_fence_blit(struct mad_exec *e, obj_handle_t enc, int update) {
 }
 static void exec_fence_compute(struct mad_exec *e, obj_handle_t enc, int update) {
     struct wmtcmd_compute_fence_op f;
-    obj_handle_t fence = mad_enc_fence(e->q->device);
-    if (!enc || !fence) return;
-    if (g_fence_chain == 6) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134 */
-    if (!update && (g_fence_chain == 2 || g_fence_chain == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
+    obj_handle_t fence;
+    if (!enc || !e->mode) return;   /* ml1136 */
+    fence = mad_enc_fence_obj(e->q->device);
+    if (!fence) return;
+    if (e->mode == 6) { if (update) f6_end(e, F6_COMPUTE, enc); else f6_begin(e, F6_COMPUTE, enc); return; }   /* ml1134 */
+    if (!update) f6_drain(e, F6_COMPUTE, enc);   /* ml1136 */
+    if (!update && (e->mode == 2 || e->mode == 3)) { if (!e->fence_needed) return; e->fence_needed = 0; e->nwr = 0; e->wr_all = 0; }   /* ml1111, ml1116 */
     memset(&f, 0, sizeof f);
     if (update) InterlockedExchange(&e->q->device->f5_nonrender, 1);   /* ml1118 */
     f.type = update ? WMTComputeCommandUpdateFence : WMTComputeCommandWaitForFence;
@@ -1424,11 +1661,76 @@ static void exec_fence_compute(struct mad_exec *e, obj_handle_t enc, int update)
     InterlockedIncrement(update ? &g_fence_updates : &g_fence_waits);
 }
 
+static UINT mad_pf_bytes(UINT pf);
+/* ml1137: attachment census (1 in 16 frames). Bytes are the attachment's full
+ * mip level at its texel size; what matters is the split, not the absolute. */
+static LONG64 f7_att_bytes(const struct mad_resource *r, UINT level) {
+    UINT b = mad_pf_bytes((UINT)r->tex_pf), w = r->width >> level, h = r->height >> level;
+    if (!b) b = r->is_depth ? (r->has_stencil ? 5 : 4) : 4;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    return (LONG64)w * h * b * (r->samples ? r->samples : 1);
+}
+/* A stored attachment: what happens to it NEXT in this command list? cleared =
+ * the store was wasted; read / rebound = needed; write = overwritten by a write
+ * state (usually needed: partial writes); none = no use in this list. */
+static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UINT level) {
+    const struct mad_list *l = e->l;
+    LONG64 b = f7_att_bytes(r, level), *cls = &g_ac_st_none;
+    unsigned j, k, lim;
+    int rebound = 0;
+    InterlockedExchangeAdd64(&g_ac_store, b);
+    for (k = 0; k < e->npend; k++) if (e->pend[k].res == r) { cls = &g_ac_st_cleared; goto done; }
+    if (e->f7_next_rts) {
+        for (k = 0; k < e->nrt; k++) if (e->rt[k] == r) rebound = 1;
+        if (e->depth == r) rebound = 1;
+    }
+    lim = e->cur + 4096 < l->ncmds ? e->cur + 4096 : l->ncmds;
+    for (j = e->cur; j < lim; j++) {
+        const struct mad_cmd *c = &l->cmds[j];
+        switch (c->kind) {
+        case MC_CLEAR_RT: case MC_CLEAR_DS:
+            if (c->u.clear.res == r) { cls = &g_ac_st_cleared; goto done; }
+            break;
+        case MC_RTS:
+            for (k = 0; k < c->u.rts.n; k++) if (c->u.rts.rt[k] == r) rebound = 1;
+            if (c->u.rts.depth == r) rebound = 1;
+            break;
+        case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH: case MC_DISPATCH_INDIRECT:
+            if (rebound) { cls = &g_ac_st_rebound; goto done; }
+            break;
+        case MC_BARRIER:
+            for (k = 0; k < c->u.barrier.n; k++)
+                if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : c->u.barrier.cls[k] == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
+            break;
+        case MC_COPY_T2T:
+            if (c->u.tt.src == r) { cls = &g_ac_st_read; goto done; }
+            if (c->u.tt.dst == r) { cls = &g_ac_st_write; goto done; }
+            break;
+        case MC_COPY_T2B:
+            if (c->u.bt.tex == r) { cls = &g_ac_st_read; goto done; }
+            break;
+        case MC_COPY_B2T:
+            if (c->u.bt.tex == r) { cls = &g_ac_st_write; goto done; }
+            break;
+        default: break;
+        }
+    }
+    if (rebound) cls = &g_ac_st_rebound;
+done:
+    InterlockedExchangeAdd64(cls, b);
+}
 static void exec_end(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
     if (e->renc) exec_fence_render(e, e->renc, 1);     /* ml1091 */
     if (e->benc) exec_fence_blit(e, e->benc, 1);
     if (e->cenc) exec_fence_compute(e, e->cenc, 1);
+    if (e->renc && g_att_census && e->l) {   /* ml1137 */
+        unsigned k;
+        for (k = 0; k < e->enc_nrt; k++) if (e->enc_rt[k] && e->enc_rt[k]->texture) f7_store_census(e, e->enc_rt[k], e->enc_rtp[k].level);
+        if (e->enc_depth && e->enc_depth->texture) f7_store_census(e, e->enc_depth, e->enc_dp.level);
+    }
+    e->f7_next_rts = 0;
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
         MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
@@ -1451,9 +1753,23 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
     mad_mip_dims(r, v->level, &w, &h, &d);
     if (options == 2) bytes = 1;                                              /* stencil aspect */
     else if (r->is_depth) { bytes = r->tex_pf == WMTPixelFormatDepth16Unorm ? 2 : 4; options = r->has_stencil ? 1 : 0; }
-    else { mad_format_info(r->desc.Format, &bytes, &block); if (block != 1 || !bytes) return; }   /* compressed targets do not exist; typed only */
+    else { mad_format_info(r->desc.Format, &bytes, &block); if (!bytes || (block != 1 && block != 4)) return; }
     if (!w || !h) return;
-    bpr = (UINT64)w * bytes; total = bpr * h;
+    /* ml1141: block-compressed textures (sampled inputs, never targets) copy out
+     * as whole 4x4 blocks: bytes is per BLOCK there. */
+    bpr = (UINT64)((w + block - 1) / block) * bytes; total = bpr * ((h + block - 1) / block);
+    {   /* ml1140: big atlases (Lumen surface cache, shadow maps: 4096^2 at 16-64 MB
+         * each) ate the whole budget in the first capture of a UE5 frame, so the
+         * G-buffer, lighting and final image were never written. Skip targets over
+         * 16 MB unless madeira.cfg capture-big = 1. */
+        static int big = -1; static unsigned said_big;
+        if (big < 0) big = mad_cfg_int_pe("capture-big", 0) ? 1 : 0;
+        if (!big && total > (16ull << 20)) {
+            if (said_big++ < 8) d3d12_log("[capture] ml1140 skipped a %ux%u target (%llu MB) at enc#%u; set capture-big = 1 to include atlases\n",
+                                          w, h, (unsigned long long)(total >> 20), seq);
+            return;
+        }
+    }
     if (g_cap_bytes + total > MAD_CAPTURE_BUDGET) {
         if (!said_budget++) d3d12_log("[capture] budget of %llu MB reached at enc#%u; later targets of this frame are not captured\n",
                                       (unsigned long long)(MAD_CAPTURE_BUDGET >> 20), seq);
@@ -1584,12 +1900,108 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
     exec_fence_blit(e, benc, 1);
     MTLCommandEncoder_endEncoding(benc);
 }
+/* ml1141: everything a matched DISPATCH will read, logged range by range from
+ * the root signature and copied out BEFORE it runs. Converter (DXIL) pipelines
+ * only: the sm5 backend's tables are logged by mad_air_build_tables. */
+static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_device *d = e->q->device; const struct mad_rootsig *rs = e->crs;
+    static struct mad_resource *seen[96]; static unsigned nseen; static UINT64 seen_frame;
+    obj_handle_t benc; unsigned i, k, ri, seq; char line[1024]; int n;
+    static const char *const rt_name[4] = { "SRV", "UAV", "CBV", "SMP" };
+    if (!rs) return;
+    if (seen_frame != g_capture_frame) { seen_frame = g_capture_frame; nseen = 0; }
+    exec_end(e);
+    benc = MTLCommandBuffer_blitCommandEncoder(e->cb); if (!benc) return;
+    seq = ++g_enc_seq;
+    exec_fence_blit(e, benc, 0);
+    d3d12_log("[capture-cs] ml1141 ===== '%s' #%d list#%u enc#%u %s %ux%ux%u, %u root params =====\n", e->cpso->vs_name, g_capture_cs_shots,
+              g_list_seq, seq, c->kind == MC_DISPATCH_INDIRECT ? "indirect" : "direct",
+              c->kind == MC_DISPATCH ? c->u.dispatch.x : 0, c->kind == MC_DISPATCH ? c->u.dispatch.y : 0, c->kind == MC_DISPATCH ? c->u.dispatch.z : 0,
+              (unsigned)rs->nparams);
+    if (c->kind == MC_DISPATCH_INDIRECT && c->u.ind.args) mad_capture_buffer(e, benc, c->u.ind.args, c->u.ind.off, 12, "iargs", 0, seq);
+    for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
+        const struct madeira_ir_root_param *p = &rs->params[i]; UINT64 va = e->croot[i];
+        if (p->type == MADEIRA_IR_PARAM_CONSTANTS) {
+            n = snprintf(line, sizeof line, "[capture-cs] p%u: %u root constants (b%u space%u):", i, p->num_constants, p->shader_register, p->register_space);
+            for (k = 0; k < p->num_constants && k < 16; k++) n += snprintf(line + n, sizeof line - n, " %08x", e->cconsts[i][k]);
+            d3d12_log("%s\n", line);
+            continue;
+        }
+        if (p->type != MADEIRA_IR_PARAM_TABLE) {   /* root CBV / SRV / UAV: a GPU address */
+            UINT64 off = 0; struct mad_resource *r = va ? mad_resolve_address(d, va, &off) : NULL;
+            d3d12_log("[capture-cs] p%u: root %s r%u space%u va=0x%llx -> %s size %llu +%llu\n", i,
+                      p->type == MADEIRA_IR_PARAM_CBV ? "CBV" : p->type == MADEIRA_IR_PARAM_SRV ? "SRV" : "UAV", p->shader_register, p->register_space,
+                      (unsigned long long)va, r ? (r->name ? r->name : "buffer") : "NOTHING LIVE", r ? (unsigned long long)r->size : 0ull, (unsigned long long)off);
+            if (r && r->buffer && p->type == MADEIRA_IR_PARAM_CBV) mad_capture_buffer(e, benc, r, off, 1024, "cb", i, seq);
+            continue;
+        }
+        {   /* descriptor table: which heap, then every range */
+            const struct mad_heap *h = NULL; unsigned base, run = 0;
+            if (e->srv && va >= e->srv->gpu_address && va < e->srv->gpu_address + (UINT64)e->srv->count * sizeof(struct mad_descriptor)) h = e->srv;
+            else if (e->smp && va >= e->smp->gpu_address && va < e->smp->gpu_address + (UINT64)e->smp->count * sizeof(struct mad_descriptor)) h = e->smp;
+            if (!h || !h->cpu) { d3d12_log("[capture-cs] p%u: table va=0x%llx is in no bound heap\n", i, (unsigned long long)va); continue; }
+            base = (unsigned)((va - h->gpu_address) / sizeof(struct mad_descriptor));
+            for (ri = 0; ri < p->num_ranges; ri++) {
+                const struct madeira_ir_root_range *rg; unsigned nd, off;
+                if (p->first_range + ri >= rs->nranges) break;
+                rg = &rs->ranges[p->first_range + ri];
+                nd = rg->num_descriptors; if (nd == 0xffffffffu || nd > 64) nd = 64;
+                off = rg->table_offset != 0xffffffffu ? rg->table_offset : run;
+                run = off + nd;
+                for (k = 0; k < nd && base + off + k < h->count; k++) {
+                    const struct mad_descriptor *de = &h->cpu[base + off + k];
+                    unsigned reg = rg->base_register + k;
+                    const char *rn = rt_name[rg->range_type & 3];
+                    if (rg->range_type == MADEIRA_IR_RANGE_SAMPLER) {
+                        float bias; UINT32 bb = (UINT32)de->metadata; memcpy(&bias, &bb, sizeof bias);
+                        if (de->gpu_va) d3d12_log("[capture-cs] p%u %s s%u space%u: sampler, LOD bias %.3f\n", i, rn, reg, rg->register_space, bias);
+                        continue;
+                    }
+                    if (de->texture_view_id && !(de->metadata >> 63)) {
+                        int xv = -1; struct mad_resource *r = mad_texture_of_view(d, de->texture_view_id, &xv);
+                        unsigned l0 = 0, nl, s0 = 0, u;
+                        if (!r) { d3d12_log("[capture-cs] p%u %s %c%u space%u: texture view %llx NOT FOUND\n", i, rn, rg->range_type == 1 ? 'u' : 't', reg, rg->register_space, (unsigned long long)de->texture_view_id); continue; }
+                        nl = r->tex_mips;
+                        if (xv >= 0) { l0 = r->xview[xv].lvl0; nl = r->xview[xv].nlvl; s0 = r->xview[xv].sl0; }
+                        d3d12_log("[capture-cs] p%u %s %c%u space%u: %s %ux%u x%u type%u pf%u dx%u, %u mips, view mips %u+%u slice %u\n", i, rn,
+                                  rg->range_type == 1 ? 'u' : 't', reg, rg->register_space, r->name ? r->name : "?", r->width, r->height,
+                                  r->tex_layers, (unsigned)r->tex_type, (unsigned)r->tex_pf, (unsigned)r->desc.Format, r->tex_mips, l0, nl, s0);
+                        if (rg->range_type != MADEIRA_IR_RANGE_SRV) continue;
+                        for (u = 0; u < nseen; u++) if (seen[u] == r) break;
+                        if (u < nseen || nseen >= 96) continue;
+                        seen[nseen++] = r;
+                        { struct mad_rtvp v; memset(&v, 0, sizeof v); v.level = (UINT16)l0; v.slice = (UINT16)s0; v.layers = 1;
+                          mad_capture_one(e, benc, r, &v, seq, i * 1000 + off + k, "tex", 0); }
+                    } else if (de->gpu_va) {
+                        UINT64 boff = 0; struct mad_resource *br = mad_resolve_address(d, de->gpu_va, &boff);
+                        d3d12_log("[capture-cs] p%u %s %c%u space%u: buffer %s size %llu +%llu, metadata 0x%llx%s\n", i, rn,
+                                  rg->range_type == 1 ? 'u' : rg->range_type == 2 ? 'b' : 't', reg, rg->register_space,
+                                  br ? (br->name ? br->name : "buffer") : "NOTHING LIVE", br ? (unsigned long long)br->size : 0ull,
+                                  (unsigned long long)boff, (unsigned long long)de->metadata, (de->metadata >> 63) ? " (typed)" : "");
+                        if (br && br->buffer && rg->range_type == MADEIRA_IR_RANGE_CBV) mad_capture_buffer(e, benc, br, boff, 1024, "cb", i * 1000 + off + k, seq);
+                    } else if (de->texture_view_id) {
+                        d3d12_log("[capture-cs] p%u %s %c%u space%u: typed buffer view %llx, metadata 0x%llx\n", i, rn, rg->range_type == 1 ? 'u' : 't',
+                                  reg, rg->register_space, (unsigned long long)de->texture_view_id, (unsigned long long)de->metadata);
+                    }
+                }
+            }
+        }
+    }
+    exec_fence_blit(e, benc, 1);
+    MTLCommandEncoder_endEncoding(benc);
+}
 static long long mad_cfg_int_pe(const char *key, long long dflt) {
     struct madeira_ctl_args a; char v[64];
     memset(&a, 0, sizeof a); a.op = 2; a.ptr = (UINT64)(ULONG_PTR)v; a.len = sizeof v;
     snprintf(a.name, sizeof a.name, "%s", key);
     MadeiraCtl(&a);
     return (a.ret && v[0]) ? _strtoi64(v, NULL, 0) : dflt;
+}
+static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
+                  d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
+    return on;
 }
 
 static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {
@@ -1713,6 +2125,19 @@ static int exec_same_targets(struct mad_exec *e) {
 }
 
 static unsigned g_said_attachless;
+/* ml1142: madeira.cfg encoder-labels = 1 names every Metal encoder after the
+ * pass that opened it ("R#<seq> <vs>|<ps>", "C#<seq> <kernel>", "B#<seq> copy"),
+ * so Instruments' Metal System Trace attributes GPU time per pass. Off by
+ * default: one NSString per encoder is not free. */
+static int g_enc_labels = -1;
+static void mad_label(obj_handle_t enc, const char *fmt, ...) {
+    char s[128]; va_list ap; obj_handle_t str;
+    if (g_enc_labels < 0) g_enc_labels = mad_cfg_int_pe("encoder-labels", 0) ? 1 : 0;
+    if (!enc || !g_enc_labels) return;
+    va_start(ap, fmt); vsnprintf(s, sizeof s, fmt, ap); va_end(ap);
+    str = NSString_alloc_init(s, WMTUTF8StringEncoding);
+    if (str) { MTLCommandEncoder_setLabel(enc, str); NSObject_release(str); }
+}
 static int exec_begin_render(struct mad_exec *e) {
     struct WMTRenderPassInfo rpi;
     UINT i, w = 0, h = 0;
@@ -1720,6 +2145,7 @@ static int exec_begin_render(struct mad_exec *e) {
     int attachless = 0;
     if (exec_same_targets(e)) { InterlockedIncrement(&g_pass_reused); return 1; }
     if (e->renc) InterlockedIncrement(&g_pass_end_rts);
+    e->f7_next_rts = 1;   /* ml1137: the pass being closed hands over to the targets bound now */
     exec_end(e);
     /* ml934: a render pass with NO colour target AND no depth is legal in
      * D3D12, and it is exactly what Nanite's hardware rasteriser uses: it
@@ -1789,7 +2215,15 @@ static int exec_begin_render(struct mad_exec *e) {
         if (v) { rpi.visibility_buffer = mad_vis_chunk(e, v, v->next, NULL); e->enc_vis_buf = rpi.visibility_buffer; }
     }
     e->vis_prev = ~(UINT64)0;
+    if (g_att_census) {   /* ml1137 */
+        for (i = 0; i < e->nrt; i++)
+            if (e->rt[i] && e->rt[i]->texture)
+                InterlockedExchangeAdd64(rpi.colors[i].load_action == WMTLoadActionClear ? &g_ac_clear : &g_ac_load, f7_att_bytes(e->rt[i], e->rtp[i].level));
+        if (e->depth && e->depth->texture)
+            InterlockedExchangeAdd64(rpi.depth.load_action == WMTLoadActionClear ? &g_ac_clear : &g_ac_load, f7_att_bytes(e->depth, e->dp.level));
+    }
     e->renc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (e->renc) e->renc_seq = ++g_enc_seq;
+    if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
     for (i = 0; i < e->nrt && e->f6_natt < 8; i++) if (e->rt[i]) e->f6_att[e->f6_natt++] = e->rt[i];
     if (e->depth) e->f6_att[e->f6_natt++] = e->depth;
@@ -1821,6 +2255,7 @@ static int exec_begin_blit(struct mad_exec *e) {
     if (e->renc) InterlockedIncrement(&g_pass_end_blit);
     exec_end(e);
     e->benc = MTLCommandBuffer_blitCommandEncoder(e->cb); if (e->benc) g_enc_seq++;
+    if (g_enc_labels) mad_label(e->benc, "B#%u copy", g_enc_seq);   /* ml1142 */
     if (e->benc) exec_fence_blit(e, e->benc, 0);   /* ml1091 */
     if (!e->benc) d3d12_log("[madeira-d3d12] no blit encoder\n");
     return e->benc != 0;
@@ -2386,7 +2821,14 @@ static int mad_air_build_vb_table_mask(struct mad_exec *e, const struct mad_pso 
             continue;
         }
         tab[idx].base = r->gpu_address + e->vb[slot].off;
-        tab[idx].stride = e->vb[slot].stride ? e->vb[slot].stride : pso->vb_stride[slot];
+        /* ml1153: a BOUND stream's StrideInBytes is used as given, 0 included:
+         * D3D reads the same element for every vertex/instance then (the ml904
+         * rule, which only the vertex-descriptor path had). Promoting 0 to the
+         * packed stride made UE's GPU-culled instanced draws read the NEXT
+         * draws' per-draw instance offsets (a stride-0 uint stream), so every
+         * foliage vertex/instance took another plant's transform: the depth
+         * prepass and the base pass drew different grass (ph-valley09/10). */
+        tab[idx].stride = e->vb[slot].stride;
         tab[idx].length = (UINT32)(r->size > e->vb[slot].off ? r->size - e->vb[slot].off : 0);
         n++;
     }
@@ -3042,6 +3484,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_draw c_draw;
     struct wmtcmd_render_draw_indexed c_dix;
     struct wmtcmd_render_draw_meshthreadgroups c_mesh;   /* ml927 */
+    struct wmtcmd_render_dxmt_geometry_draw c_gd; struct wmtcmd_render_dxmt_geometry_draw_indexed c_gdi; UINT64 gs_daboff = 0;   /* ml1147 */
     struct wmtcmd_render_setvisibilitymode c_vis;         /* ml1088 */
     struct mad_gs_drawinfo gdi; int gsemu;
     struct mad_tess *tv = NULL; unsigned tfmt = 0;   /* ml1083: the tessellation pipeline and index-format variant in use */
@@ -3068,7 +3511,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     if (g_census_on) { exec_capture_draw(e, c); exec_desc_check(e, e->rs, e->root, e->pso->vs_name); }   /* ml910/ml913 */
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
     g_dump_tables = 0;
-    if (g_capture_on && g_capture_ps[0] && e->pso->ps_name[0] && !strcmp(e->pso->ps_name, g_capture_ps) && g_capture_ps_shots < 4) {   /* ml1106 */
+    if (g_capture_on && g_capture_ps[0] && e->pso->ps_name[0] && strstr(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots */
         g_capture_ps_shots++;
         mad_capture_draw_inputs(e, c);
         if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
@@ -3099,6 +3542,18 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
          * pass is begun (its clears are real) and the draw is dropped, counted. */
         InterlockedIncrement(&g_tess_draws);
         MAD_SKIP(e); return;
+    }
+    if (((e->pso->tess && e->pso->tess->is_gs) || e->pso->tess_strip) && (c->kind == MC_DRAW || c->kind == MC_DRAW_INDEXED)) {   /* ml1147 */
+        int strip = e->topo == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP || e->topo == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ||
+                    e->topo == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ || e->topo == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ;
+        struct mad_tess *gv = strip ? e->pso->tess_strip : e->pso->tess;   /* ml1147b */
+        tfmt = c->kind == MC_DRAW_INDEXED ? (e->ib_type == WMTIndexTypeUInt32 ? 2u : 1u) : 0u;
+        if (gv && gv->obj[tfmt].rps) { tv = gv; goto tess_go; }
+        {
+            static unsigned said_strip;
+            if (said_strip++ < 8) d3d12_log("[madeira-d3d12] ml1147 %s draw (topology %u, index format %u) has no geometry variant: drawn without its geometry stage\n",
+                                            strip ? "strip" : "list", (unsigned)e->topo, tfmt);
+        }
     }
 tess_go:
     if (!exec_arg_slot(e, &argbuf, &argoff)) { MAD_SKIP(e); return; }
@@ -3152,8 +3607,8 @@ tess_go:
         UINT64 vcboff = 0, vargoff = 0, hcboff = 0, hargoff = 0, dcboff = 0, dargoff = 0, pcboff = 0, pargoff = 0, vbtoff = 0, daboff = 0, dgpu = 0;
         void *dcpu = NULL; UINT32 dp[5] = { 0, 0, 0, 0, 0 };
         if (!mad_air_build_tess_tables(e, &tv->obj[tfmt].vs, MADEIRA_IR_VIS_VERTEX, &vcb, &vcboff, &varg, &vargoff)) { MAD_SKIP(e); return; }
-        if (!mad_air_build_tess_tables(e, &tv->obj[tfmt].hs, MADEIRA_IR_VIS_HULL,   &hcb, &hcboff, &harg, &hargoff)) { MAD_SKIP(e); return; }
-        if (!mad_air_build_tess_tables(e, &tv->ds,           MADEIRA_IR_VIS_DOMAIN, &dcb, &dcboff, &darg, &dargoff)) { MAD_SKIP(e); return; }
+        if (!tv->is_gs && !mad_air_build_tess_tables(e, &tv->obj[tfmt].hs, MADEIRA_IR_VIS_HULL, &hcb, &hcboff, &harg, &hargoff)) { MAD_SKIP(e); return; }
+        if (!mad_air_build_tess_tables(e, &tv->ds, tv->is_gs ? MADEIRA_IR_VIS_GEOMETRY : MADEIRA_IR_VIS_DOMAIN, &dcb, &dcboff, &darg, &dargoff)) { MAD_SKIP(e); return; }   /* ml1147 */
         if (e->pso->ps_fn &&
             !mad_air_build_tables(e, e->rs, e->root, (const UINT32 (*)[64])e->consts,
                                   e->pso, 1, &pcb, &pcboff, &parg, &pargoff)) { MAD_SKIP(e); return; }
@@ -3162,6 +3617,7 @@ tess_go:
          * the start index is in ELEMENTS and the index buffer is bound at its
          * view's base, the object function adds the two. */
         if (!exec_ring_take_z(e, 1, 64, &dab, &daboff, &dcpu, &dgpu)) { MAD_SKIP(e); return; }   /* ml1130 */
+        gs_daboff = daboff;   /* ml1147: the geometry draw re-points object buffer 21 at this offset */
         if (c->kind == MC_DRAW_INDEXED) {
             dp[0] = c->u.drawi.icount; dp[1] = c->u.drawi.inst ? c->u.drawi.inst : 1; dp[2] = c->u.drawi.start;
             dp[3] = (UINT32)c->u.drawi.base; dp[4] = c->u.drawi.istart;
@@ -3380,7 +3836,41 @@ tess_go:
                           c->u.draw.vcount, c->u.draw.vstart, c->u.draw.icount);
         d3d12_log("%s\n", line);
     }
-    if (tv) {   /* ml1083: one object threadgroup per (patches_per_group) patches, per instance */
+    if (tv && tv->is_gs) {   /* ml1147: DXMT's geometry draw -- warps of 30/32 vertices, one object threadgroup each, per instance */
+        UINT count = c->kind == MC_DRAW_INDEXED ? c->u.drawi.icount : c->u.draw.vcount;
+        UINT inst = c->kind == MC_DRAW_INDEXED ? c->u.drawi.inst : c->u.draw.icount;
+        UINT vpw = 32, inc = 32, warps;
+        static unsigned said_gsbig, said_gsdraw;
+        if (!inst) inst = 1;
+        switch (e->topo) {   /* DXMT get_gs_vertex_count(): {vertices per warp, advance per warp} */
+        case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST: case D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST_ADJ: vpw = 30; inc = 30; break;
+        case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:          vpw = 32; inc = 31; break;
+        case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:      vpw = 32; inc = 30; break;
+        case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:      vpw = 32; inc = 29; break;
+        case D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:  vpw = 32; inc = 28; break;
+        default: vpw = 32; inc = 32; break;
+        }
+        if (c->kind == MC_DRAW_INDEXED && (!e->ib || !e->ib->buffer)) { MAD_SKIP(e); tail->next.ptr = NULL; return; }
+        if (!count) { tail->next.ptr = NULL; return; }   /* nothing to draw, not a failure */
+        warps = (count - 1) / inc + 1;
+        if ((UINT64)warps * inst > 0xffffffffull) {
+            if (said_gsbig++ < 4) d3d12_log("[madeira-d3d12] ml1147 geometry draw too large: %u x %u object threadgroups; skipped\n", warps, inst);
+            MAD_SKIP(e); tail->next.ptr = NULL; return;
+        }
+        if (c->kind == MC_DRAW_INDEXED) {
+            memset(&c_gdi, 0, sizeof c_gdi); c_gdi.type = WMTRenderCommandDXMTGeometryDrawIndexed;
+            c_gdi.draw_arguments_offset = gs_daboff; c_gdi.index_buffer = e->ib->buffer; c_gdi.index_buffer_offset = e->ib_off;
+            c_gdi.warp_count = warps; c_gdi.instance_count = inst; c_gdi.vertex_per_warp = vpw;
+            MAD_APPEND(&c_gdi);
+        } else {
+            memset(&c_gd, 0, sizeof c_gd); c_gd.type = WMTRenderCommandDXMTGeometryDraw;
+            c_gd.draw_arguments_offset = gs_daboff; c_gd.warp_count = warps; c_gd.instance_count = inst; c_gd.vertex_per_warp = vpw;
+            MAD_APPEND(&c_gd);
+        }
+        if (said_gsdraw++ < 8) d3d12_log("[madeira-d3d12] ml1147 geometry draw: %s %u x %u warps of %u, gs '%s'\n",
+                                         c->kind == MC_DRAW_INDEXED ? "indexed" : "plain", warps, inst, vpw, tv->ds_name);
+        InterlockedIncrement(&g_gs_drawn);
+    } else if (tv) {   /* ml1083: one object threadgroup per (patches_per_group) patches, per instance */
         UINT ncp = (UINT)e->topo - (UINT)D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + 1u;
         UINT count = c->kind == MC_DRAW_INDEXED ? c->u.drawi.icount : c->u.draw.vcount;
         UINT inst = c->kind == MC_DRAW_INDEXED ? c->u.drawi.inst : c->u.draw.icount;
@@ -3495,6 +3985,7 @@ tess_go:
     }
 }
 
+#define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
@@ -3506,6 +3997,18 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_FILL_BB: {
         struct wmtcmd_blit_fillbuffer k;
         if (!c->u.fill.res->buffer) { MAD_SKIP(e); return; }
+        if (c->u.fill.pattern) {   /* ml1151: a value whose bytes differ, copied from its pattern buffer */
+            struct wmtcmd_blit_copy_from_buffer_to_buffer cp; UINT64 o;
+            for (o = 0; o < c->u.fill.len; o += MAD_FILLPAT_BYTES) {
+                memset(&cp, 0, sizeof cp);
+                cp.type = WMTBlitCommandCopyFromBufferToBuffer;
+                cp.src = c->u.fill.pattern; cp.src_offset = 0;
+                cp.dst = c->u.fill.res->buffer; cp.dst_offset = c->u.fill.off + o;
+                cp.copy_length = c->u.fill.len - o < MAD_FILLPAT_BYTES ? c->u.fill.len - o : MAD_FILLPAT_BYTES;
+                MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&cp);
+            }
+            return;
+        }
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandFillBuffer;
         k.buffer = c->u.fill.res->buffer; k.offset = c->u.fill.off; k.length = c->u.fill.len; k.value = c->u.fill.byte;
@@ -3591,10 +4094,16 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
      * measurement in a census frame, and the census frames themselves, were
      * wrong because of that (Astra, 2026-09-16). */
     if (g_census_on) exec_capture_cs(e, c);   /* ml920 */
+    if (g_capture_on && g_capture_cs[0] && g_capture_cs_shots < g_capture_cs_max && e->cpso->backend != MADEIRA_IR_BACKEND_AIRCONV &&
+        (!g_capture_cs_ind || c->kind == MC_DISPATCH_INDIRECT) && !strcmp(e->cpso->vs_name, g_capture_cs)) {   /* ml1141 */
+        g_capture_cs_shots++;
+        mad_capture_dispatch_inputs(e, c);
+    }
     if (!e->cenc) {
         if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
         exec_end(e);
         e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false); if (e->cenc) g_enc_seq++;
+        if (g_enc_labels) mad_label(e->cenc, "C#%u %s", g_enc_seq, e->cpso->vs_name);   /* ml1142 */
         if (!e->cenc) { d3d12_log("[madeira-d3d12] no compute encoder\n"); MAD_SKIP(e); return; }
         exec_fence_compute(e, e->cenc, 0);   /* ml1091 */
     }
@@ -3695,12 +4204,15 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     memset(&e, 0, sizeof e);
     e.fence_needed = 1;   /* ml1111: the first encoder of a list waits for whatever ran before it */
     e.f6_sync_needed = 1; e.f6_list_start = 1;   /* ml1134: and, in mode 6, for the device fence too */
+    e.mode = mad_fence_mode(q->device);          /* ml1136: fixed for the whole list */
+    e.f7_reason = 2;                             /* ml1137: list start */
     e.q = q; e.l = l; e.cb = cb;
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
+        e.cur = i;   /* ml1137 */
         switch (c->kind) {
         case MC_PSO: if (c->u.pso && c->u.pso->is_compute) e.cpso = c->u.pso; else e.pso = c->u.pso; break;
         case MC_CROOTSIG: e.crs = c->u.rootsig; break;
@@ -3751,7 +4263,8 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (g_barrier_render < 0) { g_barrier_render = mad_cfg_int_pe("barrier-render", 0) ? 1 : 0;
                                         d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n", g_barrier_render, g_barrier_render ? "CLOSED" : "left open"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
-            if (g_fence_chain == 6) {   /* ml1134: see f6_begin */
+            if (e.mode == 6) {   /* ml1134: see f6_begin */
+                f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
                 if (e.cenc && e.f6_enc_synced && g_f6_compute_open) InterlockedIncrement(&g_f6_kept_open);
@@ -3763,7 +4276,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 }
                 break;
             }
-            if (g_fence_chain == 3) {   /* ml1116: only if a transitioned resource was written since the last wait */
+            if (e.mode == 3) {   /* ml1116: only if a transitioned resource was written since the last wait */
                 unsigned bi, wi; int hit = c->u.barrier.all || e.wr_all;
                 for (bi = 0; bi < c->u.barrier.n && !hit; bi++)
                     for (wi = 0; wi < e.nwr; wi++) if (e.wr[wi] == c->u.barrier.res[bi]) { hit = 1; break; }
@@ -3815,6 +4328,22 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       InterlockedExchange(&g_pass_end_list, 0), InterlockedExchange(&g_pass_end_attachless, 0), InterlockedExchange(&g_pass_clear_only, 0),
                       (long long)(InterlockedExchange64(&g_pass_attach_bytes, 0) >> 20));
             if ((n % 3000) == 0) mad_skip_report();   /* ml1049 */
+        }
+    }
+    /* ml1150: the memory census on a clock, not a list count. A title that dies
+     * in its loading screen (ph-valley06/07: jetsam with Nanite on) never reaches
+     * list 3000, so ml1057 never printed and the GPU share of the footprint was a
+     * guess. Every 5 s: our categories, plus Metal's own total, which also covers
+     * what the categories do not (placement heaps, libraries, driver objects). */
+    {
+        static LONG64 last_census; static LARGE_INTEGER qpf;
+        LONG64 now = mad_qpc(), prev = last_census;
+        if (!qpf.QuadPart) QueryPerformanceFrequency(&qpf);
+        if (now - prev > 5 * qpf.QuadPart && InterlockedCompareExchange64(&last_census, now, prev) == prev) {
+            mad_acct_report();
+            if (e.q && e.q->device)
+                d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB\n",
+                          (unsigned long long)(MTLDevice_currentAllocatedSize(e.q->device->mtl_device) >> 20));
         }
     }
     {
@@ -4020,17 +4549,35 @@ static void mad_perf_present(void) {
                           g_perf_presents ? (double)g_perf_resetwaits / g_perf_presents : 0.0,
                           g_perf_presents ? 1000.0 * g_perf_waitjob_ticks / (double)fq.QuadPart / g_perf_presents : 0.0);
             g_perf_worker_ticks = g_perf_drain_ticks = g_perf_resetwait_ticks = g_perf_waitjob_ticks = 0; g_perf_jobs = g_perf_resetwaits = 0;
-            d3d12_log("[perf] ml1116 encoders per frame: fence waits %.1f, fence updates %.1f, barriers %.1f\n",
+            d3d12_log("[perf] ml1116 encoders per frame: fence waits %.1f, fence updates %.1f, barriers %.1f (fence-chain %d)\n",
                       g_perf_presents ? (double)(cw - lw) / g_perf_presents : 0.0, g_perf_presents ? (double)(cu - lu) / g_perf_presents : 0.0,
-                      g_perf_presents ? (double)(cb - lb) / g_perf_presents : 0.0);
+                      g_perf_presents ? (double)(cb - lb) / g_perf_presents : 0.0, g_fence_chain);
             lw = cw; lu = cu; lb = cb;
-            if (g_fence_chain == 6 && g_perf_presents) {   /* ml1134 */
+            if (g_f6_used && g_perf_presents) {   /* ml1134 */
                 double np = (double)g_perf_presents;
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
                           "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins\n",
                           b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np);
+            }
+            if (g_f6_used && g_perf_presents) {   /* ml1137 */
+                double np = (double)g_perf_presents;
+                LONG e0 = InterlockedExchange(&g_bc_ent[0], 0), e1 = InterlockedExchange(&g_bc_ent[1], 0), e2 = InterlockedExchange(&g_bc_ent[2], 0);
+                LONG e3 = InterlockedExchange(&g_bc_ent[3], 0), e4 = InterlockedExchange(&g_bc_ent[4], 0);
+                LONG bs = InterlockedExchange(&g_f7_bsync, 0), bn = InterlockedExchange(&g_f7_none, 0), bu = InterlockedExchange(&g_f7_subset, 0), ba = InterlockedExchange(&g_f7_all, 0);
+                LONG64 f6 = InterlockedExchange64(&g_f7_fw6, 0), fr = InterlockedExchange64(&g_f7_fwr, 0);
+                d3d12_log("[perf] ml1137 barrier census per frame: entries read->read %.1f, rt/depth->read %.1f, copy->read %.1f, uav %.1f, ->write/common/alias %.1f; "
+                          "barrier-caused syncs %.1f, of which a state-aware rule needs none %.1f, a subset %.1f, all %.1f; fences waited at them %.1f -> %.1f\n",
+                          e0 / np, e1 / np, e2 / np, e3 / np, e4 / np, bs / np, bn / np, bu / np, ba / np, f6 / np, fr / np);
+            }
+            if (g_ac_frames) {   /* ml1137 */
+                double nf = (double)InterlockedExchange(&g_ac_frames, 0), mb = 1048576.0;
+                d3d12_log("[perf] ml1137 attachments per census frame: load %.1f MB, clear %.1f MB, store %.1f MB, of which next in the list: cleared %.1f, read %.1f, "
+                          "rebound %.1f, written %.1f, no use %.1f MB; DiscardResource calls %ld (5 s)\n",
+                          InterlockedExchange64(&g_ac_load, 0) / mb / nf, InterlockedExchange64(&g_ac_clear, 0) / mb / nf, InterlockedExchange64(&g_ac_store, 0) / mb / nf,
+                          InterlockedExchange64(&g_ac_st_cleared, 0) / mb / nf, InterlockedExchange64(&g_ac_st_read, 0) / mb / nf, InterlockedExchange64(&g_ac_st_rebound, 0) / mb / nf,
+                          InterlockedExchange64(&g_ac_st_write, 0) / mb / nf, InterlockedExchange64(&g_ac_st_none, 0) / mb / nf, InterlockedExchange(&g_discards, 0));
             }
         }
         d3d12_log("[perf] ml1109 sync per frame: ExecuteCommandLists %.1f, Signal %.1f, fence waits %.1f (game blocked %.1f ms/frame = %.0f%% of wall), "
@@ -4489,7 +5036,7 @@ static void mad_list_wait_idle(struct mad_list *l) {
 static ID3D12Device10Vtbl g_device_vtbl;
 static ID3D12CommandQueueVtbl g_queue_vtbl;
 static ID3D12CommandAllocatorVtbl g_alloc_vtbl;
-static ID3D12GraphicsCommandListVtbl g_list_vtbl;
+static ID3D12GraphicsCommandList7Vtbl g_list_vtbl;
 static ID3D12FenceVtbl g_fence_vtbl;
 
 static HRESULT STDMETHODCALLTYPE device_QI(ID3D12Device *This, REFIID riid, void **out) {
@@ -4771,7 +5318,7 @@ static ULONG STDMETHODCALLTYPE device_AddRef(ID3D12Device *This) { return mad_ad
 static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
     struct mad_device *d = (struct mad_device *)This;
     LONG n = InterlockedDecrement(&d->refs);
-    if (n == 0) {
+    if (n == 0) { mad_pd_purge(This);   /* ml1143 */
         /* ml1064: the fence worker holds a raw pointer to this device (ph-rdr31
          * re-created the device on the way back to the menu and destroyed the old
          * one under a live worker). Drain it before anything is freed. */
@@ -4787,6 +5334,8 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
             unsigned k;
             if (g_hp_dev == d) g_hp_dev = NULL;
             for (k = 0; k < d->ntheaps; k++) { if (d->theaps[k].heap) NSObject_release(d->theaps[k].heap); free(d->theaps[k].fl); }
+            mad_mheap_reclaim(d, 1); free(d->mhret);   /* ml1148 */
+            for (k = 0; k < d->nfillpat; k++) if (d->fillpat[k].buf) NSObject_release(d->fillpat[k].buf);   /* ml1151 */
             free(d->theaps); free(d->hret);
             DeleteCriticalSection(&d->heap_lock);
         }
@@ -4922,13 +5471,13 @@ static HRESULT STDMETHODCALLTYPE cmdsig_QI(ID3D12CommandSignature *This, REFIID 
 static ULONG STDMETHODCALLTYPE cmdsig_AddRef(ID3D12CommandSignature *This) { return mad_addref((struct mad_obj *)This); }
 static ULONG STDMETHODCALLTYPE cmdsig_Release(ID3D12CommandSignature *This) { return mad_release((struct mad_obj *)This); }
 static HRESULT STDMETHODCALLTYPE cmdsig_GetPrivateData(ID3D12CommandSignature *This, REFGUID g, UINT *n, void *d) {
-    (void)This; (void)g; (void)d; if (n) *n = 0; return DXGI_ERROR_NOT_FOUND;
+    return mad_pd_get(This, g, n, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE cmdsig_SetPrivateData(ID3D12CommandSignature *This, REFGUID g, UINT n, const void *d) {
-    (void)This; (void)g; (void)n; (void)d; return S_OK;
+    return mad_pd_set(This, g, n, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE cmdsig_SetPrivateDataInterface(ID3D12CommandSignature *This, REFGUID g, const IUnknown *d) {
-    (void)This; (void)g; (void)d; return S_OK;
+    return mad_pd_set_iface(This, g, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE cmdsig_SetName(ID3D12CommandSignature *This, LPCWSTR name) { (void)This; (void)name; return S_OK; }
 static HRESULT STDMETHODCALLTYPE cmdsig_GetDevice(ID3D12CommandSignature *This, REFIID riid, void **out) {
@@ -5055,14 +5604,24 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
     (void)visible_mask;
     for (i = 0; i < n; i++) {
         const D3D12_RESOURCE_DESC *d = &descs[i];
-        UINT64 bytes = 0, a = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-        if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) bytes = d->Width;
-        else {
+        UINT64 bytes = 0, a = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, msz = 0, mal = 0;
+        struct mad_device *md = (struct mad_device *)This;
+        if (d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            bytes = d->Width;
+            MTLDevice_heapBufferSizeAndAlign(md->mtl_device, d->Width ? d->Width : 1, WMTResourceStorageModePrivate, &msz, &mal);   /* ml1145 */
+        } else {
+            struct WMTTextureInfo ti; enum WMTPixelFormat pf; int isd;
             UINT subs = (d->MipLevels ? d->MipLevels : 1) *
                         (d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d->DepthOrArraySize ? d->DepthOrArraySize : 1));
             device_GetCopyableFootprints(This, d, 0, subs, 0, NULL, NULL, NULL, &bytes);
             if (d->SampleDesc.Count > 1) a = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
+            if (mad_texinfo_from_desc(d, &ti, &pf, &isd)) MTLDevice_heapTextureSizeAndAlign(md->mtl_device, &ti, &msz, &mal);   /* ml1145 */
         }
+        /* ml1145: a placed resource is really placed now, so the application must
+         * plan its heap with the size and alignment Metal needs, not the linear
+         * footprint (tiled textures, compression metadata, page rounding). */
+        if (msz > bytes) bytes = msz;
+        if (mal > a) a = mal;
         if (a > align) align = a;
         total = mad_align(total, a) + mad_align(bytes, a);
     }
@@ -5131,6 +5690,29 @@ static void mad_hp_free_locked(struct mad_texheap *h, UINT64 off, UINT64 size) {
     if (i + 1 < h->nfl && h->fl[i].off + h->fl[i].size == h->fl[i + 1].off) {
         h->fl[i].size += h->fl[i + 1].size;
         memmove(&h->fl[i + 1], &h->fl[i + 2], (h->nfl - i - 2) * sizeof *h->fl); h->nfl--;
+    }
+}
+/* ml1148: a D3D12 heap's Metal heap is released only once the GPU has finished
+ * every command buffer committed before the application released it, with two
+ * more completed after. ph-valley04/05: twice, a command buffer's own cleanup
+ * (IOGPUMetalCommandBufferStorageReset) released an object that was already
+ * freed, first during a capture and then while the fence mode was switched;
+ * heaps freed with placed resources still held by an in-flight command buffer
+ * are the new lifetime in ml1145. */
+static void mad_mheap_reclaim(struct mad_device *d, int all) {
+    obj_handle_t done_list[64]; void *done_mem[64]; unsigned nd = 0, i = 0;
+    UINT64 done;
+    if (!d) return;
+    done = mad_gpu_completed(d);
+    EnterCriticalSection(&d->heap_lock);
+    while (i < d->nmhret && nd < 64) {
+        if (all || d->mhret[i].serial + 2 <= done) { done_list[nd] = d->mhret[i].heap; done_mem[nd++] = d->mhret[i].mem; d->mhret[i] = d->mhret[--d->nmhret]; }
+        else i++;
+    }
+    LeaveCriticalSection(&d->heap_lock);
+    for (i = 0; i < nd; i++) {
+        if (done_list[i]) { mad_unresident(d, done_list[i]); NSObject_release(done_list[i]); }
+        if (done_mem[i]) VirtualFree(done_mem[i], 0, MEM_RELEASE);   /* ml1154: a file-backed CPU-visible buffer's storage */
     }
 }
 static void mad_hp_reclaim_locked(struct mad_device *d) {
@@ -5491,17 +6073,17 @@ static ULONG STDMETHODCALLTYPE qheap_AddRef(ID3D12QueryHeap *This) { return mad_
 static ULONG STDMETHODCALLTYPE qheap_Release(ID3D12QueryHeap *This) {
     struct mad_queryheap *q = (struct mad_queryheap *)This;
     LONG r = InterlockedDecrement(&q->refs);
-    if (r == 0) { free(q->results); DeleteCriticalSection(&q->lock); free(q); }   /* ml1088 */
+    if (r == 0) { mad_pd_purge(This);   /* ml1143 */ free(q->results); DeleteCriticalSection(&q->lock); free(q); }   /* ml1088 */
     return (ULONG)r;
 }
 static HRESULT STDMETHODCALLTYPE qheap_GetPrivateData(ID3D12QueryHeap *This, REFGUID g, UINT *n, void *d) {
-    (void)This; (void)g; (void)d; if (n) *n = 0; return DXGI_ERROR_NOT_FOUND;
+    return mad_pd_get(This, g, n, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE qheap_SetPrivateData(ID3D12QueryHeap *This, REFGUID g, UINT n, const void *d) {
-    (void)This; (void)g; (void)n; (void)d; return S_OK;
+    return mad_pd_set(This, g, n, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE qheap_SetPrivateDataInterface(ID3D12QueryHeap *This, REFGUID g, const IUnknown *d) {
-    (void)This; (void)g; (void)d; return S_OK;
+    return mad_pd_set_iface(This, g, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE qheap_SetName(ID3D12QueryHeap *This, LPCWSTR name) { (void)This; (void)name; return S_OK; }
 static HRESULT STDMETHODCALLTYPE qheap_GetDevice(ID3D12QueryHeap *This, REFIID riid, void **out) {
@@ -5774,7 +6356,7 @@ static void mad_addr_index_insert(struct mad_device *d, struct mad_resource *r) 
     if (!mad_aidx_grow(d, d->naidx + 1)) { d->aidx_dirty = 1; mad_aidx_end(d); return; }
     while (lo < hi) { unsigned m = (lo + hi) / 2; if (d->aidx[m].lo <= r->gpu_address) lo = m + 1; else hi = m; }
     memmove(&d->aidx[lo + 1], &d->aidx[lo], (d->naidx - lo) * sizeof *d->aidx);
-    d->aidx[lo].lo = r->gpu_address; d->aidx[lo].hi = r->gpu_address + r->size; d->aidx[lo].r = r; d->aidx[lo].seq = ++d->aidx_seq;
+    d->aidx[lo].lo = r->gpu_address; d->aidx[lo].hi = r->gpu_address + r->size; d->aidx[lo].r = r; d->aidx[lo].seq = r->track_seq;   /* ml1157 */
     __atomic_store_n(&d->naidx, d->naidx + 1, __ATOMIC_RELEASE);
     if (r->size > d->aidx_maxsize) d->aidx_maxsize = r->size;
     mad_aidx_end(d);
@@ -5792,6 +6374,7 @@ static void mad_addr_index_remove(struct mad_device *d, struct mad_resource *r) 
 static void mad_track(struct mad_device *d, struct mad_resource *r) {
     if (!d || !r) return;
     EnterCriticalSection(&d->live_lock);
+    r->track_seq = ++d->aidx_seq;   /* ml1157 */
     if (mad_grow((void **)&d->live, &d->live_cap, d->nlive + 1, sizeof *d->live)) { d->live[d->nlive++] = r; if (r->gpu_address && r->size) mad_addr_index_insert(d, r); }
     LeaveCriticalSection(&d->live_lock);
 }
@@ -5814,12 +6397,11 @@ static void mad_addr_index_rebuild(struct mad_device *d) {   /* live_lock held *
     for (i = 0; i < d->nlive; i++) {
         struct mad_resource *r = d->live[i];
         if (!r->gpu_address || !r->size) continue;
-        d->aidx[n].lo = r->gpu_address; d->aidx[n].hi = r->gpu_address + r->size; d->aidx[n].r = r; d->aidx[n].seq = i; n++;
+        d->aidx[n].lo = r->gpu_address; d->aidx[n].hi = r->gpu_address + r->size; d->aidx[n].r = r; d->aidx[n].seq = r->track_seq; n++;   /* ml1157: creation order, not live-array slot */
         if (r->size > d->aidx_maxsize) d->aidx_maxsize = r->size;
     }
     qsort(d->aidx, n, sizeof *d->aidx, mad_addr_cmp);
     __atomic_store_n(&d->naidx, n, __ATOMIC_RELEASE);
-    if (d->aidx_seq < d->nlive) d->aidx_seq = d->nlive;
     d->aidx_dirty = 0;
     mad_aidx_end(d);
 }
@@ -5847,10 +6429,15 @@ static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 add
         UINT64 maxsz = MAD_LD(d->aidx_maxsize);
         struct mad_resource *found = NULL;
         if (n && ax) {
-            unsigned lo = 0, hi = n, best_seq = ~0u; int i;
+            unsigned lo = 0, hi = n, best_seq = 0; int i;
             while (lo < hi) { unsigned m = (lo + hi) / 2; if (MAD_LD(ax[m].lo) <= addr) lo = m + 1; else hi = m; }
+            /* ml1157: of placed resources aliasing this address, the NEWEST. The
+             * oldest (the old rule) is the one the application is about to free:
+             * a command recorded against it held a dead resource by the time it
+             * ran (ph-valley16: a UAV clear's blit fill on a freed buffer, then
+             * objc_release of it when the command buffer completed). */
             for (i = (int)lo - 1; i >= 0 && MAD_LD(ax[i].lo) + maxsz > addr; i--)
-                if (addr < MAD_LD(ax[i].hi) && MAD_LD(ax[i].seq) < best_seq) { best_seq = MAD_LD(ax[i].seq); found = MAD_LD(ax[i].r); }
+                if (addr < MAD_LD(ax[i].hi) && (!found || MAD_LD(ax[i].seq) > best_seq)) { best_seq = MAD_LD(ax[i].seq); found = MAD_LD(ax[i].r); }
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* the reads above complete before the re-check */
         if (found && MAD_LD(d->aidx_ver) == v1) {
@@ -5869,15 +6456,15 @@ static struct mad_resource *mad_resolve_address_locked(struct mad_device *d, UIN
         /* last entry with lo <= addr, then back over entries that could still
          * contain addr (placed resources may alias); keep the live-order first
          * match, as the linear walk did. */
-        unsigned lo = 0, hi = d->naidx, best_seq = ~0u; int i;
+        unsigned lo = 0, hi = d->naidx, best_seq = 0; int i;
         while (lo < hi) { unsigned m = (lo + hi) / 2; if (d->aidx[m].lo <= addr) lo = m + 1; else hi = m; }
-        for (i = (int)lo - 1; i >= 0 && d->aidx[i].lo + d->aidx_maxsize > addr; i--)
-            if (addr < d->aidx[i].hi && d->aidx[i].seq < best_seq) { best_seq = d->aidx[i].seq; found = d->aidx[i].r; }
+        for (i = (int)lo - 1; i >= 0 && d->aidx[i].lo + d->aidx_maxsize > addr; i--)   /* ml1157: newest alias */
+            if (addr < d->aidx[i].hi && (!found || d->aidx[i].seq > best_seq)) { best_seq = d->aidx[i].seq; found = d->aidx[i].r; }
     }
     if (!found) {   /* miss: the slow path keeps the old semantics exactly and re-syncs the index */
         for (unsigned i = 0; i < d->nlive; i++) {
             struct mad_resource *r = d->live[i];
-            if (r->gpu_address && addr >= r->gpu_address && addr < r->gpu_address + r->size) { found = r; __atomic_store_n(&d->aidx_dirty, 1, __ATOMIC_RELAXED); break; }
+            if (r->gpu_address && addr >= r->gpu_address && addr < r->gpu_address + r->size && (!found || r->track_seq > found->track_seq)) { found = r; __atomic_store_n(&d->aidx_dirty, 1, __ATOMIC_RELAXED); }   /* ml1157: newest alias */
         }
         if (!found) InterlockedIncrement(&g_resolve_miss);   /* ml1132: a true miss always takes this lock */
     }
@@ -5899,7 +6486,7 @@ static ULONG STDMETHODCALLTYPE res_AddRef(ID3D12Resource *This) { return mad_add
 static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
     struct mad_resource *r = (struct mad_resource *)This;
     LONG n = InterlockedDecrement(&r->refs);
-    if (n == 0) {
+    if (n == 0) { mad_pd_purge(This);   /* ml1143 */
         /* The backend owns the storage, so releasing the buffer is the whole
          * teardown; there is no separate free to order against it. */
         mad_untrack(r->owner, r);
@@ -5921,12 +6508,26 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
         { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
         if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
-        if (r->buffer) mad_unresident(r->owner, r->buffer);
-        if (r->texture && !r->borrowed && !r->hp_used) mad_unresident(r->owner, r->texture);
+        if (r->buffer && !r->placed_heap) mad_unresident(r->owner, r->buffer);
+        if (r->texture && !r->borrowed && !r->hp_used && !r->placed_heap) mad_unresident(r->owner, r->texture);
         if (r->hp_used && r->owner) mad_hp_release(r->owner, r);   /* ml1072: block returns after the GPU is done with it */
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->xview); }
         if (r->buffer) NSObject_release(r->buffer);
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
+        if (r->placed_heap) ID3D12Heap_Release((ID3D12Heap *)r->placed_heap);   /* ml1145 */
+        if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
+            struct mad_device *md = r->owner; int queued = 0;
+            InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
+            if (md) {
+                EnterCriticalSection(&md->heap_lock);
+                if (mad_grow((void **)&md->mhret, &md->mhret_cap, md->nmhret + 1, sizeof *md->mhret)) {
+                    md->mhret[md->nmhret].heap = 0; md->mhret[md->nmhret].mem = r->own_mem;
+                    md->mhret[md->nmhret].serial = (UINT64)md->gpu_serial; md->nmhret++; queued = 1;
+                }
+                LeaveCriticalSection(&md->heap_lock);
+            }
+            if (!queued) { static unsigned said; if (said++ < 4) d3d12_log("[madeira-d3d12] ml1154 could not queue a buffer's storage for release; leaked %p\n", r->own_mem); }
+        }
         free(r);
     }
     return (ULONG)n;
@@ -6080,8 +6681,84 @@ static void mad_refuse_log(const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE heap
                   why, (unsigned)desc->Dimension, (unsigned)desc->Format, (unsigned long long)desc->Width, desc->Height,
                   desc->DepthOrArraySize, desc->MipLevels, desc->SampleDesc.Count, (unsigned)desc->Flags, (unsigned)heap_type);
 }
+/* ml1145: PLACED RESOURCES ALIAS. The heap used to be a description only and
+ * every placed resource got its own allocation. UE 5's transient allocator
+ * places many short-lived resources at overlapping offsets of a few 128 MB
+ * heaps and caches the placements for a while: in D3D12 they share the heap;
+ * here each was new memory, ~118 MB a frame, and a UE 5.0 title was killed at
+ * the 8 GB line on its first rendered frames (ph-valley02). DEFAULT heaps are
+ * now real Metal placement heaps. CUSTOM heaps (a DXBC title's hundreds of
+ * small CPU-page texture heaps, ~1.7 GB of mostly empty space) stay
+ * description-only. madeira.cfg heap-backing = 0 restores the old behaviour. */
+struct mad_memheap {
+    ID3D12HeapVtbl *vtbl; LONG refs; const IID *iid; const char *name;
+    struct mad_device *device;
+    D3D12_HEAP_DESC desc;
+    obj_handle_t mtl;   /* ml1145: the Metal placement heap, or 0 */
+};
+static LONG g_placed_in_heap, g_placed_fallback;
+static void mad_placed_fallback(const struct mad_memheap *h, const D3D12_RESOURCE_DESC *desc, UINT64 off, UINT64 msz, UINT64 mal) {
+    LONG n = InterlockedIncrement(&g_placed_fallback);
+    if (n <= 16)
+        d3d12_log("[madeira-d3d12] ml1145 placed %s %llux%u at +%llu could not go into its %llu KB heap (Metal needs %llu bytes, align %llu); standalone\n",
+                  desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? "buffer" : "texture", (unsigned long long)desc->Width, desc->Height,
+                  (unsigned long long)off, (unsigned long long)(h->desc.SizeInBytes >> 10), (unsigned long long)msz, (unsigned long long)mal);
+}
+/* ml1145: the Metal texture description a D3D12 resource gets. ONE builder for
+ * creation and for GetResourceAllocationInfo, so the size the application
+ * plans its heap with is the size the placement really takes. */
+static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth) {
+    UINT layers = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
+    if (!mad_map_texture_format(desc->Format, desc->Flags, pf, is_depth)) return 0;
+    memset(ti, 0, sizeof *ti);
+    ti->pixel_format = *pf;
+    ti->width = (uint32_t)desc->Width;
+    ti->height = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : desc->Height;
+    ti->depth = 1;
+    ti->array_length = 1;
+    ti->mipmap_level_count = desc->MipLevels ? desc->MipLevels : 1;
+    /* ml1030: same clamp as the PSO, or a 4x pipeline meets an 8x target. */
+    ti->sample_count = mad_clamp_sample_count(desc->SampleDesc.Count ? desc->SampleDesc.Count : 1);
+    /* ml932: every 1D/2D texture is allocated as an ARRAY (length >= 1),
+     * matching shaders converted with IRCompatibilityFlagForceTextureArray
+     * (the converter manual's "Texture arrays" table). 3D is unchanged. */
+    switch (desc->Dimension) {
+    case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
+        ti->type = WMTTextureType2DArray; ti->height = 1; ti->array_length = layers; break;
+    case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
+        ti->type = WMTTextureType3D; ti->depth = layers; break;
+    default:
+        ti->type = ti->sample_count > 1 ? WMTTextureType2DMultisampleArray : WMTTextureType2DArray;
+        ti->array_length = layers;
+        break;
+    }
+    ti->usage = WMTTextureUsageShaderRead;
+    if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+        ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsageRenderTarget);
+    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+        ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsageShaderWrite);
+        /* ml1149: texture atomics (InterlockedMax on R32 UAVs, 64-bit max on
+         * RG32Uint visibility buffers) are defined only with ShaderAtomic usage,
+         * which Metal allows on exactly these three formats (with PixelFormatView). */
+        if (ti->pixel_format == WMTPixelFormatR32Uint || ti->pixel_format == WMTPixelFormatR32Sint ||
+            ti->pixel_format == WMTPixelFormatRG32Uint)
+            ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsageShaderAtomic);
+    }
+    /* Views may reinterpret typeless and sRGB/linear pairs. */
+    ti->usage = (enum WMTTextureUsage)(ti->usage | WMTTextureUsagePixelFormatView);
+    ti->options = WMTResourceStorageModePrivate;
+    return 1;
+}
+static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
+                                      const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
+                                      struct mad_memheap *ph, UINT64 poff);
 static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                    const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out) {
+    return mad_create_resource_at(d, heap_type, desc, riid, out, NULL, 0);
+}
+static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
+                                      const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
+                                      struct mad_memheap *ph, UINT64 poff) {
     struct mad_resource *r;
     HRESULT hr;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) { mad_refuse_log(desc, heap_type, "dimension UNKNOWN"); return E_INVALIDARG; }
@@ -6098,39 +6775,16 @@ static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_ty
         struct WMTTextureInfo ti;
         enum WMTPixelFormat pf;
         int is_depth;
-        UINT layers = desc->DepthOrArraySize ? desc->DepthOrArraySize : 1;
-        if (!mad_map_texture_format(desc->Format, desc->Flags, &pf, &is_depth)) { free(r); mad_refuse_log(desc, heap_type, "texture format has no Metal mapping"); return E_NOTIMPL; }
-        memset(&ti, 0, sizeof ti);
-        ti.pixel_format = pf;
-        ti.width = (uint32_t)desc->Width;
-        ti.height = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : desc->Height;
-        ti.depth = 1;
-        ti.array_length = 1;
-        ti.mipmap_level_count = desc->MipLevels ? desc->MipLevels : 1;
-        /* ml1030: same clamp as the PSO, or a 4x pipeline meets an 8x target. */
-        ti.sample_count = mad_clamp_sample_count(desc->SampleDesc.Count ? desc->SampleDesc.Count : 1);
-        /* ml932: every 1D/2D texture is allocated as an ARRAY (length >= 1),
-         * matching shaders converted with IRCompatibilityFlagForceTextureArray
-         * (the converter manual's "Texture arrays" table). 3D is unchanged. */
-        switch (desc->Dimension) {
-        case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
-            ti.type = WMTTextureType2DArray; ti.height = 1; ti.array_length = layers; break;
-        case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-            ti.type = WMTTextureType3D; ti.depth = layers; break;
-        default:
-            ti.type = ti.sample_count > 1 ? WMTTextureType2DMultisampleArray : WMTTextureType2DArray;
-            ti.array_length = layers;
-            break;
+        if (!mad_texinfo_from_desc(desc, &ti, &pf, &is_depth)) { free(r); mad_refuse_log(desc, heap_type, "texture format has no Metal mapping"); return E_NOTIMPL; }
+        if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
+            UINT64 psz = 0, pal = 0;
+            MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
+            if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
+                r->texture = MTLHeap_newTextureAtOffset(ph->mtl, &ti, poff);
+            if (r->texture) { r->placed_heap = ph; ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
+            else mad_placed_fallback(ph, desc, poff, psz, pal);
         }
-        ti.usage = WMTTextureUsageShaderRead;
-        if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
-            ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageRenderTarget);
-        if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
-            ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageShaderWrite);
-        /* Views may reinterpret typeless and sRGB/linear pairs. */
-        ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsagePixelFormatView);
-        ti.options = WMTResourceStorageModePrivate;
-        if (!(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        if (!r->texture && !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
             && ti.sample_count <= 1) {   /* ml1072 */
             UINT64 hsz = 0, hal = 0, hoff = 0; int hidx;
             MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &hsz, &hal);
@@ -6142,7 +6796,7 @@ static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_ty
         }
         if (!r->texture) r->texture = MTLDevice_newTexture(d->mtl_device, &ti);
         if (!r->texture) { free(r); return mad_creation_failure(d, "newTexture"); }
-        if (!r->hp_used) mad_resident(d, r->texture);
+        if (!r->hp_used && !r->placed_heap) mad_resident(d, r->texture);   /* ml1145: a placed one is resident through its heap */
         r->width = ti.width; r->height = ti.height;
         r->gpu_resource_id = ti.gpu_resource_id;
         r->tex_type = ti.type; r->tex_pf = pf; r->tex_mips = ti.mipmap_level_count;   /* ml913 */
@@ -6160,7 +6814,7 @@ static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_ty
         r->is_depth = is_depth;
         r->has_stencil = (pf == WMTPixelFormatDepth32Float_Stencil8);
         r->samples = ti.sample_count;
-        {   /* ml1057 */
+        if (!r->placed_heap) {   /* ml1057; ml1145: a placed texture costs nothing beyond its heap */
             UINT fb = 0, blk = 1; UINT64 px, bytes;
             mad_format_info(desc->Format, &fb, &blk);
             if (!blk) blk = 1;
@@ -6187,14 +6841,49 @@ static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_ty
          * memory must be page aligned in both pointer and length). */
         info.options = heap_type == D3D12_HEAP_TYPE_DEFAULT ? WMTResourceStorageModePrivate : WMTResourceStorageModeShared;
         info.memory.ptr = NULL;
-        r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+        if (ph && ph->mtl && heap_type == D3D12_HEAP_TYPE_DEFAULT) {   /* ml1145: inside the application's heap */
+            UINT64 psz = 0, pal = 0;
+            MTLDevice_heapBufferSizeAndAlign(d->mtl_device, info.length, info.options, &psz, &pal);
+            if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
+                r->buffer = MTLHeap_newBufferAtOffset(ph->mtl, &info, poff);
+            if (r->buffer) { r->placed_heap = ph; ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
+            else { mad_placed_fallback(ph, desc, poff, psz, pal); info.memory.ptr = NULL; info.gpu_address = 0; }
+        }
+        /* ml1154: a large CPU-visible buffer gets storage WE allocate, handed to
+         * Metal as a no-copy buffer. A fresh >= 8 MB guest commit is backed by
+         * the file tier (ml1077), whose dirty pages iOS writes back and never
+         * charges to phys_footprint, the number jetsam kills on. UE 5.0 keeps
+         * 0.4-0.9 GB of UPLOAD buffers live (ph-valley08-13), and its load-time
+         * peak is what kills the Lumen runs. Metal-allocated shared storage is
+         * charged in full. madeira.cfg upload-swap = 0 turns it off. */
+        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on()) {
+            SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
+            void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (mem) {
+                UINT64 want = info.length;
+                info.length = len; info.memory.ptr = mem;
+                r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
+                if (r->buffer) { r->own_mem = mem; InterlockedExchangeAdd64(&g_upload_swap_bytes, (LONG64)len); InterlockedIncrement(&g_upload_swap_n); }
+                else { VirtualFree(mem, 0, MEM_RELEASE); info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; }
+                {
+                    static unsigned said;
+                    if (said++ < 8)
+                        d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffer %llu MB (heap type %u) on our storage %p: %s; %ld so far, %lld MB\n",
+                                  (unsigned long long)(want >> 20), (unsigned)heap_type, mem, r->buffer ? "Metal accepted it" : "Metal REFUSED it, Metal-owned instead",
+                                  g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+                }
+            }
+        }
+        if (!r->buffer) r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
         if (!r->buffer) { free(r); return mad_creation_failure(d, "newBuffer"); }
-        mad_acct(r, heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED, info.length, +1);   /* ml1057 */
-        mad_resident(d, r->buffer);
+        if (!r->placed_heap) {
+            mad_acct(r, heap_type == D3D12_HEAP_TYPE_DEFAULT ? MAD_CAT_BUF_PRIVATE : MAD_CAT_BUF_SHARED, info.length, +1);   /* ml1057 */
+            mad_resident(d, r->buffer);
+        }
         r->cpu = info.memory.ptr;      /* NULL for GPU-private, which is correct */
         r->gpu_address = info.gpu_address;
         mad_track(d, r);
-        if (info.length >= (16u << 20)) {            /* ml885: big buffers, with where they live */
+        if (info.length >= (16u << 20) && !r->placed_heap) {            /* ml885: big buffers, with where they live */
             static unsigned said_big;
             if (said_big++ < 40)
                 d3d12_log("[madeira-d3d12] big buffer: %llu MB heap-type %u cpu=%p gpu=0x%llx flags 0x%x\n",
@@ -6231,14 +6920,12 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(ID3D12Device *Th
 }
 
 /* ---- heaps -----------------------------------------------------------------
- * A heap is a promise of memory the application will carve up itself. This
- * runtime keeps the description and nothing else; the resources placed in it
- * allocate on their own (see mad_create_resource). */
-struct mad_memheap {
-    ID3D12HeapVtbl *vtbl; LONG refs; const IID *iid; const char *name;
-    struct mad_device *device;
-    D3D12_HEAP_DESC desc;
-};
+ * A heap is a promise of memory the application will carve up itself.
+ * ml1145: a DEFAULT heap is backed by a Metal placement heap of the same size
+ * and its placed resources live INSIDE it at the application's offset, so
+ * resources the application aliases share memory as they do in D3D12 (see
+ * struct mad_memheap above mad_create_resource). Other heap types keep the
+ * description only; their placed resources allocate on their own. */
 static ID3D12HeapVtbl g_memheap_vtbl;
 static HRESULT STDMETHODCALLTYPE memheap_QI(ID3D12Heap *This, REFIID riid, void **out) {
     struct mad_obj *o = (struct mad_obj *)This;
@@ -6250,24 +6937,34 @@ static ULONG STDMETHODCALLTYPE memheap_AddRef(ID3D12Heap *This) { return mad_add
 static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
     struct mad_obj *o = (struct mad_obj *)This;
     LONG n = InterlockedDecrement(&o->refs);
-    if (n == 0) {
+    if (n == 0) { mad_pd_purge(This);   /* ml1143 */
         struct mad_memheap *h = (struct mad_memheap *)This;
         static unsigned said;
         if (h->desc.Alignment == 4194304 && (h->desc.Flags & 0x1000) && said++ < 200)
             d3d12_log("[transient] list#%u heap %p DESTROYED (%llu KB)\n", g_list_seq, (void *)h,
                       (unsigned long long)h->desc.SizeInBytes >> 10);   /* ml895 */
+        if (h->mtl) {   /* ml1145: every placed resource held a reference, so none is left; ml1148: but the GPU may still hold them */
+            struct mad_device *hd = h->device; int queued = 0;
+            EnterCriticalSection(&hd->heap_lock);
+            if (mad_grow((void **)&hd->mhret, &hd->mhret_cap, hd->nmhret + 1, sizeof *hd->mhret)) {
+                hd->mhret[hd->nmhret].heap = h->mtl; hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->mhret[hd->nmhret].mem = NULL; hd->nmhret++; queued = 1;
+            }
+            LeaveCriticalSection(&hd->heap_lock);
+            if (!queued) { mad_unresident(hd, h->mtl); NSObject_release(h->mtl); }
+            mad_mheap_reclaim(hd, 0);
+        }
         free(o);
     }
     return (ULONG)n;
 }
 static HRESULT STDMETHODCALLTYPE memheap_GetPrivateData(ID3D12Heap *This, REFGUID g, UINT *n, void *d) {
-    (void)This; (void)g; (void)d; if (n) *n = 0; return DXGI_ERROR_NOT_FOUND;
+    return mad_pd_get(This, g, n, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE memheap_SetPrivateData(ID3D12Heap *This, REFGUID g, UINT n, const void *d) {
-    (void)This; (void)g; (void)n; (void)d; return S_OK;
+    return mad_pd_set(This, g, n, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE memheap_SetPrivateDataInterface(ID3D12Heap *This, REFGUID g, const IUnknown *d) {
-    (void)This; (void)g; (void)d; return S_OK;
+    return mad_pd_set_iface(This, g, d);   /* ml1143 */
 }
 static HRESULT STDMETHODCALLTYPE memheap_SetName(ID3D12Heap *This, LPCWSTR name) { (void)This; (void)name; return S_OK; }
 static HRESULT STDMETHODCALLTYPE memheap_GetDevice(ID3D12Heap *This, REFIID riid, void **out) {
@@ -6291,6 +6988,17 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
     h->vtbl = &g_memheap_vtbl; h->refs = 1; h->iid = &IID_ID3D12Heap; h->name = "Heap";
     h->device = (struct mad_device *)This;
     h->desc = *desc;
+    {   /* ml1145 */
+        static int backing = -1; static unsigned said_b;
+        struct mad_device *hd = (struct mad_device *)This;
+        if (backing < 0) { backing = (int)mad_cfg_int_pe("heap-backing", 1); d3d12_log("[madeira-d3d12] ml1145 heap-backing = %d (DEFAULT heaps %s)\n", backing, backing ? "are Metal placement heaps; placed resources alias" : "are descriptions only"); }
+        if (backing && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {
+            h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, desc->SizeInBytes, WMTResourceStorageModePrivate);
+            if (h->mtl) mad_resident(hd, h->mtl);
+            if (said_b++ < 32) d3d12_log("[madeira-d3d12] ml1145 heap %llu KB flags %#x %s\n", (unsigned long long)(desc->SizeInBytes >> 10),
+                                         (unsigned)desc->Flags, h->mtl ? "backed by a Metal placement heap" : "COULD NOT be backed; its resources stand alone");
+        }
+    }
     if (said < 4096) {   /* ml891: every heap, with its alignment -- the transient allocator lives here */
         said++;
         d3d12_log("[madeira-d3d12] heap: %llu KB, type %u, flags %#x, align %llu -> %p\n",
@@ -6310,7 +7018,7 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(ID3D12Device *This,
     static unsigned said;
     (void)state; (void)clear;
     if (!h || !desc || !out) { if (said++ < 8) d3d12_log("[madeira-d3d12] CreatePlacedResource: null heap/desc/out\n"); return E_INVALIDARG; }
-    hr = mad_create_resource((struct mad_device *)This, h->desc.Properties.Type, desc, riid, out);
+    hr = mad_create_resource_at((struct mad_device *)This, h->desc.Properties.Type, desc, riid, out, h, offset);   /* ml1145 */
     /* ml895: every placement inside a TRANSIENT heap (4 MB aligned, NOT_ZEROED)
      * with the list sequence, so a heap's occupancy can be replayed offline.
      * The RenderThread fault behind every menu crash is UE's transient
@@ -6348,7 +7056,7 @@ static ULONG STDMETHODCALLTYPE heap_AddRef(ID3D12DescriptorHeap *T) { return mad
 static ULONG STDMETHODCALLTYPE heap_Release(ID3D12DescriptorHeap *T) {
     struct mad_heap *h = (struct mad_heap *)T;
     LONG r = InterlockedDecrement(&h->refs);
-    if (r == 0) {
+    if (r == 0) { mad_pd_purge(T);   /* ml1143 */
         /* The Metal buffer of a shader-visible heap is deliberately kept: a
          * command buffer already submitted may still read it. CPU-only
          * storage has no such reader. */
@@ -6411,10 +7119,24 @@ heap_GetGPUDescriptorHandleForHeapStart(ID3D12DescriptorHeap *T, D3D12_GPU_DESCR
 
 static ULONG STDMETHODCALLTYPE pso_AddRef(ID3D12PipelineState *T) { return mad_addref((struct mad_obj *)T); }
 static HRESULT STDMETHODCALLTYPE pso_QI(ID3D12PipelineState *T, REFIID r, void **o) { return mad_qi((struct mad_obj *)T, r, o, 1); }
+static void mad_tess_free(struct mad_tess *t) {   /* ml1083; ml1147b: shared by the tessellation and geometry records */
+    unsigned k;
+    if (!t) return;
+    for (k = 0; k < 3; k++) {
+        if (t->obj[k].rps) NSObject_release(t->obj[k].rps);
+        if (t->obj[k].fn) NSObject_release(t->obj[k].fn);
+        if (t->obj[k].lib) NSObject_release(t->obj[k].lib);
+        free(t->obj[k].vs.air); free(t->obj[k].hs.air);
+    }
+    if (t->ds_fn) NSObject_release(t->ds_fn);
+    if (t->ds_lib) NSObject_release(t->ds_lib);
+    free(t->ds.air);
+    free(t);
+}
 static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
     struct mad_pso *p = (struct mad_pso *)T;
     LONG n = InterlockedDecrement(&p->refs);
-    if (n == 0) {
+    if (n == 0) { mad_pd_purge(T);   /* ml1143 */
         if (p->rps) NSObject_release(p->rps);
         { unsigned k; for (k = 0; k < p->nvar; k++) if (p->var[k].rps) NSObject_release(p->var[k].rps); }
         if (p->has_vd) DeleteCriticalSection(&p->var_lock);
@@ -6428,19 +7150,8 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         if (p->cps) NSObject_release(p->cps);
         free(p->air);   /* ml1010 */
         free(p->ps_air);   /* ml1011 */
-        if (p->tess) {   /* ml1083 */
-            unsigned k;
-            for (k = 0; k < 3; k++) {
-                if (p->tess->obj[k].rps) NSObject_release(p->tess->obj[k].rps);
-                if (p->tess->obj[k].fn) NSObject_release(p->tess->obj[k].fn);
-                if (p->tess->obj[k].lib) NSObject_release(p->tess->obj[k].lib);
-                free(p->tess->obj[k].vs.air); free(p->tess->obj[k].hs.air);
-            }
-            if (p->tess->ds_fn) NSObject_release(p->tess->ds_fn);
-            if (p->tess->ds_lib) NSObject_release(p->tess->ds_lib);
-            free(p->tess->ds.air);
-            free(p->tess);
-        }
+        mad_tess_free(p->tess);         /* ml1083 */
+        mad_tess_free(p->tess_strip);   /* ml1147b */
         free(p);
     }
     return (ULONG)n;
@@ -7159,7 +7870,13 @@ static void mad_resolve_target(struct mad_device *d) {
                         : apple8 ? MAD_IR_FAMILY_APPLE8
                         : apple7 ? MAD_IR_FAMILY_APPLE7
                                  : MAD_IR_FAMILY_APPLE6;
-        snprintf(g_target.os_version, sizeof g_target.os_version, "17.0");
+        /* ml1140: 18.0, not 17.0. The converter refuses atomics on
+         * globallycoherent textures below iOS 18 ("IR contains unsupported
+         * instruction: dx.op.atomicBinOp.i32 ... requires targeting macOS 15,
+         * iOS 18, or later", IRErrorCodeUnsupportedInstruction = 7): a UE5 Lumen/
+         * Nanite compute shader failed on the device and UE treated the failed
+         * PSO as fatal. Every device this runtime targets runs iOS 26+. */
+        snprintf(g_target.os_version, sizeof g_target.os_version, "18.0");
     }
     g_target.resolved = 1;
     d3d12_log("[madeira-d3d12] conversion target: %s, family %u, min %s "
@@ -7211,6 +7928,11 @@ struct mad_convert_opts {
     const void *hs_bc, *ds_bc; SIZE_T hs_bc_len, ds_bc_len;
     struct mad_air_out *air2;
     UINT *threads_per_patch, *max_potential, *out_prim;
+    /* ml1147: DXBC geometry shaders. gs_stage 1 = object (dxil is the VS, gs_bc
+     * the GS; tess_index_format carries the index format), 2 = mesh (dxil is the
+     * GS, gs_bc the VS). */
+    UINT gs_stage, gs_strip;
+    const void *gs_bc; SIZE_T gs_bc_len;
 };
 static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_rootsig *rs,
                                       const void *dxil, SIZE_T dxil_len, const char *entry,
@@ -7262,6 +7984,10 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         a.hs_bytecode = (uint64_t)(ULONG_PTR)o->hs_bc; a.hs_bytecode_len = (uint64_t)o->hs_bc_len;
         a.ds_bytecode = (uint64_t)(ULONG_PTR)o->ds_bc; a.ds_bytecode_len = (uint64_t)o->ds_bc_len;
         if (o->air2) { memset(o->air2, 0, sizeof *o->air2); a.out_air_ranges2 = (uint64_t)(uintptr_t)o->air2->ranges; a.air_range_cap2 = MADEIRA_IR_AIR_RANGE_MAX; }
+    }
+    if (o && o->gs_stage) {   /* ml1147 */
+        a.gs_stage = o->gs_stage; a.gs_strip = o->gs_strip; a.tess_index_format = o->tess_index_format;
+        a.gs_bytecode = (uint64_t)(ULONG_PTR)o->gs_bc; a.gs_bytecode_len = (uint64_t)o->gs_bc_len;
     }
 
     /* Ask for the size, then convert into a buffer that fits. */
@@ -7335,6 +8061,10 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         a.hs_bytecode = (uint64_t)(ULONG_PTR)o->hs_bc; a.hs_bytecode_len = (uint64_t)o->hs_bc_len;
         a.ds_bytecode = (uint64_t)(ULONG_PTR)o->ds_bc; a.ds_bytecode_len = (uint64_t)o->ds_bc_len;
         if (o->air2) { a.out_air_ranges2 = (uint64_t)(uintptr_t)o->air2->ranges; a.air_range_cap2 = MADEIRA_IR_AIR_RANGE_MAX; }
+    }
+    if (o && o->gs_stage) {   /* ml1147 */
+        a.gs_stage = o->gs_stage; a.gs_strip = o->gs_strip; a.tess_index_format = o->tess_index_format;
+        a.gs_bytecode = (uint64_t)(ULONG_PTR)o->gs_bc; a.gs_bytecode_len = (uint64_t)o->gs_bc_len;
     }
     a.out_entry = (uint64_t)(uintptr_t)name;
     if (buf2) { a.out_buf2 = (uint64_t)(uintptr_t)buf2; a.out_cap2 = cap2; }
@@ -7755,6 +8485,113 @@ fail:
     return 0;
 }
 
+/* ml1147: is this shader container DXBC (SHEX/SHDR chunk) rather than DXIL? */
+static int mad_bc_is_dxbc(const void *bc, SIZE_T len) {
+    const unsigned char *b = bc; UINT32 n, i;
+    if (!b || len < 32 || memcmp(b, "DXBC", 4)) return 0;
+    memcpy(&n, b + 28, 4);
+    if (n > 64 || 32 + (SIZE_T)n * 4 > len) return 0;
+    for (i = 0; i < n; i++) {
+        UINT32 off; memcpy(&off, b + 32 + i * 4, 4);
+        if ((SIZE_T)off + 8 > len) continue;
+        if (!memcmp(b + off, "DXIL", 4)) return 0;
+        if (!memcmp(b + off, "SHEX", 4) || !memcmp(b + off, "SHDR", 4)) return 1;
+    }
+    return 0;
+}
+/* ml1147: GEOMETRY SHADERS on the DXBC backend, as DXMT's D3D11 layer runs them
+ * (d3d11_pipeline_gs.cpp): a mesh pipeline whose OBJECT function is the vertex
+ * shader compiled against the geometry shader and whose MESH function is the
+ * geometry shader. Before this every DXBC geometry pipeline lost its geometry
+ * stage ("Geometry shader cannot be independently converted"): UE 5.0's
+ * WriteToSlice volume passes (the colour-grading LUT among them) drew nothing
+ * and the frame came out black (ph-valley03). Built for LIST topologies, one
+ * object variant per index format; a strip draw keeps the plain pipeline. The
+ * mad_tess record is reused: obj[fmt].vs = the vertex tables, ds = the geometry
+ * shader's, no hull. */
+static int mad_gsx_build(struct mad_device *d, struct mad_rootsig *rs, struct mad_pso *p,
+                         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, const struct WMTRenderPipelineInfo *rp, UINT strip) {
+    struct mad_tess *t = calloc(1, sizeof *t);
+    struct madeira_ir_input_layout *L = calloc(1, sizeof *L);
+    struct madeira_ir_loc locs[MAD_LOC_MAX]; unsigned nl = 0;
+    struct mad_air_out *air = malloc(sizeof *air);   /* 8 KB: not on the stack */
+    unsigned fmt, built = 0;
+    static unsigned said;
+    if (!t || !L || !air) { free(t); free(L); free(air); return 0; }
+    t->is_gs = 1;
+    mad_build_input_layout(desc, p, L);
+    {   /* the mesh (geometry) function: shared by every object variant */
+        struct mad_convert_opts o; memset(&o, 0, sizeof o);
+        o.gs_stage = 2; o.gs_strip = strip; o.gs_bc = desc->VS.pShaderBytecode; o.gs_bc_len = desc->VS.BytecodeLength;
+        o.air = air; o.name_out = t->ds_name; o.name_cap = sizeof t->ds_name;
+        t->ds_fn = mad_convert_stage_opts(d, rs, desc->GS.pShaderBytecode, desc->GS.BytecodeLength, NULL, &t->ds_lib, "GS(dxbc)",
+                                          NULL, 0, NULL, NULL, locs, &nl, &o);
+        if (!t->ds_fn) goto fail;
+        t->ds.cb_bind = air->cb_bind; t->ds.arg_bind = air->arg_bind; t->ds.arg_qwords = air->arg_qwords; t->ds.nair = air->nranges;
+        if (air->nranges) { t->ds.air = malloc((size_t)air->nranges * sizeof *t->ds.air); if (!t->ds.air) goto fail;
+                            memcpy(t->ds.air, air->ranges, (size_t)air->nranges * sizeof *t->ds.air); }
+    }
+    for (fmt = 0; fmt < 3; fmt++) {   /* the object (vertex-for-geometry) function, per index format */
+        struct mad_convert_opts o; struct WMTMeshRenderPipelineInfo mp; obj_handle_t err = 0;
+        memset(&o, 0, sizeof o);
+        o.gs_stage = 1; o.gs_strip = strip; o.tess_index_format = fmt; o.layout = L->n ? L : NULL;
+        o.gs_bc = desc->GS.pShaderBytecode; o.gs_bc_len = desc->GS.BytecodeLength;
+        o.air = air; o.name_out = t->obj_name; o.name_cap = sizeof t->obj_name;
+        nl = 0;
+        t->obj[fmt].fn = mad_convert_stage_opts(d, rs, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, NULL, &t->obj[fmt].lib, "VS+GS(dxbc)",
+                                                NULL, 0, NULL, NULL, locs, &nl, &o);
+        if (!t->obj[fmt].fn) continue;
+        t->obj[fmt].slot_mask = air->slot_mask;
+        t->obj[fmt].vs.cb_bind = air->cb_bind; t->obj[fmt].vs.arg_bind = air->arg_bind; t->obj[fmt].vs.arg_qwords = air->arg_qwords; t->obj[fmt].vs.nair = air->nranges;
+        t->obj[fmt].hs.cb_bind = ~0u; t->obj[fmt].hs.arg_bind = ~0u;
+        if (air->nranges) { t->obj[fmt].vs.air = malloc((size_t)air->nranges * sizeof *t->obj[fmt].vs.air); if (!t->obj[fmt].vs.air) goto fail;
+                            memcpy(t->obj[fmt].vs.air, air->ranges, (size_t)air->nranges * sizeof *t->obj[fmt].vs.air); }
+        memset(&mp, 0, sizeof mp);
+        memcpy(mp.colors, rp->colors, sizeof mp.colors);
+        mp.alpha_to_coverage_enabled = rp->alpha_to_coverage_enabled;
+        mp.rasterization_enabled = true;
+        mp.raster_sample_count = rp->raster_sample_count;
+        mp.depth_pixel_format = rp->depth_pixel_format; mp.stencil_pixel_format = rp->stencil_pixel_format;
+        mp.object_function = t->obj[fmt].fn; mp.mesh_function = t->ds_fn; mp.fragment_function = p->ps_fn;
+        /* DXMT's fixed bindings for a geometry pipeline: vertex-buffer table 16,
+         * draw arguments 21, vertex tables 29/30 on the object stage; geometry
+         * tables 29/30 on the mesh stage; the pixel stage's 29/30. The payload
+         * is DXMT's size; its object threadgroups are 30 or 32 wide. */
+        mp.immutable_object_buffers = (1u << 16) | (1u << 21) | (1u << 29) | (1u << 30);
+        mp.immutable_mesh_buffers = (1u << 29) | (1u << 30);
+        mp.immutable_fragment_buffers = (1u << 29) | (1u << 30);
+        mp.payload_memory_length = 16256;
+        t->obj[fmt].rps = MTLDevice_newMeshRenderPipelineState(d->mtl_device, &mp, &err);
+        if (err) mad_log_nserror("geometry mesh pipeline", err);
+        if (!t->obj[fmt].rps) {
+            d3d12_log("[madeira-d3d12] ml1147 geometry pipeline FAILED (index format %u): vs+gs '%s' gs '%s' ps '%s'\n",
+                      fmt, t->obj_name, t->ds_name, p->ps_name);
+            continue;
+        }
+        built++;
+    }
+    if (!built) goto fail;
+    if (said++ < 16)
+        d3d12_log("[madeira-d3d12] ml1147 geometry pipeline built (%s): %u index-format variant(s), vs '%s' gs '%s' ps '%s' (%u targets, %u input elements)\n",
+                  strip ? "strip" : "list", built, p->vs_name, t->ds_name, p->ps_name, desc->NumRenderTargets, L->n);
+    InterlockedIncrement(&g_gs_built);
+    if (strip) p->tess_strip = t; else p->tess = t;
+    free(L); free(air);
+    return 1;
+fail:
+    d3d12_log("[madeira-d3d12] ml1147 geometry pipeline NOT built for vs '%s' ps '%s'; its geometry stage stays dropped\n", p->vs_name, p->ps_name);
+    for (fmt = 0; fmt < 3; fmt++) {
+        if (t->obj[fmt].rps) NSObject_release(t->obj[fmt].rps);
+        if (t->obj[fmt].fn) NSObject_release(t->obj[fmt].fn);
+        if (t->obj[fmt].lib) NSObject_release(t->obj[fmt].lib);
+        free(t->obj[fmt].vs.air);
+    }
+    if (t->ds_fn) NSObject_release(t->ds_fn);
+    if (t->ds_lib) NSObject_release(t->ds_lib);
+    free(t->ds.air); free(t); free(L); free(air);
+    return 0;
+}
+
 static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device *This,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     struct mad_device *d = (struct mad_device *)This;
@@ -7787,7 +8624,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
 
     {
         struct madeira_ir_loc locs[MAD_LOC_MAX]; unsigned nl = 0;
-        if (desc->GS.pShaderBytecode) {   /* ml927: geometry-shader pipeline -> converter mesh emulation */
+        if (desc->GS.pShaderBytecode && !mad_bc_is_dxbc(desc->GS.pShaderBytecode, desc->GS.BytecodeLength)) {   /* ml927: geometry-shader pipeline -> converter mesh emulation; ml1147: DXIL only */
             struct madeira_ir_input_layout *L = calloc(1, sizeof *L);
             struct mad_convert_opts ov, og;
             char gsname[64];
@@ -8121,7 +8958,29 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
     if (p->has_tess && desc->HS.pShaderBytecode && desc->DS.pShaderBytecode && !desc->GS.pShaderBytecode &&
         p->backend == MADEIRA_IR_BACKEND_AIRCONV)
         mad_tess_build(d, rs, p, desc, &rp);
-    if (!p->rps && !p->tess) {
+    /* ml1147: DXBC geometry shader -> object/mesh pipeline; the plain pipeline
+     * above stays as the fallback for draws the mesh variants cannot take. */
+    if (!p->tess && desc->GS.pShaderBytecode && desc->GS.BytecodeLength && !desc->HS.pShaderBytecode &&
+        p->backend == MADEIRA_IR_BACKEND_AIRCONV && mad_bc_is_dxbc(desc->GS.pShaderBytecode, desc->GS.BytecodeLength))
+    {
+        mad_gsx_build(d, rs, p, desc, &rp, 0);
+        /* ml1147b: UE's volume rasterizer draws each slice as a 4-vertex TRIANGLE
+         * STRIP (ph-valley04: all 8 WriteToSlice draws were topology 5), and
+         * the object/mesh functions are specialised on strip vs list. */
+        if (desc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE || desc->PrimitiveTopologyType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
+            mad_gsx_build(d, rs, p, desc, &rp, 1);
+    }
+    if (!p->rps && !p->tess && !p->tess_strip && desc->GS.pShaderBytecode && desc->GS.BytecodeLength) {
+        /* ml1138: a geometry-shader pipeline we cannot build becomes a PLACEHOLDER
+         * (draws with it are skipped and counted), not E_FAIL. UE5 creates
+         * pipelines asynchronously; an E_FAIL for its WriteToSlice pipelines on the
+         * device left the render thread waiting forever (the demo froze behind the
+         * loading throbber). A missing effect is recoverable; a hang is not. */
+        static unsigned said;
+        if (said++ < 16)
+            d3d12_log("[madeira-d3d12] ml1138 geometry-shader pipeline could not be built; returning a placeholder whose draws are skipped "
+                      "(%u targets, gs %u B)\n", desc->NumRenderTargets, (unsigned)desc->GS.BytecodeLength);
+    } else if (!p->rps && !p->tess) {
         d3d12_log("[madeira-d3d12] newRenderPipelineState failed (%u targets, depth %u, %u input elements%s)\n",
                   desc->NumRenderTargets, (unsigned)desc->DSVFormat, desc->InputLayout.NumElements,
                   p->has_tess ? ", tessellation" : "");
@@ -8239,7 +9098,20 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(ID3D12Device 
         if (p->vs_fn && air.backend != MADEIRA_IR_BACKEND_AIRCONV)
             mad_apply_reflected_layout(p, (struct mad_rootsig *)desc->pRootSignature, locs, nl, "CS");
     }
-    if (!p->vs_fn) { pso_Release((ID3D12PipelineState *)p); return E_FAIL; }
+    if (!p->vs_fn) {
+        /* ml1139: a compute shader the converter refuses becomes a PLACEHOLDER
+         * pipeline (its dispatches are skipped and counted), not E_FAIL. UE5 treats
+         * a failed CreateComputePipelineState as fatal (PipelineStateCache.cpp:437),
+         * and under this runtime a UE fatal presents as a freeze. A missing effect
+         * is recoverable and shows how far the title gets. */
+        static unsigned said_ph;
+        if (said_ph++ < 16)
+            d3d12_log("[madeira-d3d12] ml1139 compute shader could not be converted (%u bytes); returning a placeholder whose dispatches are skipped\n",
+                      (unsigned)desc->CS.BytecodeLength);
+        hr = pso_QI((ID3D12PipelineState *)p, riid, out);
+        pso_Release((ID3D12PipelineState *)p);
+        return hr;
+    }
     if (!p->tg[0]) { p->tg[0] = 1; }
     if (!p->tg[1]) { p->tg[1] = 1; }
     if (!p->tg[2]) { p->tg[2] = 1; }
@@ -8364,9 +9236,34 @@ static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstant(ID3D12GraphicsCom
 /* ml892: UAV clears for BUFFER views through the blit fill. The CPU handle
  * points at our descriptor entry, whose address+size name the range; the
  * resource is found by address. Metal fills bytes, so a value whose four
- * bytes are equal is exact and anything else is approximated by its low byte
- * and named once. Texture UAV clears are not implemented yet. */
-static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESCRIPTOR_HANDLE cpu, const UINT32 v[4], const char *what) {
+ * bytes are equal is exact. Texture UAV clears are not implemented yet.
+ *
+ * ml1151: anything else used to be approximated by its low byte -- a clear to
+ * 1 wrote 0x01010101 into every element (ph-valley09: UE 5.0 clears Nanite /
+ * instance-culling buffers to 1). Now the value is copied from a small shared
+ * buffer holding it repeated, kept per device for the few distinct values a
+ * title uses. D3D12 clears raw and structured views with Values[0] per dword,
+ * which is also exact for the R32 typed views these clears target. */
+static obj_handle_t mad_fill_pattern(struct mad_device *d, UINT32 v) {
+    obj_handle_t buf = 0; unsigned i;
+    AcquireSRWLockExclusive(&d->fillpat_lock);
+    for (i = 0; i < d->nfillpat; i++) if (d->fillpat[i].value == v) { buf = d->fillpat[i].buf; break; }
+    if (!buf && d->nfillpat < (sizeof d->fillpat / sizeof d->fillpat[0])) {
+        struct WMTBufferInfo bi;
+        memset(&bi, 0, sizeof bi); bi.length = MAD_FILLPAT_BYTES; bi.options = WMTResourceStorageModeShared;
+        buf = MTLDevice_newBuffer(d->mtl_device, &bi);
+        if (buf && bi.memory.ptr) {
+            UINT32 *w = (UINT32 *)bi.memory.ptr; UINT64 k;
+            for (k = 0; k < MAD_FILLPAT_BYTES / 4; k++) w[k] = v;
+            mad_resident(d, buf);
+            d->fillpat[d->nfillpat].value = v; d->fillpat[d->nfillpat].buf = buf; d->nfillpat++;
+            d3d12_log("[madeira-d3d12] ml1151 UAV clear value %#x: exact pattern buffer %u of %u\n", v, d->nfillpat, (unsigned)(sizeof d->fillpat / sizeof d->fillpat[0]));
+        } else if (buf) { NSObject_release(buf); buf = 0; }
+    }
+    ReleaseSRWLockExclusive(&d->fillpat_lock);
+    return buf;
+}
+static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res, const UINT32 v[4], const char *what) {
     struct mad_list *l = (struct mad_list *)This;
     struct mad_descriptor *e = (struct mad_descriptor *)cpu.ptr;
     struct mad_resource *r; UINT64 off = 0; UINT64 len;
@@ -8374,7 +9271,12 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
     static unsigned said_tex, said_approx;
     if (!e || !l) return;
     if (!e->gpu_va) { if (said_tex++ < 2) d3d12_log("[madeira-d3d12] %s on a texture view is not implemented; skipped\n", what); return; }
-    r = mad_resolve_address(l->device, e->gpu_va, &off);
+    /* ml1157: the application names the resource; use it. Resolving the view's
+     * address picked whichever placed resource aliased it, which could be one
+     * the application frees before this list runs. */
+    r = (struct mad_resource *)res;
+    if (r && r->buffer && r->gpu_address && e->gpu_va >= r->gpu_address && e->gpu_va < r->gpu_address + r->size) off = e->gpu_va - r->gpu_address;
+    else r = mad_resolve_address(l->device, e->gpu_va, &off);
     if (!r || !r->buffer) return;
     len = e->metadata & 0xffffffffu;
     if (!len || off + len > r->size) len = r->size > off ? r->size - off : 0;
@@ -8386,24 +9288,33 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
         UINT32 x = v ? v[0] : 0; UINT8 b = (UINT8)(x & 0xff);
         int exact = v && v[0] == v[1] && v[1] == v[2] && v[2] == v[3] &&
                     ((x >> 8) & 0xff) == b && ((x >> 16) & 0xff) == b && ((x >> 24) & 0xff) == b;
-        if (!exact && said_approx++ < 4)
-            d3d12_log("[madeira-d3d12] %s with value %#x is approximated by byte %#x\n", what, x, b);
-        c->u.fill.byte = b;
+        c->u.fill.byte = b; c->u.fill.pattern = 0;
+        if (!(((x >> 8) & 0xff) == b && ((x >> 16) & 0xff) == b && ((x >> 24) & 0xff) == b))
+        {
+            static unsigned said_pat;
+            c->u.fill.pattern = mad_fill_pattern(l->device, x);   /* ml1151 */
+            if (c->u.fill.pattern && said_pat++ < 16)
+                d3d12_log("[madeira-d3d12] ml1151 %s value %#x exact: resource '%s' %llu bytes, range +%llu len %llu (gpu 0x%llx)\n",
+                          what, x, r->name ? r->name : "?", (unsigned long long)r->size, (unsigned long long)off,
+                          (unsigned long long)len, (unsigned long long)r->gpu_address);
+        }
+        if (!exact && !c->u.fill.pattern && said_approx++ < 4)
+            d3d12_log("[madeira-d3d12] %s with value %#x is approximated by byte %#x (no pattern buffer)\n", what, x, b);
     }
 }
 static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewUint(ID3D12GraphicsCommandList *This,
         D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res,
         const UINT values[4], UINT n, const D3D12_RECT *rects) {
-    (void)gpu; (void)res; (void)n; (void)rects;
-    mad_record_uav_clear(This, cpu, values, "ClearUnorderedAccessViewUint");
+    (void)gpu; (void)n; (void)rects;
+    mad_record_uav_clear(This, cpu, res, values, "ClearUnorderedAccessViewUint");
 }
 static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewFloat(ID3D12GraphicsCommandList *This,
         D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res,
         const FLOAT values[4], UINT n, const D3D12_RECT *rects) {
     UINT32 u[4]; int i;
-    (void)gpu; (void)res; (void)n; (void)rects;
+    (void)gpu; (void)n; (void)rects;
     for (i = 0; i < 4; i++) memcpy(&u[i], &values[i], 4);
-    mad_record_uav_clear(This, cpu, u, "ClearUnorderedAccessViewFloat");
+    mad_record_uav_clear(This, cpu, res, u, "ClearUnorderedAccessViewFloat");
 }
 static void STDMETHODCALLTYPE list_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT f[4]) {
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_BLEND_FACTOR);
@@ -8411,6 +9322,7 @@ static void STDMETHODCALLTYPE list_OMSetBlendFactor(ID3D12GraphicsCommandList *T
 }
 static void STDMETHODCALLTYPE list_DiscardResource(ID3D12GraphicsCommandList *This, ID3D12Resource *res, const D3D12_DISCARD_REGION *region) {
     (void)This; (void)res; (void)region;   /* a hint; nothing to do */
+    InterlockedIncrement(&g_discards);    /* ml1137: does the application use it at all? */
 }
 static void STDMETHODCALLTYPE list_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT ref) {
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_STENCIL_REF);
@@ -8550,12 +9462,33 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
     InterlockedIncrement(&g_barriers);
     if (l->ncmds && l->cmds[l->ncmds - 1].kind == MC_BARRIER) c = &l->cmds[l->ncmds - 1];
     else { c = mad_list_push(l, MC_BARRIER); if (!c) return; }
+    if (c->u.barrier.n == 0 && !c->u.barrier.all) c->u.barrier.cls_noref = BC_NONE;
     for (i = 0; i < n; i++) {   /* ml1116: fence-chain = 3 waits only for resources an encoder in flight wrote */
         struct mad_resource *r = NULL;
-        if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) r = (struct mad_resource *)b[i].Transition.pResource;
-        else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) r = (struct mad_resource *)b[i].UAV.pResource;
-        if (!r) { c->u.barrier.all = 1; continue; }
-        if (c->u.barrier.n < 8) c->u.barrier.res[c->u.barrier.n++] = r; else c->u.barrier.all = 1;
+        UINT8 cls = BC_ALL;
+        const UINT W = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+                       D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+            UINT bs = (UINT)b[i].Transition.StateBefore, as = (UINT)b[i].Transition.StateAfter;
+            r = (struct mad_resource *)b[i].Transition.pResource;
+            /* ml1137: COMMON on either side and any write after are "wait for everything" */
+            if (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) cls = BC_RAR;
+            else if (!as || (as & W) || !bs) cls = BC_ALL;
+            else if (!(bs & W)) cls = BC_RAR;
+            else if (!(bs & ~(UINT)(D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_DEPTH_WRITE))) cls = BC_RAW_ATT;
+            else if (bs == D3D12_RESOURCE_STATE_COPY_DEST) cls = BC_RAW_COPY;
+            else if (bs == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) cls = BC_RAW_UAV;
+        } else if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
+            r = (struct mad_resource *)b[i].UAV.pResource;
+            cls = BC_RAW_UAV;   /* UAV accesses happen only in compute and render encoders */
+        }
+        if (!r) {
+            c->u.barrier.all = 1;
+            if (c->u.barrier.cls_noref == BC_NONE || cls > c->u.barrier.cls_noref) c->u.barrier.cls_noref = cls;
+            continue;
+        }
+        if (c->u.barrier.n < 8) { c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r; }
+        else { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; }
     }
 }
 /* ml889: ExecuteIndirect. D3D12's argument records are byte-for-byte Metal's
@@ -9175,55 +10108,55 @@ static void build_vtables(void) {
     g_res_vtbl.GetGPUVirtualAddress = (void *)res_GetGPUVirtualAddress;
     g_res_vtbl.GetDesc = (void *)res_GetDesc;
 
-    madeira_fill_ID3D12GraphicsCommandList(&g_list_vtbl);
-    g_list_vtbl.GetDevice = list_GetDevice;
-    g_list_vtbl.QueryInterface          = list_QI;
-    g_list_vtbl.AddRef                  = list_AddRef;
-    g_list_vtbl.Release                 = list_Release;
-    g_list_vtbl.Close                   = list_Close;
-    g_list_vtbl.Reset                   = list_Reset;
-    g_list_vtbl.GetType                 = list_GetType;
-    g_list_vtbl.CopyBufferRegion        = list_CopyBufferRegion;
-    g_list_vtbl.OMSetRenderTargets      = list_OMSetRenderTargets;
-    g_list_vtbl.ClearRenderTargetView   = list_ClearRenderTargetView;
-    g_list_vtbl.SetPipelineState        = list_SetPipelineState;
-    g_list_vtbl.SetGraphicsRootSignature= list_SetGraphicsRootSignature;
-    g_list_vtbl.SetGraphicsRootConstantBufferView = list_SetGraphicsRootConstantBufferView;
-    g_list_vtbl.SetGraphicsRootDescriptorTable = list_SetGraphicsRootDescriptorTable;
-    g_list_vtbl.SetDescriptorHeaps      = list_SetDescriptorHeaps;
-    g_list_vtbl.RSSetViewports          = list_RSSetViewports;
-    g_list_vtbl.RSSetScissorRects       = list_RSSetScissorRects;
-    g_list_vtbl.IASetVertexBuffers      = list_IASetVertexBuffers;
-    g_list_vtbl.OMSetStencilRef         = list_OMSetStencilRef;
-    g_list_vtbl.SetComputeRootSignature            = list_SetComputeRootSignature;
-    g_list_vtbl.SetComputeRootConstantBufferView   = list_SetComputeRootConstantBufferView;
-    g_list_vtbl.SetComputeRootShaderResourceView   = list_SetComputeRootShaderResourceView;
-    g_list_vtbl.SetComputeRootUnorderedAccessView  = list_SetComputeRootUnorderedAccessView;
-    g_list_vtbl.SetComputeRootDescriptorTable      = list_SetComputeRootDescriptorTable;
-    g_list_vtbl.SetComputeRoot32BitConstant        = list_SetComputeRoot32BitConstant;
-    g_list_vtbl.SetComputeRoot32BitConstants       = list_SetComputeRoot32BitConstants;
+    madeira_fill_ID3D12GraphicsCommandList7(&g_list_vtbl);
+    g_list_vtbl.GetDevice = (void *)list_GetDevice;
+    g_list_vtbl.QueryInterface          = (void *)list_QI;
+    g_list_vtbl.AddRef                  = (void *)list_AddRef;
+    g_list_vtbl.Release                 = (void *)list_Release;
+    g_list_vtbl.Close                   = (void *)list_Close;
+    g_list_vtbl.Reset                   = (void *)list_Reset;
+    g_list_vtbl.GetType                 = (void *)list_GetType;
+    g_list_vtbl.CopyBufferRegion        = (void *)list_CopyBufferRegion;
+    g_list_vtbl.OMSetRenderTargets      = (void *)list_OMSetRenderTargets;
+    g_list_vtbl.ClearRenderTargetView   = (void *)list_ClearRenderTargetView;
+    g_list_vtbl.SetPipelineState        = (void *)list_SetPipelineState;
+    g_list_vtbl.SetGraphicsRootSignature= (void *)list_SetGraphicsRootSignature;
+    g_list_vtbl.SetGraphicsRootConstantBufferView = (void *)list_SetGraphicsRootConstantBufferView;
+    g_list_vtbl.SetGraphicsRootDescriptorTable = (void *)list_SetGraphicsRootDescriptorTable;
+    g_list_vtbl.SetDescriptorHeaps      = (void *)list_SetDescriptorHeaps;
+    g_list_vtbl.RSSetViewports          = (void *)list_RSSetViewports;
+    g_list_vtbl.RSSetScissorRects       = (void *)list_RSSetScissorRects;
+    g_list_vtbl.IASetVertexBuffers      = (void *)list_IASetVertexBuffers;
+    g_list_vtbl.OMSetStencilRef         = (void *)list_OMSetStencilRef;
+    g_list_vtbl.SetComputeRootSignature            = (void *)list_SetComputeRootSignature;
+    g_list_vtbl.SetComputeRootConstantBufferView   = (void *)list_SetComputeRootConstantBufferView;
+    g_list_vtbl.SetComputeRootShaderResourceView   = (void *)list_SetComputeRootShaderResourceView;
+    g_list_vtbl.SetComputeRootUnorderedAccessView  = (void *)list_SetComputeRootUnorderedAccessView;
+    g_list_vtbl.SetComputeRootDescriptorTable      = (void *)list_SetComputeRootDescriptorTable;
+    g_list_vtbl.SetComputeRoot32BitConstant        = (void *)list_SetComputeRoot32BitConstant;
+    g_list_vtbl.SetComputeRoot32BitConstants       = (void *)list_SetComputeRoot32BitConstants;
     g_device_vtbl.CreateComputePipelineState = (void *)device_CreateComputePipelineState;
-    g_list_vtbl.CopyResource            = list_CopyResource;
-    g_list_vtbl.ResourceBarrier         = list_ResourceBarrier;
-    g_list_vtbl.Dispatch                = list_Dispatch;
-    g_list_vtbl.ExecuteIndirect         = list_ExecuteIndirect;
-    g_list_vtbl.SetGraphicsRootShaderResourceView  = list_SetGraphicsRootShaderResourceView;
-    g_list_vtbl.SetGraphicsRootUnorderedAccessView = list_SetGraphicsRootUnorderedAccessView;
-    g_list_vtbl.SetGraphicsRoot32BitConstant       = list_SetGraphicsRoot32BitConstant;
-    g_list_vtbl.SetGraphicsRoot32BitConstants      = list_SetGraphicsRoot32BitConstants;
-    g_list_vtbl.ClearUnorderedAccessViewUint  = list_ClearUnorderedAccessViewUint;
-    g_list_vtbl.ClearUnorderedAccessViewFloat = list_ClearUnorderedAccessViewFloat;
-    g_list_vtbl.OMSetBlendFactor              = list_OMSetBlendFactor;
-    g_list_vtbl.DiscardResource               = list_DiscardResource;
-    g_list_vtbl.BeginQuery              = list_BeginQuery;
-    g_list_vtbl.EndQuery                = list_EndQuery;
-    g_list_vtbl.ResolveQueryData        = list_ResolveQueryData;
-    g_list_vtbl.IASetPrimitiveTopology  = list_IASetPrimitiveTopology;
-    g_list_vtbl.DrawInstanced           = list_DrawInstanced;
-    g_list_vtbl.CopyTextureRegion       = list_CopyTextureRegion;
-    g_list_vtbl.IASetIndexBuffer        = list_IASetIndexBuffer;
-    g_list_vtbl.DrawIndexedInstanced    = list_DrawIndexedInstanced;
-    g_list_vtbl.ClearDepthStencilView   = list_ClearDepthStencilView;
+    g_list_vtbl.CopyResource            = (void *)list_CopyResource;
+    g_list_vtbl.ResourceBarrier         = (void *)list_ResourceBarrier;
+    g_list_vtbl.Dispatch                = (void *)list_Dispatch;
+    g_list_vtbl.ExecuteIndirect         = (void *)list_ExecuteIndirect;
+    g_list_vtbl.SetGraphicsRootShaderResourceView  = (void *)list_SetGraphicsRootShaderResourceView;
+    g_list_vtbl.SetGraphicsRootUnorderedAccessView = (void *)list_SetGraphicsRootUnorderedAccessView;
+    g_list_vtbl.SetGraphicsRoot32BitConstant       = (void *)list_SetGraphicsRoot32BitConstant;
+    g_list_vtbl.SetGraphicsRoot32BitConstants      = (void *)list_SetGraphicsRoot32BitConstants;
+    g_list_vtbl.ClearUnorderedAccessViewUint  = (void *)list_ClearUnorderedAccessViewUint;
+    g_list_vtbl.ClearUnorderedAccessViewFloat = (void *)list_ClearUnorderedAccessViewFloat;
+    g_list_vtbl.OMSetBlendFactor              = (void *)list_OMSetBlendFactor;
+    g_list_vtbl.DiscardResource               = (void *)list_DiscardResource;
+    g_list_vtbl.BeginQuery              = (void *)list_BeginQuery;
+    g_list_vtbl.EndQuery                = (void *)list_EndQuery;
+    g_list_vtbl.ResolveQueryData        = (void *)list_ResolveQueryData;
+    g_list_vtbl.IASetPrimitiveTopology  = (void *)list_IASetPrimitiveTopology;
+    g_list_vtbl.DrawInstanced           = (void *)list_DrawInstanced;
+    g_list_vtbl.CopyTextureRegion       = (void *)list_CopyTextureRegion;
+    g_list_vtbl.IASetIndexBuffer        = (void *)list_IASetIndexBuffer;
+    g_list_vtbl.DrawIndexedInstanced    = (void *)list_DrawIndexedInstanced;
+    g_list_vtbl.ClearDepthStencilView   = (void *)list_ClearDepthStencilView;
 
     madeira_fill_ID3D12RootSignature(&g_rootsig_vtbl);
     g_rootsig_vtbl.GetDevice = rootsig_GetDevice;
@@ -9474,7 +10407,7 @@ static ULONG STDMETHODCALLTYPE swap_AddRef(IDXGISwapChain4 *T) { return mad_addr
 static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     LONG n = InterlockedDecrement(&s->refs);
-    if (n == 0) {
+    if (n == 0) { mad_pd_purge(T);   /* ml1143 */
         if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1121: queued presents name this swapchain */
         mad_swap_release_buffers(s);
         if (s->view) ReleaseMetalView(s->view);
@@ -9486,9 +10419,9 @@ static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
     }
     return (ULONG)n;
 }
-static HRESULT STDMETHODCALLTYPE swap_SetPrivateData(IDXGISwapChain4 *T, REFGUID g, UINT n, const void *d) { (void)T; (void)g; (void)n; (void)d; return S_OK; }
-static HRESULT STDMETHODCALLTYPE swap_SetPrivateDataInterface(IDXGISwapChain4 *T, REFGUID g, const IUnknown *d) { (void)T; (void)g; (void)d; return S_OK; }
-static HRESULT STDMETHODCALLTYPE swap_GetPrivateData(IDXGISwapChain4 *T, REFGUID g, UINT *n, void *d) { (void)T; (void)g; (void)d; if (n) *n = 0; return DXGI_ERROR_NOT_FOUND; }
+static HRESULT STDMETHODCALLTYPE swap_SetPrivateData(IDXGISwapChain4 *T, REFGUID g, UINT n, const void *d) { return mad_pd_set(T, g, n, d); }   /* ml1143 */
+static HRESULT STDMETHODCALLTYPE swap_SetPrivateDataInterface(IDXGISwapChain4 *T, REFGUID g, const IUnknown *d) { return mad_pd_set_iface(T, g, d); }
+static HRESULT STDMETHODCALLTYPE swap_GetPrivateData(IDXGISwapChain4 *T, REFGUID g, UINT *n, void *d) { return mad_pd_get(T, g, n, d); }
 static HRESULT STDMETHODCALLTYPE swap_GetParent(IDXGISwapChain4 *T, REFIID riid, void **out) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     if (!out) return E_POINTER;
@@ -9554,12 +10487,14 @@ static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags) {
     return S_OK;
 }
 /* ml1121: the Metal half of Present; runs on the queue's worker (async) or on the caller. */
+static void mad_mheap_reclaim(struct mad_device *d, int all);
 static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     struct mad_resource *src;
     obj_handle_t drawable, tex, cb, enc;
     struct wmtcmd_blit_copy_from_texture_to_texture t2t;
     if (idx >= s->nbuf) return;
     src = s->buffers[idx];
+    mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
     { LONG64 tf = mad_qpc();   /* ml1128 */
     mad_device_flush_all(s->queue->device);          /* ml884: the frame's batch precedes the present */
     InterlockedExchangeAdd64(&g_xp.t_flush, mad_qpc() - tf); }
@@ -9568,6 +10503,20 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
         memset(&a, 0, sizeof a); a.op = 0; MadeiraCtl(&a);
         if (a.ret) { g_capture_left += a.ret; d3d12_log("[capture] %u frame(s) requested at present #%llu\n", a.ret, (unsigned long long)s->presents); }
+        {   /* ml1136: live fence-chain switch from the overlay; lists already running keep their mode */
+            int want;
+            memset(&a, 0, sizeof a); a.op = 6; MadeiraCtl(&a);
+            want = (int)a.ret;
+            if (want >= 1 && want <= 6 && want != 4 && want != g_fence_chain && g_fence_chain >= 0) {
+                d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> %d at present #%llu\n", g_fence_chain, want, (unsigned long long)s->presents);
+                g_fence_chain = want;
+            } else if (a.ret == 7 && g_fence_chain != 0 && g_fence_chain >= 0) {   /* 7 = request mode 0 (0 means "no request") */
+                d3d12_log("[madeira-d3d12] ml1136 fence-chain %d -> 0 (NO fences, diagnostic) at present #%llu\n", g_fence_chain, (unsigned long long)s->presents);
+                g_fence_chain = 0;
+            }
+        }
+        if (g_att_census) InterlockedIncrement(&g_ac_frames);   /* ml1137: the frame that just ended was a census frame */
+        g_att_census = (s->presents % 16) == 15;
         if (g_occlusion_visible < 0) {   /* ml1103 */
             g_occlusion_visible = mad_cfg_int_pe("occlusion-visible", 0) ? 1 : 0;
             d3d12_log("[madeira-d3d12] ml1103 occlusion-visible = %d (%s)\n", g_occlusion_visible,
@@ -9575,9 +10524,18 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         }
         if (g_capture_left) {
             g_capture_on = 1; g_capture_frame = s->presents + 1; g_dump_draws = 0;
-            if (!g_capture_ps_loaded) { g_capture_ps_loaded = 1; mad_cfg_str_pe("capture-ps", g_capture_ps, sizeof g_capture_ps);
-                                        if (g_capture_ps[0]) d3d12_log("[capture] ml1106 targeted draw capture for ps='%s'\n", g_capture_ps); }
+            {   /* ml1152: re-read every CAP, like capture-cs */
+                g_capture_ps_loaded = 1; mad_cfg_str_pe("capture-ps", g_capture_ps, sizeof g_capture_ps);
+                if (g_capture_ps[0]) d3d12_log("[capture] ml1106 targeted draw capture for ps='%s'\n", g_capture_ps); }
             g_capture_ps_shots = 0;
+            {   /* ml1141: re-read every CAP, so the target can change between captures of one run */
+                mad_cfg_str_pe("capture-cs", g_capture_cs, sizeof g_capture_cs);
+                g_capture_cs_ind = mad_cfg_int_pe("capture-cs-indirect", 0) ? 1 : 0;
+                g_capture_cs_max = (int)mad_cfg_int_pe("capture-cs-max", 12);
+                if (g_capture_cs[0]) d3d12_log("[capture] ml1141 targeted dispatch capture for cs='%s' (%s, first %d)\n", g_capture_cs,
+                                              g_capture_cs_ind ? "indirect only" : "direct and indirect", g_capture_cs_max);
+            }
+            g_capture_cs_shots = 0;
             d3d12_log("[capture] ===== capturing frame %llu (everything between present #%llu and #%llu; draw-dump forced on) =====\n",
                       (unsigned long long)g_capture_frame, (unsigned long long)s->presents, (unsigned long long)s->presents + 1);
         }
@@ -9617,7 +10575,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     cb = MTLCommandQueue_commandBuffer(s->queue->device->mtl_queue);
     if (cb && tex) {
         enc = MTLCommandBuffer_blitCommandEncoder(cb); if (enc) g_enc_seq++;
-        if (enc && g_fence_chain == 6 && s->queue->device->enc_fence) {   /* ml1134: after every committed batch, not just queue order */
+        if (enc && g_f6_used && s->queue->device->enc_fence) {   /* ml1134: after every committed batch, not just queue order */
             obj_handle_t df = s->queue->device->enc_fence;
             f6_encode(enc, F6_BLIT, &df, 1, 0);
         }
@@ -9866,12 +10824,12 @@ static HRESULT STDMETHODCALLTYPE mdd_QI(struct mad_mtl_dxgi_device *T, REFIID ri
 static ULONG STDMETHODCALLTYPE mdd_AddRef(struct mad_mtl_dxgi_device *T) { return (ULONG)InterlockedIncrement(&T->refs); }
 static ULONG STDMETHODCALLTYPE mdd_Release(struct mad_mtl_dxgi_device *T) {
     LONG n = InterlockedDecrement(&T->refs);
-    if (n == 0) { ID3D12CommandQueue_Release((ID3D12CommandQueue *)T->queue); free(T); }
+    if (n == 0) { mad_pd_purge(T);   /* ml1143 */ ID3D12CommandQueue_Release((ID3D12CommandQueue *)T->queue); free(T); }
     return (ULONG)n;
 }
-static HRESULT STDMETHODCALLTYPE mdd_SetPrivateData(struct mad_mtl_dxgi_device *T, REFGUID g, UINT n, const void *d) { (void)T; (void)g; (void)n; (void)d; return S_OK; }
-static HRESULT STDMETHODCALLTYPE mdd_SetPrivateDataInterface(struct mad_mtl_dxgi_device *T, REFGUID g, const IUnknown *d) { (void)T; (void)g; (void)d; return S_OK; }
-static HRESULT STDMETHODCALLTYPE mdd_GetPrivateData(struct mad_mtl_dxgi_device *T, REFGUID g, UINT *n, void *d) { (void)T; (void)g; (void)d; if (n) *n = 0; return DXGI_ERROR_NOT_FOUND; }
+static HRESULT STDMETHODCALLTYPE mdd_SetPrivateData(struct mad_mtl_dxgi_device *T, REFGUID g, UINT n, const void *d) { return mad_pd_set(T, g, n, d); }   /* ml1143 */
+static HRESULT STDMETHODCALLTYPE mdd_SetPrivateDataInterface(struct mad_mtl_dxgi_device *T, REFGUID g, const IUnknown *d) { return mad_pd_set_iface(T, g, d); }
+static HRESULT STDMETHODCALLTYPE mdd_GetPrivateData(struct mad_mtl_dxgi_device *T, REFGUID g, UINT *n, void *d) { return mad_pd_get(T, g, n, d); }
 static HRESULT STDMETHODCALLTYPE mdd_GetParent(struct mad_mtl_dxgi_device *T, REFIID riid, void **out) { (void)T; (void)riid; if (out) *out = NULL; return E_NOINTERFACE; }
 static HRESULT STDMETHODCALLTYPE mdd_GetAdapter(struct mad_mtl_dxgi_device *T, IDXGIAdapter **out) { (void)T; if (out) *out = NULL; d3d12_log("[madeira-d3d12] IDXGIDevice::GetAdapter is not implemented\n"); return E_NOTIMPL; }
 static HRESULT STDMETHODCALLTYPE mdd_CreateSurface(struct mad_mtl_dxgi_device *T, const DXGI_SURFACE_DESC *d, UINT n, DXGI_USAGE u, const DXGI_SHARED_RESOURCE *s, IDXGISurface **out) { (void)T; (void)d; (void)n; (void)u; (void)s; if (out) *out = NULL; return E_NOTIMPL; }
@@ -10054,7 +11012,7 @@ static ULONG STDMETHODCALLTYPE blob_AddRef(ID3D10Blob *T) { return (ULONG)Interl
 static ULONG STDMETHODCALLTYPE blob_Release(ID3D10Blob *T) {
     struct mad_blob *b = (struct mad_blob *)T;
     LONG n = InterlockedDecrement(&b->refs);
-    if (n == 0) { free(b->data); free(b); }
+    if (n == 0) { mad_pd_purge(T);   /* ml1143 */ free(b->data); free(b); }
     return (ULONG)n;
 }
 static void * STDMETHODCALLTYPE blob_GetBufferPointer(ID3D10Blob *T) { return ((struct mad_blob *)T)->data; }

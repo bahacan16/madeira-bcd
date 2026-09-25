@@ -23,7 +23,7 @@ INTERFACES = [
     "ID3D12Device10",   # ml877: the device answers ID3D12Device1..8; a UE 5.4 title fatals without Device1/Device2
     "ID3D12CommandQueue",
     "ID3D12CommandAllocator",
-    "ID3D12GraphicsCommandList",
+    "ID3D12GraphicsCommandList7",   # ml1144: the list answers GraphicsCommandList1..7; a UE 5.0 title fatals when List4 is refused
     "ID3D12Fence",
     "ID3D12Resource2",   # ml886: Resource1/Resource2 queries must not fail silently
     "ID3D12RootSignature",
@@ -88,6 +88,11 @@ def emit(header_path, out_path):
     L.append(" * trail instead of silently taking a fallback path. */")
     L.append("void madeira_d3d12_note_unimplemented(const char *iface, const char *method);")
     L.append("")
+    L.append("/* ml1143: private data is really stored, per object and GUID (madeira_d3d12.c). */")
+    L.append("static HRESULT mad_pd_get(const void *obj, REFGUID guid, UINT *data_size, void *data);")
+    L.append("static HRESULT mad_pd_set(const void *obj, REFGUID guid, UINT data_size, const void *data);")
+    L.append("static HRESULT mad_pd_set_iface(const void *obj, REFGUID guid, const IUnknown *data);")
+    L.append("")
 
     for iface in INTERFACES:
         methods = parse(text, iface)
@@ -95,14 +100,23 @@ def emit(header_path, out_path):
         for ret, name, args in methods:
             fn = "stub_%s_%s" % (iface, name)
             L.append("static %s STDMETHODCALLTYPE %s(%s) {" % (ret, fn, args))
-            # Private data and names: every object accepts them, and engines
-            # verify the result. Answering is correct; refusing was a fatal.
-            if name in ("SetPrivateData", "SetPrivateDataInterface", "SetName"):
+            # Private data: every object keeps it, and engines read it back.
+            # ml1143: storing nothing made D3DX12's residency manager (UE's D3D12
+            # RHI) see a new queue on every submission. Names are accepted.
+            if name == "SetName":
                 L.append("    return S_OK;")
                 L.append("}")
                 continue
             if name == "GetPrivateData":
-                L.append("    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */")
+                L.append("    return mad_pd_get(This, guid, data_size, data);")
+                L.append("}")
+                continue
+            if name == "SetPrivateData":
+                L.append("    return mad_pd_set(This, guid, data_size, data);")
+                L.append("}")
+                continue
+            if name == "SetPrivateDataInterface":
+                L.append("    return mad_pd_set_iface(This, guid, data);")
                 L.append("}")
                 continue
             L.append('    madeira_d3d12_note_unimplemented("%s", "%s");' % (iface, name))

@@ -78,3 +78,13 @@ code except as noted (requested 2026-09-16):
 - ca6f153cf9e 2026-08-25 Rename the project from Mythic to Madeira
 - 7817e220384 2026-08-28 Print the arena band selector's deferred log from dispatcher init
 - abf22e09603 2026-09-16 ntdll ARM64EC: root-frame unwinding, TLS window, arena hand-over and loader traces
+
+## After adoption
+
+Later changes are committed on `madeira-lgpl` directly. Third-party
+contributions keep their authors' copyright under LGPL-2.1-or-later and are
+signed off under the DCO (the fork's `CONTRIBUTING.md`):
+
+- feb96ad2be4 2026-09-25 xinput: read Madeira host controller snapshots
+  through win32u. Author: 125hz. willfaust/wine pull request #1, merged as
+  815cf1f92e2.

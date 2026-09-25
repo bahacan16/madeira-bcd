@@ -115,6 +115,7 @@ struct FPSOverlay: View {
                     pacingPill
                     capturePill
                     ecoPill
+                    fencePill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(6)
@@ -150,6 +151,7 @@ struct FPSOverlay: View {
                     pacingPill
                     capturePill
                     ecoPill
+                    fencePill
                 }
                 .font(.system(.caption, design: .monospaced))
                 .padding(.horizontal, 8)
@@ -222,6 +224,29 @@ struct FPSOverlay: View {
             .onTapGesture {
                 ecoOn.toggle()
                 madeira_set_eco(ecoOn ? 1 : 0)
+            }
+    }
+
+    /// ml1136: GPU encoder-sync mode, switchable live for in-place A/B tests.
+    /// F1 = every encoder waits for the one before (accurate, default),
+    /// F6 = barrier-driven, F5 = render passes wait at the fragment stage,
+    /// F0 = no fences at all (diagnostic ceiling; expect flicker).
+    // ml1137: the overlay view is recreated on layout changes, which reset a plain
+    // @State to the config value (ph-rdr93: taps re-requested F6 three times).
+    // The mode lives in a static so it survives, and @State mirrors it for redraws.
+    @State private var fenceMode: Int = FPSOverlayFenceMode.current
+    private var fencePill: some View {
+        let color: Color = fenceMode == 1 ? .white : fenceMode == 6 ? .purple : fenceMode == 5 ? .blue : .red
+        return Text("F\(fenceMode)")
+            .foregroundColor(color)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(color, lineWidth: 1))
+            .onTapGesture {
+                fenceMode = FPSOverlayFenceMode.current
+                fenceMode = fenceMode == 1 ? 6 : fenceMode == 6 ? 5 : fenceMode == 5 ? 0 : 1
+                FPSOverlayFenceMode.current = fenceMode
+                madeira_set_fence_mode(Int32(fenceMode == 0 ? 7 : fenceMode))
             }
     }
 
@@ -330,4 +355,9 @@ struct FPSOverlay: View {
         guard dt > 0.0001 else { return 0 }
         return Double(dc) / dt
     }
+}
+
+/// ml1137: process-wide fence-mode display state for the overlay pill.
+enum FPSOverlayFenceMode {
+    static var current: Int = Int(MadeiraConfig.get("fence-chain") ?? "1") ?? 1
 }

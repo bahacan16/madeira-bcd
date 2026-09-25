@@ -8987,3 +8987,109 @@ traffic (~400 MB/frame upper bound) and render scale are the levers.
   a mapping at 0x..+NMB (VM tag T, prot P)`.
 - A pool shrunk below 500 MB logs `⚠️ SMALL JIT POOL (N MB) on this launch ...
   relaunch`.
+
+## §131 — ph-rdr91/92: active play native vs Resolution Scale 3/4; the burst budget includes the GPU; GPU numbers at 60 fps are not comparable (DVFS); ml1136 live fence-mode toggle
+
+Logs: `research/logs-rdr2/ph-rdr91-ml1135.txt` (native, JIT pool 592 MB) and
+`ph-rdr92-ml1135-scale34.txt` (Resolution Scale 3/4, pool 560 MB). Both runs:
+- ECO through loading, then active play (running, camera moving);
+- 4 JIT generations each (no freezes).
+
+| Measure | Native (ph-rdr91) | 3/4 scale (ph-rdr92) |
+|---|---|---|
+| Seconds of 60 fps | 47 | 69 |
+| CPU at 60 fps | 3.70 W, 4.0 GHz, 64 mJ/frame, 289 M instr/frame | ~3.8 W |
+| GPU at 60 fps | 15-16 ms/frame, 87-90 % busy | 14-15 ms, 85-88 % |
+| fps after the clamp | 32-40 | 40-48 |
+| GPU after the clamp | 22-28 ms, 88-92 % busy | 19-22 ms, 89-92 % |
+| CPU after the clamp | 1.49 W, 2.0 GHz, 42 mJ/frame | 1.6-1.7 W, 2.2-2.4 GHz, 35-41 mJ/frame |
+| Game blocked on the GPU after the clamp | 14-20 % | 17-18 % |
+
+**Reading:**
+- **After the clamp, the GPU is the limit** (~90 % busy; the game waits on it).
+- 44 % fewer pixels cost ~20 % less GPU time after the clamp, so about half
+  of the GPU cost is resolution-independent:
+  - shadow maps;
+  - compute;
+  - per-draw or per-encoder costs, including fence stalls.
+- Keep 3/4 for now: +20-25 % fps after the clamp and a 47 % longer burst.
+- The burst lasted 69 s vs 47 s at the same CPU power, so **the burst budget
+  counts GPU energy too**. ph-rdr91 clamped at only 315 J of CPU energy from
+  launch (the others 413-478 J). The "425 J of CPU energy" model (§128) is only
+  an approximation for similar GPU loads. GPU efficiency extends the burst.
+- **GPU ms/frame at a vsync-capped 60 fps is NOT a work measure.** The GPU
+  lowers its own clock until it is ~85-90 % busy. Only GPU-bound
+  (post-clamp) numbers at a stable clock compare.
+  - So §130's mode-6 verdict ("15.0 ms in both runs at 60") is INVALID.
+  - Mode 6 must be re-tested after the clamp, in one place.
+
+### ml1136 (installed, `build/ipa/Madeira-20260924-0953-ml1136.ipa`): live fence-chain toggle
+
+- Overlay pill F1 / F6 / F5 / F0 (tap cycles 1 -> 6 -> 5 -> 0 -> 1).
+- Mechanism:
+  - `madeira_set_fence_mode()` (winemetal_unix.c) sets a request;
+  - MadeiraCtl op 6 returns it; 7 means mode 0;
+  - the D3D12 runtime polls it at every Present;
+  - `g_fence_chain` changes there, but each list keeps the mode it started
+    with (`e->mode`, snapshotted in mad_exec_list).
+- Mode-switch safety:
+  - a non-6 list first waits for encoders a mode-6 list left pending
+    (f6_drain);
+  - f6_join runs at commit whenever encoders are pending, whatever the mode;
+  - the Present blit waits for the device fence once any mode-6 list has run.
+- The log records each switch: `ml1136 fence-chain A -> B at present #N`. The
+  ml1116 perf line now names the mode.
+- Test after the clamp, standing still: ~20 s per mode, F1 -> F6 -> F5 (and
+  F0 briefly as the ceiling), then compare `[perf] ml1108` GPU ms/frame and
+  fps per window.
+
+## §132 — ph-rdr93 (ml1136): fence-mode A/B in one spot after the clamp; F6 made the default; ml1137 GPU census
+
+Log: `research/logs-rdr2/ph-rdr93-ml1136-fence-ab.txt`. 3/4 scale, standing
+still after the clamp; each mode ~20 s (switch times logged):
+
+| Mode | fps | GPU ms/frame | GPU busy | Game blocked on GPU |
+|---|---|---|---|---|
+| F1 (later window, clock recovered) | ~45 | ~19.9 | 90 % | 17 % |
+| **F6** | **~48** (44-51) | **~18.6** | 90 % | 15-17 % |
+| F6 again | ~47 | ~19.1 | 90 % | |
+| F5 | ~44 | ~20.3 | 87-90 % | |
+| F0 (no fences; heavy flicker) | ~41 | **13.0** | **~54 %** | 0 % |
+
+- F6 = about +6 % fps and -1.3 ms GPU per frame. No glitches (the user
+  confirmed), so the phone cfg now has **fence-chain = 6**. Backup:
+  `madeira-cur.cfg.pre-f6default`.
+- F0 shows the sync stalls are ~7 ms of the ~20 ms GPU frame. Its fps is
+  CPU-bound: broken culling means more CPU work, so F0 is a ceiling for GPU
+  time only.
+- F6 recovers ~1.3 ms of those ~7 ms.
+- The pill reset to the cfg value when the overlay was recreated (three "F6"
+  requests in a row). Fixed in ml1137 with a static.
+
+**ml1137** (installed, `build/ipa/Madeira-20260924-1103-ml1137.ipa`): counts
+only, no behaviour change.
+- Barriers are recorded with their state class (list_ResourceBarrier):
+  - read->read;
+  - RT/depth->read;
+  - copy_dest->read;
+  - UAV (UAV->read, and UAV barriers);
+  - ->write / COMMON / aliasing ("all");
+  - BEGIN_ONLY splits count as read->read.
+- In mode 6, each barrier-caused sync counts what a state-aware rule would
+  wait for. The pending encoders are tracked per class:
+  - RT/depth: the passes that had it attached;
+  - copy: pending blits;
+  - UAV: compute and render.
+  - `[perf] ml1137 barrier census per frame: ... syncs X, a state-aware rule
+    needs none/subset/all; fences waited A -> B`.
+- In 1 of 16 frames, attachment bytes are counted as load / clear / store,
+  plus what happens NEXT to each stored attachment in its list:
+  - cleared (store wasted);
+  - read / rebound (needed);
+  - written;
+  - no use.
+  - Also counted: DiscardResource calls (currently a no-op in the runtime).
+  - `[perf] ml1137 attachments per census frame: ...`.
+- Decide from these:
+  - a state-aware barrier mode (F7), if many syncs or fences drop;
+  - DontCare stores and loads, if cleared-next or discard are large.

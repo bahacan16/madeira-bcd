@@ -1614,3 +1614,1007 @@ at the repo root contains ml934 **only** — not ml934b/d/ml935.
    gated by `/tmp/rmetald-no-autodump`, which a `/tmp` wipe deletes.** It
    then freezes rendering for seconds every 100 frames and reads as a
    rendering bug. Recreate that file after any reboot.
+
+## 2026-09-24 — iPhone 18 Pro (local Metal): freeze behind the loading throbber = geometry-shader pipelines unbuildable locally -> ml1138
+
+Log: `research/logs-rdr2/ph-empire01-iphone18-freeze.txt` (Empire-dx12.bat, ml1137).
+
+- Device created; swapchain 960x540; Present #1 and #2; then nothing. The
+  CPU sits nearly idle and every game thread waits:
+  - RenderThread in an UNTIMED wait;
+  - GameThread and RHIThread in timed waits;
+  - our three queue workers idle.
+- Last runtime events:
+  - two geometry pipelines, `WriteToSliceMainVS/GS` (+ FilterMainPS, +
+    MainPS);
+  - `[winemetal] geometry-emulation pipelines are only implemented for the
+    remote backend`;
+  - the fallback plain pipeline cannot link a VS converted for stage-in
+    (`AGXMetalG19P: unresolved visible function reference:
+    irconverter_stage_in_shader`);
+  - `newRenderPipelineState failed`, so CreateGraphicsPipelineState returned
+    E_FAIL.
+- UE creates PSOs asynchronously; the render thread then waits forever. On the
+  vphone the remote host (rmetald RM_OP_NEW_GEOM_PSO_INFO) built these, which
+  is why it worked there.
+
+**ml1138** (installed, `build/ipa/Madeira-20260924-1117-ml1138.ipa`):
+- winemetal_unix.c `_MTLDevice_newGeometryEmulationPipelineState` builds the
+  pipeline LOCALLY, exactly as rmetald / IRRuntimeNewGeometryEmulationPipeline
+  do:
+  - object = `<vs>.dxil_irconverter_object_shader` with
+    tessellationEnabled=false, stage-in function linked;
+  - mesh = GS with vertex_shader_output_size_fc;
+  - fragment = PS.
+  - Logs: `ml1138 local geometry pipeline OK` / REFUSED reasons.
+- madeira_d3d12.c: a GS pipeline that still cannot be built returns a
+  PLACEHOLDER PSO (draws skipped and counted) instead of E_FAIL, so a missing
+  effect can never hang an engine that builds pipelines asynchronously.
+- Not yet tried on the device with this title: fence-chain 6 (the phone
+  default since the RDR2 work), Nanite, Lumen. Next freezes may come from
+  those.
+
+### ph-empire02 (ml1138): geometry pipelines OK; next wall = a compute shader the iOS converter refuses -> UE fatal -> ml1139
+
+- `ml1138 local geometry pipeline OK` for both WriteToSlice pipelines.
+- Present #3, fullscreen (swapchain 1408x648), then the Bink splash
+  (SplashMicroids.bk2) started.
+- Then: `CS conversion failed: compile/link failed (dxil backend, code 7);
+  34376 bytes`, followed by
+  `LowLevelFatalError [PipelineStateCache.cpp] [Line: 437]` (a failed PSO is
+  fatal in UE), which presents as a freeze. The vphone converted on the Mac
+  converter; the phone's iOS converter rejects this shader.
+- The refused-bytecode dump never landed: inside the Wine process
+  HOME = Documents/wine, so the path Documents/wine/Documents/... did not
+  exist.
+
+**ml1139** (installed, `build/ipa/Madeira-20260924-1130-ml1139.ipa`):
+- madeira_ir_unix.mm: refused shaders go to `$MADEIRA_DOCS_DIR/madeira-failed-shaders/shader_NN_codeC.bin`
+  (the app's real Documents; visible in Files).
+- madeira_d3d12.c: a compute shader that cannot be converted returns a
+  PLACEHOLDER PSO (dispatches skipped and counted) instead of E_FAIL.
+
+Next:
+- pull the dumped .bin and convert it with the Mac converter (iOS target
+  plus the same flags) to get the real diagnostic behind code 7;
+- then fix the conversion.
+
+### ph-empire03 (ml1139): IN GAME on the iPhone 18 Pro; code 7 decoded; ml1140
+
+Log: `research/logs-rdr2/ph-empire03-ml1139-ingame.txt`.
+
+**In game, with the same look as the vphone:** the ant and rocks look
+metallic, and the cave is far too bright.
+
+**Nanite and Lumen are both ON.** The .bat passes only
+`-dx12 -sm6 -windowed -ResX=960 -ResY=540`.
+- Nanite:
+  - 10,573 attachment-less passes (HW raster);
+  - NodeAndClusterCull, InstanceCull;
+  - MicropolyRasterize, RasterBinBuild, ShadingBinBuildCS.
+- Lumen (software):
+  - ScreenProbe* passes;
+  - LumenCardCopyPS;
+  - LumenSceneDirectLighting*;
+  - TraceFromProbesCS;
+  - mesh-SDF culling.
+- The Shipping build writes no UE log (the -abslog user path "mythic" does
+  not exist on the phone).
+
+**Code 7 decoded** with the Mac converter on the dumped
+`shader_00_code7.bin` (scratchpad msc_probe):
+`IR contains unsupported instruction: "dx.op.atomicBinOp.i32". Support for
+globally coherent textures requires targeting macOS 15, iOS 18, or later`
+(IRErrorCodeUnsupportedInstruction).
+
+| Target | Result |
+|---|---|
+| iOS 17 / Apple9, the old phone target | FAILS |
+| iOS 17 / Apple10 | FAILS |
+| iOS 18+ (any family) | OK |
+| macOS 15, the vphone target | OK |
+
+**Performance:** 5.8 fps, GPU-bound at 142.5 ms GPU per frame (82 % busy),
+~250 encoders and ~516 barriers per frame, at 1080x496 render resolution.
+
+**The capture was truncated:** the 384 MB budget was reached at
+enc#250380 by 4096^2 Lumen atlases, so there was no G-buffer, lighting or
+final image.
+
+**ml1140** (installed, `build/ipa/Madeira-20260924-1207-ml1140.ipa`):
+- iOS conversion target 17.0 -> 18.0. This affects only the DXIL path, which
+  has no disk cache, so there is no recompilation cost.
+- Capture skips targets over 16 MB unless `capture-big = 1`.
+
+**Next:**
+- CAP in the cave, then compare the final image and the G-buffer to the
+  reference;
+- continue the "Lumen floods the cave" work (Open #1 above). Ground truth
+  from D3DMetal remains the recommended discriminator.
+
+### ph-empire04 (ml1140): capture of frame 1307 — materials correct, light floods in at ONE additive pass
+
+Log: `research/logs-rdr2/ph-empire04-ml1140.txt`; capture files are in the
+session scratchpad only (game-derived, never commit).
+
+- **G-buffer is right:**
+  - GBufferC base colour is brown rock (mean RGB 0.358/0.325/0.283);
+  - GBufferB: metallic 0.000, specular 0.495, roughness mean 0.914
+    (median 1.0), shading-model bytes {0, 33, 38}.
+  - So "metallic" is a LIGHTING look, not bad material data.
+- **Scene-colour luminance medians** (right wall / left floor / opening):
+  - through enc#133575: 0.003-0.005 / 0.001-0.003 / 0.106-0.133;
+  - enc#133581: 0.072 / 0.123 / 0.253;
+  - enc#133584: opening 0.590 (sky atmosphere + fog, expected).
+- **enc#133581** = `MainVS` + `ReflectionEnvironmentSkyLighting`, additive
+  (D3D src ONE / dst ONE colour, ONE / ZERO alpha; Metal matches). This is
+  UE's composite of Lumen diffuse indirect + reflections/sky specular. The
+  blend is translated correctly, so the shader's OUTPUT is too high.
+- ⚠️ **Our own launch batch forces `r.ReflectionMethod=0`** (plus VSM off,
+  volumetric fog/cloud off). These were ml900 vphone-transport dispatch cuts.
+  With Lumen GI on and reflections = None, specular falls back to reflection
+  captures and the sky light, and DFAO is handed to Lumen, so rough rock can
+  pick up sky specular. The reference screenshots are engine defaults
+  (Lumen reflections ON). **We have never compared like with like.**
+- Hardware Lumen: not possible today. OPTIONS5 reports RaytracingTier 0 and
+  CreateStateObject is a stub, so UE picks software Lumen. Whether the demo
+  was cooked with ray-tracing shaders is unknown (its config pak is
+  Oodle-compressed).
+
+**Staged for the next run** (config only, no build; backups in the scratchpad):
+- phone `Empire-dx12.bat`: `r.ReflectionMethod=0` -> `1` in all three
+  UserEngine.ini layers (ONE variable; VSM and volumetrics still off);
+- phone `madeira.cfg`: `capture-ps = ReflectionEnvironmentSkyLighting`, so
+  a CAP frame dumps every input that pass samples (diffuse indirect,
+  reflections, AO, and so on) and logs its argument tables.
+
+### ph-empire05 (ml1140 + r.ReflectionMethod=1): LIGHTING RIGHT; ground smooth / rocks blurry -> ml1141
+
+Log: `research/logs-rdr2/ph-empire05-ml1140-lumenrefl.txt`. User: "lighting
+might be perfect now". Speed unchanged: 5.2-6.0 fps, GPU 136-160 ms/frame,
+83 % busy.
+
+- **The cave flood was our own batch.** `r.ReflectionMethod=0` (an ml900
+  vphone-transport dispatch cut) left rough rock with unoccluded sky specular.
+  With Lumen reflections ON (the engine default) the lighting matches.
+- The capture-ps target never fired: with Lumen reflections UE composites in
+  compute, so `ReflectionEnvironmentSkyLighting` is not drawn at all.
+- **New symptom: rock textures lack detail; parts of the ground are
+  perfectly smooth.** Frame 1728:
+  - GBufferC (base colour): ground flat beige, rock pile a low-frequency
+    smear; the ant and the upper-left rock wall are sharp.
+  - GBufferA (normals): the smooth ground has NO normal-map detail at all;
+    the left wall and some lower-left ground do.
+  - Before Nanite's compute material pass (ShadingBinBuildCS, then one
+    indirect `MainCS` per shading bin) the G-buffer holds only the ant, so
+    every rock and all the ground is Nanite compute-shaded. Same path, sharp
+    for some materials and not others.
+- **Killed:**
+  - compute gradient sampling. `tests/offline/gradcs` (new): SampleGrad,
+    SampleLevel and implicit Sample through SM6.6 compute derivatives, with
+    ForceTextureArray and descriptor tables, all pick the exact mip on the
+    M4 Max;
+  - SRV min-LOD clamp (0 clamped views this run);
+  - write masks (the page-table updates write one channel at a time;
+    WMTColorWriteMask matches Metal's bit order);
+  - VRAM budget (3072 MB reported, queried once).
+- **Virtual texturing is live but mostly coarse.** 22 PageTableUpdate draws
+  per census window, and all feedback compaction kernels dispatch. The
+  decoded 256x256 RGBA16Uint page table (3 layers):
+  - 69 % of entries at level 5 (a texture's single root page);
+  - some regions at 0-3;
+  - only ~900 physical tiles used per layer, so the pool is not full.
+  Either the feedback that should request finer pages is missing for some
+  materials, or the visible ground simply is not a VT texture. Unproven
+  either way.
+- Nanite TESSELLATION is active (PatchSplit, InitVisiblePatchesArgs every
+  frame). A displacement map read at a coarse mip would also flatten the
+  ground.
+
+**ml1141** (installed, `build/ipa/Madeira-20260924-1251-ml1141.ipa`; config
+armed with `capture-cs = MainCS`, `capture-cs-indirect = 1`,
+`capture-cs-max = 32`):
+- targeted DISPATCH capture. On a CAP frame, every root argument of the
+  matched dispatches is logged:
+  - each table entry as SRV / UAV / CBV / sampler;
+  - textures with size, format, mip count and the VIEW's mip range;
+  - buffers with size and offset; sampler LOD bias.
+- The SRV textures (the view's most detailed mip, de-duplicated) and root
+  CBVs are captured before the dispatch runs.
+- `mad_capture_one` now copies block-compressed textures (whole 4x4 blocks).
+- `build/tools/bc-decode.m` + capture-to-png.py decode BC1-7 on the Mac's GPU.
+
+**Next:** CAP where the ground is smooth. The first ~24 indirect MainCS
+dispatches after ShadingBinBuildCS are the material bins. Read the ground
+material's textures from the capture:
+- a real high-res mip 0 means sampling/VT is at fault;
+- a tiny texture means streaming never delivered;
+- a VT page table + physical atlas means the VT feedback path is at fault.
+
+### ph-empire06 (ml1141 capture-cs): ROOT CAUSE of the smooth ground = UE's texture streamer is over budget and streams nothing
+
+Log: `research/logs-rdr2/ph-empire06-ml1141-capcs.txt` (frame 1639, CAP
+over smooth ground; 32 Nanite material passes captured).
+
+- **Every material texture in all 32 material passes is <= 64x64**: 128
+  bindings, not one larger.
+  - Mix: 64x64 BC1 x32, 64x64 BC5 x18, 32x32 BC1 x12.
+  - Each has a full chain to 1x1 (7 or 6 mips), i.e. only the always-resident
+    tail of a streamed texture.
+  - Decoded (bc-decode) they are real content: soil base colour, normal map,
+    masks. At 64x64 they paint the ground smooth.
+- **Virtual texturing is fine and populated**, which is why some surfaces
+  are sharp. Physical caches are 11352^2 BC1 x2 and 8184^2 BC5, with a
+  256x256 RGBA16Uint page table.
+- **IO is fine**: Nanite pages and VT tiles stream from the same .ucas.
+- **Sampling is fine** (gradcs test, previous section).
+- **Texture quality is High** (`GameUserSettings.ini`
+  sg.TextureQuality=2), so no scalability mip bias explains it.
+- **Budget:** our own `live GPU backing` line shows the game at ~3,360 MB in
+  the level:
+  - RT 555, UAV tex 578, sampled 696, private buffers 1,395 (Nanite
+    streaming pool 576 MB alone);
+  - peak 3,701 during load.
+  - We report DedicatedVideoMemory and QueryVideoMemoryInfo.Budget =
+    `vram-mb` = 3072 (the RDR2-tuned value), with CurrentUsage = Metal
+    currentAllocatedSize.
+  - **UE is permanently over budget**, so the streamer keeps every streamed
+    texture at its minimum mips. VT caches are fixed allocations and are
+    unaffected.
+- Headroom: kill line 8192 MB, footprint ~6.1 GB in the level (peak 6.9).
+
+**Staged (config only):** `vram-mb = 4608`. One variable; everything else is
+as in ph-empire06. Expect the footprint to rise by the streamed textures
+(target < ~7.5 GB).
+- If the ground sharpens: CONFIRMED. The general fix is a budget derived
+  from the kill line minus the measured non-GPU footprint, not one fixed
+  number for every title.
+- If it does not: UE's streamer is stuck for another reason. The async
+  texture-create path (queue types 0/2/3 in use) is the next suspect.
+
+### ph-empire07 (vram-mb 4608): TEXTURES SHARP (confirmed by the user); performance census -> ml1142
+
+Log: `research/logs-rdr2/ph-empire07-ml1141-vram4608.txt`.
+- The user reports all textures sharp; rendering "may be perfect". The
+  in-cave monochrome moment is game logic (same in CrossOver on the Mac).
+- **Memory:** tex-sampled 696 -> 1,209 MB; footprint 7.6-7.8 GB (peak 7.84)
+  against the 8.19 GB kill line. That is tight; watch for jetsam.
+- **Performance:** 5.2-5.8 fps.
+  - Frame ~180 ms, GPU busy only 58-75 ms (32-41 %); the game blocked on
+    fences only 7-44 ms/frame. So the frame is not GPU-bound any more.
+  - **The ExecuteCommandLists thread (UE's RHI submission thread, xp role E)
+    runs ~250 ms of P-core time per ~270 ms window**, ~5.8 G instr/s.
+    `[xp-api-top]`: d3d12.dll+0x25ff4 (fence_GetCompletedValue) =
+    4.39 M calls/s of 4.9 M x64->EC transitions/s. SetEventOnCompletion
+    is only ~4 per frame.
+  - A spinning submission thread would also explain the idle GPU: if it
+    spins waiting, it is not submitting.
+  - P cores are clamped to ~1.6 GHz (power budget), and one of the two
+    P cores is spent on the spin.
+- The executable has both `RHIInterruptThread` and `RHISubmissionThread`
+  (cvars `rhi.UseSubmissionThread`, `r.D3D12.SubmissionTimeout`).
+
+**ml1142** (installed, `build/ipa/Madeira-20260924-1341-ml1142.ipa`):
+- `[gcv]` probe: 1 GetCompletedValue call in 2^18 scans its stack for
+  return addresses inside the game exe and tallies (caller, caller's
+  caller, thread) with the thread's name. Disassemble those RVAs in the
+  pulled exe (`scratchpad/empire-bin/`).
+- `encoder-labels = 1` (config): every Metal encoder is named after the
+  pass that opened it (`R#seq vs|ps WxH`, `C#seq kernel`, `B#seq copy`) for
+  an Instruments Metal System Trace (`xcrun xctrace record --template
+  'Metal System Trace' --device <udid> --attach <pid>`).
+
+### ph-empire08 (ml1142): the spin is D3DX12's residency manager, starved of PRIVATE DATA -> ml1143; GPU profile says shadows
+
+Log: `research/logs-rdr2/ph-empire08-ml1142-gcv-trace.txt`; Metal System
+Trace `scratchpad/mst1.trace` (5.7 s, 47 frames, labels via
+encoder-labels = 1; parsed with scratchpad/mstparse.py + mstagg.py).
+
+**CPU: the spin.**
+- 11,135 of 11,137 `[gcv]` samples are on thread 0114 'RHISubmissionThread',
+  exe `+0x2895cc7` <- `+0x289c9ae`, on a fence parked at 1.
+- The counter wrapped past 2^31: ~2.9 G GetCompletedValue calls in the session.
+- Disassembly (pulled exe):
+  - `+0x2895c60` = D3DX12Residency `DequeueCompletedSyncPoints` (list of
+    DeviceWideSyncPoint, count at +8, QueueSyncPoint{Fence*, value} pairs at
+    +0x20; calls Fence->pFence->GetCompletedValue);
+  - `+0x289c970` = `ProcessPagingWork` (QPC, locks, MakeResident arrays; its
+    own waits use SetEventOnCompletion + WaitForSingleObject correctly);
+  - callers: the residency worker thread (`+0x2890fc0`, created at
+    `+0x289bea0`) and two inline ExecuteCommandLists paths that end in
+    queue->Wait(fence, value).
+- **Root cause (ours):** `ID3D12CommandQueue::SetPrivateData` returned S_OK
+  and stored nothing; GetPrivateData always returned NOT_FOUND (generated
+  stubs, and five hand-written copies). D3DX12 keeps its per-queue fence in
+  the queue's private data, so every ExecuteCommandLists looked like a new
+  queue:
+  - a new fence each time, signalled once (the "fence at 1");
+  - NumQueuesSeen++;
+  - every sync point carries one entry per fence ever made.
+  - Cost grows without bound over a session.
+
+**ml1143** (installed, `build/ipa/Madeira-20260924-1409-ml1143.ipa`,
+d3d12.dll sha a35b9c4a):
+- real private data: a store keyed by (object, GUID), D3D12 semantics
+  (size query, DXGI_ERROR_MORE_DATA, interface entries AddRef'd);
+- `gen_vtables.py` routes every interface's Get/Set/SetInterface to it; the
+  five hand-written copies too;
+- every destructor purges its object (13 release paths), so a reused
+  address inherits nothing.
+- The `[gcv]` probe stays in, to measure the drop.
+
+**GPU: per-pass profile (47 frames, ~100 ms GPU/frame, 8.2 fps while
+tracing).**
+- Nanite raster into the 12288x2048 SHADOW atlas: 26.1 ms fragment + 7.9 ms
+  vertex per frame = 34 ms.
+- MicropolyRasterize 12.9 ms (mostly shadow views, by pass size).
+- RasterBinReserve 7.4, MainCS (Nanite shading + others) 8.1.
+- InjectMainPS (translucency volume, GS emulation) 5.4.
+- EmitShadowMapPS 2.7.
+- Main-view HW raster only 0.8 ms.
+- Cause: our batch's `r.Shadow.Virtual.Enable=0` (ml900 vphone cut) forces
+  legacy cascaded shadow maps. With Nanite that re-rasterizes every cascade
+  every frame; VSM (the engine default) caches pages.
+- **Next (config): VSM on.** Separate run, one variable.
+
+### ph-empire09 (ml1143): CONFIRMED -- 5.5 -> 11.3-12.1 fps; now fully GPU-bound
+
+Log: `research/logs-rdr2/ph-empire09-ml1143-privdata.txt`. User: "like 12 FPS
+now, instead of 3-5".
+- GetCompletedValue polls: ~800,000 -> 105-111 per frame.
+- GPU busy 93-100 % of wall at 82-87 ms per frame. The game waits on fences
+  74-84 ms/frame, i.e. it waits for the GPU.
+- Footprint 7.5-7.7 GB (peak 7.76) at vram-mb 4608: tight, survived.
+- **Staged (config):** phone Empire-dx12.bat `r.Shadow.Virtual.Enable=0` ->
+  `1` in all three UserEngine.ini layers. One variable. Backup
+  `scratchpad/empire-cfg/Empire-dx12.bat.bak-ml1143`. Remaining non-default
+  batch overrides after this: `r.VolumetricFog=0`, `r.VolumetricCloud=0`,
+  `r.SkyLight.RealTimeReflectionCapture=1`.
+
+### ph-empire10 (ml1143 + VSM on): menu flicker gone at F5; app died = JETSAM, not F5
+
+Log: `research/logs-rdr2/ph-empire10-ml1143-f5-crash.txt`.
+- **User:** the 3D menu background flickered heavily under fence-chain 6.
+  Pressing the pill to F5 (fragment-stage waits) stopped it at once. The
+  app died ~1 s later.
+- **The death is memory:**
+  - footprint 7,153 -> 7,780 MB at 14:32:06.5 (+627 MB in 300 ms), then a
+    steady climb to 8,178 MB at 14:32:12.9 (kill line 8,192);
+  - the F6 -> F5 switch was at 14:32:09.9 (present #1121), mid-climb, and
+    the slope did not change;
+  - tex-sampled 671 -> 906 -> 1,114 MB (UE filling the 4,608 MB budget) plus
+    VSM UAV memory (tex-UAV 585 -> 687 MB).
+- **Config now:** `vram-mb = 4352` and `vram-trim-mb = 700` (ml1075 dynamic
+  trim: above 7,492 MB footprint the advertised budget shrinks 1:1). Whether
+  UE re-polls QueryVideoMemoryInfo is unknown: the ml1075 line only prints on
+  a >= 64 MB change or every 5,000 calls, and the trim was off, so no change
+  ever happened.
+- **Open, real:** fence-chain 6 has a correctness hole that this menu scene
+  hits (flicker gone under F5). RDR2 never showed it. Empire is DXIL, not
+  DXBC; the fence chain is shared runtime logic. Next: find the barrier
+  pattern mode 6 under-syncs, e.g. the ml1137 "state-aware rule needs none"
+  class, or compute encoders kept open at a barrier (`f6-compute-open`).
+
+### ph-empire11 (ml1143 + VSM + vram-mb 4352 / trim 700): 14-17.7 fps; where it stands
+
+Log: `research/logs-rdr2/ph-empire11-ml1143-vsm.txt`. User: "15-18 FPS".
+- **VSM roughly halved GPU work.** Per-frame GPU was 82-87 ms before;
+  now 36-40 ms in the windows where the GPU is only 60 % busy, and 54-68 ms
+  where it is 95 % busy. DVFS: GPU ms at different utilisations are not
+  comparable.
+- **Two regimes, both ~15-17 fps:**
+  1. +84 s .. +190 s: the SoC power limiter parks or clamps the P cores
+     (P = 0.00 or 1.44 GHz; everything on E cores at 1.72 GHz). The GPU is
+     60 % busy, the game waits on fences 45-52 ms/frame, and
+     `list Reset waits` = 37 ms/frame (14.8 waits): game threads blocked
+     in command-list Reset until our async-submit worker has consumed the
+     list. The worker is busy 22.5 ms/frame on an E core.
+  2. Before and after that window the P cores run at 3-4.8 GHz and the
+     game is GPU-bound (94-95 %).
+- **Memory:** UE polls QueryVideoMemoryInfo constantly (166k queries), so
+  the ml1075 trim works (budget 4,050-4,259). Yet the footprint peaked at
+  8,175 MB at +121 s mid-game, 17 MB from the kill line. Config now
+  `vram-trim-mb = 1000` (trim from 7,192 MB).
+- Retire on the fence worker (cpu_blocked_in_retire 14 ms/frame) is NOT on
+  the submission path; I checked, it is the async fence worker.
+
+**Candidate levers, none built (no proven gain yet):**
+1. **List Reset without waiting.** D3D12 lets a command list be reset right
+   after ExecuteCommandLists (the recording belongs to the allocator). Ours
+   keeps the recording in the list object, so Reset waits for the ml1120
+   worker. Fix: on Reset of an in-flight list, hand its recording storage
+   to the queued job and give the list fresh storage. General benefit, but
+   whether those 37 ms are on the critical path is unproven. Measure
+   first: which threads wait, and does the RHI thread wait.
+2. **F6 correctness hole** (menu flicker), then re-measure F5 vs F6.
+3. **Game settings** (the user's choice, not our code): sg.ReflectionQuality
+   is 3 (Epic, Lumen reflections), the rest are 2 (High), ResolutionQuality 87.
+4. A new Metal System Trace with VSM on, for the next GPU breakdown.
+
+## 2026-09-24 — Valley of the Ancient (UE 5.0.0 Early Access, Shipping) on the iPhone 18 Pro: splash then stall -> ml1144
+
+Log: `research/logs-rdr2/ph-valley01-splash-stall.txt`; UE crash report
+`scratchpad/valley/CrashContext-0924.xml` (from the prefix
+`users/mobile/AppData/Local/ValleyoftheAncient/Saved/Crashes/UECC-*/CrashContext.runtime-xml`;
+it carries ErrorMessage even though Shipping writes no log).
+- AncientGame.exe -> AncientGame-Win64-Shipping.exe. Two devices are created
+  (FL 11.0 probe, then 12.0), with queues, heaps and command signatures.
+  Then:
+  `LowLevelFatalError [D3D12Util.cpp:648] CommandList->QueryInterface(IID_PPV_ARGS(RayTracingCommandList)) failed at D3D12CommandList.cpp:85 with error E_NOINTERFACE`.
+  It presents as the splash window staying up (a UE fatal hangs on its own
+  crash reporter).
+- UE 5.0 queries ID3D12GraphicsCommandList4 on every direct/compute list
+  whenever the device answers ID3D12Device5, which ours does (ml877).
+  Our list answered only the base interface: List1/2/4/5 were refused.
+- ⚠️ The ml812 OutputDebugStringW dumper prints wide strings as dots; read
+  the crash XML for the message.
+- Valley `Saved/Config/Windows/Engine.ini` holds no overrides (generated
+  paths only).
+
+**ml1144** (installed, `build/ipa/Madeira-20260924-1457-ml1144.ipa`,
+d3d12.dll sha 7cf28f34):
+- `gen_vtables.py` builds the list vtable as ID3D12GraphicsCommandList7
+  (a superset; 162 stubs);
+- `struct mad_list` / `g_list_vtbl` are typed List7, with the 47
+  assignments cast;
+- `list_QI` answers ID3D12GraphicsCommandList1..7 with the same object.
+- The new methods are named stubs. Every optional feature they serve is
+  reported off (OPTIONS2-18 all zero), so a conforming engine never calls
+  them; any call shows up as `madeira_d3d12_note_unimplemented`.
+
+### ph-valley02 (ml1144): into the demo (text screen, campfire audio) -> JETSAM; placed resources did not alias -> ml1145
+
+Log: `research/logs-rdr2/ph-valley02-ml1144-crash.txt`.
+- **ml1144 worked:** past device and list creation, into the first rendered
+  frames.
+- **Killed at 8,129 of 8,192 MB.** Footprint: 1.3 GB at +11 s -> 5.4 GB at
+  +20 s -> 6.9 GB at +31 s -> 8.1 GB at +32 s. The ml1075 trim had already
+  cut the budget to 3,414 MB, but these allocations do not follow the
+  budget.
+- **The last ~8 frames each allocated the same set: 28 + 35 + 35 + 20 MB.**
+  - The "big buffer" line also fires for placed resources; the "placed"
+    line only fires for >= 32 MB.
+  - The one we can see is placed at offset 0 of a 128 MB
+    DEFAULT/NOT_ZEROED heap every frame.
+  - UE 5.0's RDG transient allocator: placements alias inside a few heaps
+    and are cached for a while. In D3D12 they share the heap; ours gave each
+    placed resource its own allocation (the heap was a description only).
+- **Heaps:**
+  - UE's are DEFAULT type, 4-128 MB, flags 0x1000 / 0x1044 / 0x10c0;
+  - RDR2's (ph-rdr93) are 1,189 CUSTOM (type 4) heaps of a few hundred KB,
+    flags 0x44. That is why they were never backed.
+
+**ml1145** (installed, `build/ipa/Madeira-20260924-1518-ml1145.ipa`;
+d3d12.dll ca5f59e2, winemetal.dll a7f74320):
+- winemetal slots 139-140: `MTLDevice_heapBufferSizeAndAlign`,
+  `MTLHeap_newBufferAtOffset` (PE thunks, unix handlers, wow64 stubs;
+  wmt_api_names.h regenerated to 141 entries).
+- **DEFAULT heaps are Metal placement heaps** (private, tracked, added to
+  the residency set). Placed buffers and textures are created INSIDE them at
+  the app's offset when Metal's alignment and size allow; otherwise
+  standalone plus an `ml1145 placed ... standalone` log (first 16).
+- A placed resource AddRefs its heap, is not separately resident and is not
+  separately accounted.
+- CUSTOM / UPLOAD / READBACK heaps unchanged. `heap-backing = 0` in
+  madeira.cfg restores the old behaviour.
+- `GetResourceAllocationInfo` now reports max(linear footprint, Metal
+  placement size) and max(64 KB, Metal alignment). The texture description
+  comes from one helper, `mad_texinfo_from_desc`, shared with creation.
+- ⚠️ Possible regression: UE 5.4 (Empire) pool heaps are now fully backed.
+  That matches Windows, but unused heap space now costs memory; Empire sat
+  at 7.6-7.7 GB. Its `r.RDG.TransientAllocator=0` override may no longer be
+  needed; that was likely the same gap.
+
+### ph-valley03 (ml1145): in game, BLACK screen + HUD, 2-4 fps -> ml1146 (shader-cache bug) + ml1147 (DXBC geometry shaders)
+
+Log: `research/logs-rdr2/ph-valley03-ml1145-black.txt`. Metal HUD 6.2 GB, no
+jetsam; every DEFAULT heap was backed with 0 placement fallbacks (ml1145
+works). GPU 100 % busy at 250-455 ms/frame.
+
+Capture of frame 360 (budget reached at enc#65881, so no final image):
+- Lighting works: Echo and grass are shaded. Scene colour is fine through
+  enc#65867.
+- **The valley (Nanite geometry) is absent from the G-buffer** (13.5 %
+  coverage: character + foliage only).
+- enc#65874/76/78 (same DXBC PS mdc_d838f42fb3b1e0a9, no blend) write an
+  all-zero scene colour.
+- No draw writing the colour-grading LUT volume ever runs.
+- Almost every shader is DXBC (mdc_ hash names). Only
+  VirtualShadowMapProjection came through as named DXIL.
+
+Two defects in our code:
+1. **Shader-cache poisoning (ml1146).** VS mdc_ed97faff695915a3 is first
+   converted as "VS(gs)" (the ml927 DXIL geometry path, tried on DXBC), with
+   no range buffer. mad_sc_store wrote the header's range COUNT with no range
+   data, so the next plain conversion of the same shader hit the cache and
+   read ranges out of the metallib bytes: type ?262158, space 2164260871.
+   Result: **4,766 draws skipped at L3607** (the VERTEX table build) as
+   "table not reported".
+   - Fix: store an entry only when every list it counts is present
+     (ranges / ranges2).
+   - MAD_SC_VERSION 2 -> 3 invalidates the poisoned entries on the phone.
+2. **DXBC geometry shaders were never supported** ("sm5 compile: Geometry
+   shader cannot be independently converted"; 285 draws skipped, others drew
+   without their GS).
+   - UE 5.0 SM5 uses VS+GS "WriteToSlice" for every volume texture,
+     including the tonemapper's colour-grading LUT, so the image goes black.
+   - **ml1147** (installed, `build/ipa/Madeira-20260924-1547-ml1147.ipa`,
+     d3d12.dll 5c106450) ports DXMT's D3D11 geometry pipeline:
+     - ABI fields `gs_stage/gs_strip/gs_bytecode`;
+     - unix `mad_airconv_convert_gs` (SM50CompileGeometryPipelineVertex /
+       ...Geometry, argument chains geometry -> IA -> common and
+       geometry -> common, own cache key "geom");
+     - runtime `mad_gsx_build`: reuses the mad_tess record with is_gs; one
+       object variant per index format, list topologies; fixed bindings
+       object 16/21/29/30, mesh 29/30, fragment 29/30; payload 16256;
+     - draws via `WMTRenderCommandDXMTGeometryDraw[Indexed]` with DXMT's
+       get_gs_vertex_count() warps; the plain pipeline stays as the fallback
+       for strip or indirect draws, which are logged.
+   - The ml927 converter GS path now runs for DXIL only (mad_bc_is_dxbc).
+     That is also what created the poisoning in (1).
+- ml1146 was installed on its own first (`...-1539-ml1146.ipa`); ml1147
+  includes it.
+
+Still open, untouched: Nanite geometry absent (UE believes 64-bit atomics
+are supported via OPTIONS9/11 = TRUE; how an SM5/DXBC build does its
+64-bit visibility-buffer atomics is not yet known), and 2-4 fps.
+
+### ph-valley04 (ml1147): geometry pipelines BUILT, but the slice writers are STRIPS -> ml1147b; Nanite question; CAP crash
+
+Log: `research/logs-rdr2/ph-valley04-ml1147.txt`. Still black.
+- 5 DXBC geometry pipelines built (list); indexed geometry draws ran.
+- **All 8 WriteToSlice draws were topology 5 (TRIANGLESTRIP)** and fell back.
+  UE's volume rasterizer draws each slice as a 4-vertex strip.
+- **ml1147b** (installed, `build/ipa/Madeira-20260924-1600-ml1147b.ipa`,
+  d3d12.dll 5e93ff3e):
+  - a second geometry record `p->tess_strip` built with gs_strip = 1 (line
+    and triangle topology types), routed for strip draws;
+  - DXMT warp sizes for strips ({32,31} line, {32,30} tri, {32,29},
+    {32,28} adj);
+  - `mad_tess_free()` shared by pso_Release;
+  - the placeholder check also counts tess_strip.
+- **CAP crash:** objc_release of a freed object in Metal's command-buffer
+  storage reset (IOGPUMetalCommandBufferStorageReset) during the second
+  capture, while the old ml9xx `[cap] K2` census (typed-buffer views) was
+  running. Command buffers are RETAINED (plain `commandBuffer`), so something
+  we release is released once too often. Not pinned down.
+- **Is Nanite even running?** Yes:
+  - ~3 UAV-only passes per frame at 16384x16384 (the virtual-shadow-map page
+    space Nanite rasterizes into);
+  - dozens of UAV-only VS+PS draws per frame (Nanite HW raster shape);
+  - yet no Nanite geometry reaches the G-buffer.
+  - Hypothesis: this is an SM5 (DXBC) build. UE 5.0 did Nanite's 64-bit
+    visibility atomics on SM5 only through NVAPI/AGS vendor extensions,
+    which our DXBC path cannot perform. We report native 64-bit atomics
+    (OPTIONS9/11 TRUE, correct for SM6.6 and needed by UE 5.4), which may
+    be what makes UE 5.0 enable Nanite at all.
+  - **Staged test:** `ValleyoftheAncient/Config/UserEngine.ini` =
+    `[ConsoleVariables] r.Nanite=0` (fallback meshes). If the valley
+    appears, the hypothesis holds.
+
+### ph-valley05 (ml1147b) -> ml1148 + ml1149: why Nanite never ran, and the AMD-intrinsic rewrite
+
+Log: `research/logs-rdr2/ph-valley05-ml1147b.txt`. Character, campfire and foliage
+render. The valley itself does not.
+
+- **The staged `r.Nanite=0` was NOT in effect for ph-valley05.**
+  - The game launched at 16:01:15; the file reached the phone at 16:01:27.
+  - It has now been replaced (see below).
+- **Correction: the 16384x16384 UAV-only passes are NOT Nanite.**
+  - They are the virtual-shadow-map depth rasterizers for regular meshes.
+  - They do a 32-bit `atomic_umax` into the page pool (SM5 DXBC).
+  - Note: the `mdc_` names are our DXBC compiler's content hash; the "N bytes of DXIL"
+    log line is shared with DXBC and misleading.
+- **Nanite's shaders are DXIL (UE compiles them with DXC even in this SM5 build).**
+  - They include `MicropolyRasterize`, `InstanceCull` and the hardware-raster VS/PS.
+  - None was ever converted in ph-valley05: UE never created a Nanite pipeline.
+- **The CPU gate.** Found by disassembly; the local game copy is in `~/Downloads/Valley of the Ancient - DX12`.
+  - `UseNanite() = platform && r.Nanite && (GRHISupportsAtomicUInt64 || r.Nanite.RequireAtomic64Support == 0) && ...`
+  - The only writers of `GRHISupportsAtomicUInt64` are the statically linked AMD AGS paths:
+    - D3D12: bit 25 of `agsDriverExtensionsDX12_CreateDevice`'s extension mask;
+    - D3D11: AGS's DX11 init.
+  - This UE 5.0 EA build never looks at OPTIONS9 or NVAPI for it.
+- **The GPU side.**
+  - All 78 AGS-using shaders in the cook do one thing: AMD `AtomicU64`
+    (opcode 0x18, op 2 = MaxU64) on a `RWTexture2D<uint2>`.
+  - They use the 3-phase magic-UAV sequence in space 0x7FFF0ADE (details in the
+    `madeira_ags.cpp` header).
+  - Apple's converter refuses such a shader outright (magic space not in the root
+    signature, code 4).
+  - Extraction: the shader archives sit raw in the 49 MB pak, LZ4 per shader.
+    Scratchpad `ue_shaderarc.py`; never commit game shaders.
+- **ml1149 (installed, `build/ipa/Madeira-20260924-1648-ml1149.ipa`):**
+  - `src/unix/madeira_ags.cpp`: an LLVM 15 DXIL rewrite (the reader and writer
+    airconv already links) before `IRObjectCreateFromDXIL`:
+    - the sequence becomes `dx.op.atomicBinOp.i64(UMax)`;
+    - the target is retyped `RWTexture2D<uint64_t>` (i64 plus the `Atomic64Use` tag);
+    - the shader flags and SFI0 bits are set;
+    - the magic buffer is dropped from the metadata and PSV0.
+    - `madeira.cfg ags-rewrite = 0` turns it off.
+    - Log line: `[madeira-ir] ml1149 AGS <hash>: rewrote N AGS 64-bit atomic(s)`.
+  - UAV textures in R32Uint/R32Sint/RG32Uint get `ShaderAtomic` usage (Metal allows
+    it on exactly those three, with PixelFormatView, in placement heaps too).
+  - Offline proof (`tests/offline/atomic64`):
+    - native SM6.6 64-bit max: 16/16 contested cells exact;
+    - AMD's own intrinsic at `cs_6_0` after the rewrite: 16/16;
+    - all 78 cooked shaders convert and Metal accepts them;
+    - none of the 92 non-AGS DXIL shaders is touched.
+  - **The converter rejects any shader that reads a 64-bit texture atomic's result**
+    ("unsupported instruction: dx.op.atomicBinOp.i64").
+    - That cost four wrong hypotheses: shader model, DXIL version, 6.6 handles,
+      writer.
+    - The pass only materialises the old value when something reads it.
+  - Also contains ml1148:
+    - `MTLHeap` release is deferred until the GPU passes the heap's last serial;
+    - suspect for the `objc_release` crash in command-buffer storage reset (seen in
+      ph-valley04 and ph-valley05);
+    - unverified.
+- **Config staged for the next run (both sha-verified on the phone):**
+  - `ValleyoftheAncient/Config/UserEngine.ini`: `[SystemSettings]` and
+    `[ConsoleVariables]` `r.Nanite.RequireAtomic64Support=0`.
+  - Saved `Engine.ini`: appended `[SystemSettings]` with the same line.
+    Backup: scratchpad `valley/Engine-before-nanite.ini`.
+  - To undo, remove those lines.
+- **A general CPU-side fix is possible but not done:**
+  - it would mean passing as an AMD GPU (vendor 0x1002, the ADL DLL, `amdxc64.dll`
+    `AmdExtD3DCreateInterface`) so the static AGS reports the extension;
+  - that also flips every AMD-specific path in the game.
+- **Watch next run:**
+  - `ml1149 AGS` lines (expect ~78 distinct hashes over time);
+  - any `converter refused` lines;
+  - UE fatals from a permutation chosen off `GRHISupportsAtomicUInt64 == 0`;
+  - whether the rocks appear.
+
+### ph-valley06 (ml1149): Nanite switched on -> jetsam during load (+2.3 GB in one cycle)
+
+Log: `research/logs-rdr2/ph-valley06-ml1149.txt`.
+- **Nanite was enabled; memory is what killed the run.**
+  - The footprint tracked ph-valley05 until cycle 10: 4,784 vs 4,273 MB.
+  - Then it went 5,946 -> 7,972 -> 8,134 of 8,192 MB, with the compressor at 2.2 GB.
+- **What Nanite added.**
+  - Default-heap UAV buffers, about 1.6 GB: 640 + 256 + 160 + 80 + 48x2 + 40 + 37 + 32 MB.
+  - Upload buffers, about 0.66 GB: 256 + 144 + 64x2 + 32x3 MB.
+  - 640 MB = 5,120 x 128 KB = the Nanite streaming pool (512 MB default) plus
+    1,024 initial root pages.
+  - 48 MB = 4M max visible clusters x 12 B.
+  - The rest are unnamed. UE 5.0's defaults are sized for 4K; we render 1408x648.
+- **No `ml1149 AGS` line.** It died before any Nanite pipeline was created, so the
+  rewrite is still unexercised on device.
+- **Upload buffers are single-copy** (a shared Metal buffer; the guest uses its
+  contents pointer). No double counting.
+- **Staged (Valley only, `Config/UserEngine.ini` [SystemSettings]; `madeira.cfg` untouched):**
+  - `r.Nanite.Streaming.StreamingPoolSize=256`
+  - `r.Nanite.MaxCandidateClusters=4194304`
+  - `r.Nanite.MaxVisibleClusters=2097152`
+  - `r.Streaming.PoolSize=610`
+    - This is the demo's own TextureQuality@1 value.
+    - The saved GameUserSettings is empty, so it ran at Epic = 1010.
+    - The pak's scalability values are 410/610/810/1010/3010.
+  - `r.Nanite.RequireAtomic64Support=0` stays.
+- **The NVIDIA route (user played this cook on a 1080 Ti).**
+  - `0x141bf0c7f` passes `&GRHISupportsAtomicUInt64` as the out-pointer to
+    `NvAPI_D3D12_IsNvShaderExtnOpCodeSupported(device, 20 = NV_EXTN_OP_UINT64_ATOMIC)`.
+  - Guards: IsRHIDeviceNVIDIA, the vendor-device allowance, and NvAPI_Initialize == OK.
+  - My earlier "AGS-only" came from scanning for store instructions only; NVAPI writes
+    through the pointer.
+  - vkd3d-proton issue #678 quotes the same call.
+  - General CPU-side fix, lighter than posing as AMD:
+    - DXMT's `src/nvapi` built as `nvapi64.dll` plus the D3D12 op-support query;
+    - `dxgi.customVendorId = 10de`.
+  - Not done: vendor NVIDIA flips UE's other NVIDIA paths.
+  - The cooked shaders are the same AGS-encoded ones either way, and our rewrite
+    handles them regardless of vendor.
+
+### ph-valley07 (ml1149): the pool cvars took effect, still jetsam (~8.0 GB plateau, died at cycle 18)
+
+Log: `research/logs-rdr2/ph-valley07-ml1149.txt`.
+- **The cvars took effect.**
+  - Streaming-pool buffer: 640 -> 384 MB.
+  - Default-heap buffers: 1,597 -> 1,269 MB.
+  - But placement heaps went +128 MB and uploads +32 MB, so the net was only about -170 MB.
+- **Timeline.**
+  - Cycle 13 -> 14: 5,112 -> 7,526 MB, with the compressor at 2.0 GB.
+  - It held ~7.5-8.0 GB for 5 cycles, then died while still loading.
+  - Still no `ml1149 AGS` line.
+- **Where Nanite's cost sits (estimated from the footprint minus the CPU bands).**
+  - GPU: ~2.3 GB without Nanite -> ~3.6 GB with it.
+  - Guest band: 1.1 GB -> 2.34 GB dirty.
+    - Upload heaps are ~0.69 GB of it (their shared memory lives in the guest range).
+    - The rest is UE's own Nanite data.
+  - The file-backed swap (ml1077) already holds 861 MB. It only takes fresh >= 8 MB
+    commits outside reserve-then-commit views.
+- **For scale:** Epic's PC minimum for this demo was 32 GB of RAM plus an 8 GB GPU.
+- **ml1150 (installed, `build/ipa/Madeira-20260924-1722-ml1150.ipa`):** the ml1057
+  live-backing census now prints every 5 s from ExecuteCommandLists.
+  - It used to print every 3,000 lists, which Valley never reached, not even ph-valley05.
+  - Plus `ml1150 Metal currentAllocatedSize N MB`, which also covers placement heaps,
+    libraries and driver objects.
+- **Staged:** `r.Nanite.Streaming.StreamingPoolSize=128` and `r.Streaming.PoolSize=410`
+  (the demo's Low value; textures will be soft).
+
+### ph-valley08 (ml1150): first real memory census; still jetsam during load
+
+Log: `research/logs-rdr2/ph-valley08-ml1150.txt`. Died at cycle 16 (8,113 MB).
+- **At the last census:**
+  - Metal currentAllocatedSize: 3,742 MB.
+  - ml1057 categories (3,036 MB):
+    - buf-private 1,159 (Nanite)
+    - buf-shared 798 (upload heaps)
+    - tex-UAV 608 (Lumen / VSM / Nanite)
+    - tex-RT 275
+    - tex-DS 124
+    - tex-sampled 70 (the texture pool had not filled yet)
+  - About 700 MB of placement heaps, libraries and driver objects are outside the categories.
+- **CPU side:**
+  - tag 0 dirty 3,853 MB, 1,075 MB of it compressed.
+  - Bands: guest 2,576 (0.8 GB of it is the upload heaps, tag 100), hostlow 661,
+    fex 627 (dirty 627 vs resident 265, so the compressed pages sit mostly in FEX and
+    hostlow, NOT the guest band).
+  - So widening the guest-band swap tier would NOT capture today's cold pages.
+- **Buffers.**
+  - The pool cut worked: pool+root is now 256 MB.
+  - Unchanged:
+    - a second 256 MB UAV buffer;
+    - 160, 56, 48, 40, 37 and 32 MB UAV buffers;
+    - 256 and 144 MB upload buffers.
+  - The 48 MB buffer did not shrink with `MaxVisibleClusters=2M`, so it is either
+    something else or that cvar did not apply. Resources have no names in Shipping.
+- **Staged for a validation run:**
+  - Lumen off: `r.DynamicGlobalIlluminationMethod=0`, `r.ReflectionMethod=2`,
+    `r.Lumen.DiffuseIndirect.Allow=0`, `r.Lumen.Reflections.Allow=0`.
+  - The pool trims stay.
+  - Purpose: prove the AGS rewrite and Nanite on device. Fitting Lumen back is a
+    separate memory project.
+
+### ph-valley09 (ml1150, Lumen off): NANITE RENDERS (8-10 fps); foliage prepass/base-pass mismatch; ml1151 exact UAV clears
+
+Log: `research/logs-rdr2/ph-valley09-ml1150.txt`. Capture: scratchpad `capv610`/`capv610png` (frame 610).
+- **The user sees the Nanite valley.**
+  - Footprint ~8.1 GB, Metal 3.4-3.6 GB, GPU ~112 ms per frame.
+- **Correction: the AGS rewrite (ml1149) was NOT exercised.**
+  - No DXIL Nanite shader converted at all.
+  - With `RequireAtomic64Support=0` and no vendor extension, UE 5.0 EA runs Nanite's
+    non-64-bit path. That path is 107 new SM5 DXBC shaders, found by diffing this run's
+    `mdc_` hashes against ph-valley05's and mapping them to the pak extraction
+    (scratchpad `new.files`, `newdis/`):
+    - compute culling with 32-bit atomics;
+    - UAV-only hardware raster (enc 160118/160122, `imm_atomic_umax`);
+    - emit depth/stencil (160125 depth >=, R8 mask; 160127 stencil 132; 160129
+      material depth + stencil 1);
+    - tile classification (22x11 dispatch);
+    - per-material full-screen draws (depth EQUAL + stencil EQUAL 1, 160161).
+  - The AGS/DXIL path is what a real AMD or NVIDIA (NVAPI) GPU would take.
+- **Black / popping foliage = the depth prepass and the base pass draw DIFFERENT foliage.**
+  - Pixel analysis (`prepass_vs_base.png`): 119k px of foliage only in the prepass,
+    42.6k only in the base pass; the character matches exactly.
+  - Prepass-only pixels hide the Nanite rock and nothing shades them -> black
+    plant-shaped holes.
+  - Base-pass-only pixels are stamped as Nanite (stencil 1) and overwritten by the
+    material pass. Measured: 45,231 foliage px, all with stencil 1.
+  - Both foliage vertex shaders are new with Nanite on:
+    - prepass 4ede2390 (a1_04047), base cfc3fd45 (a1_04052);
+    - instance = stride-0 per-draw offset stream (vb1) + SV_InstanceID -> Buffer<uint>
+      instance-ID list (t2) written by GPU instance culling (compute with
+      atomic_iadd / imm_atomic_iadd).
+  - So the per-pass instance lists or offsets differ.
+- **Suspect:** `ClearUnorderedAccessViewUint` value 1 was approximated by byte fill
+  (0x01010101 per dword), 4+ times per run.
+  - **ml1151** (installed, `build/ipa/Madeira-20260924-1757-ml1151.ipa`) makes
+    non-byte-uniform buffer UAV clears exact:
+    - copies from a per-device 256 KB shared pattern buffer (up to 8 values, resident,
+      released with the device);
+    - `Values[0]` per dword, per the D3D12 raw/structured rule.
+  - It logs `ml1151 ... value 0x1 exact: resource ... bytes, range` for the first 16,
+    to identify the buffer.
+  - NOT proven to be the foliage cause; next run decides.
+- **Other observations:**
+  - Nanite's material-depth target has uncleared 0/255 blocks in the sky. Harmless
+    (stencil EQUAL 1 excludes them).
+  - A local-light shadow mask (160263) sits over stale aliased memory outside its
+    scissor (sc=314,56-730,464).
+  - The darkness overall is partly Lumen off: no GI.
+
+### ph-valley10 (ml1151): exact clears did NOT fix the foliage; next test is fence mode 5 vs 6
+
+Log: `research/logs-rdr2/ph-valley10-ml1151.txt`. Capture: scratchpad `capv998`/`capv998png`.
+- **Exact clears were active but didn't fix it.**
+  - `ml1151` value-1 clears hit a 1,024-byte range: first in a 1 KB buffer, then inside
+    a pooled 3.37 MB buffer.
+  - They are exact now; the mismatch is unchanged.
+  - Prepass-only 54.8k px, base-only 55.5k px, both 57.5k (`prepass_vs_base_998.png`).
+- **Frame structure (998).**
+  - The prepass is 5 parallel lists (#12246-12251) of 55+55+55+55+54 = 274 draws.
+  - The prepass's instance culling is the tail of list #12244:
+    - `4065eb32` 1/4/28 groups (hierarchical scan);
+    - then `9c81c8bb` 274 groups (one per draw).
+  - Per-draw `InstanceIdOffset` is a stride-0 vb1 stream at 4*drawIndex.
+    - Draws past index 255 resolve to a 1,672-byte resource aliased at the same address
+      as a 1,024-byte one (placed transients; real heap aliasing, no fallbacks logged).
+- **Ruled out: the mode-6 "compute stays open" hole.**
+  - Compute encoders are created SERIAL (`MTLDispatchTypeSerial`), which orders dispatches.
+  - The in-app pill test (F6 -> F5, the full chain) decides whether any ordering hole remains.
+- **ml1152 (installed, `build/ipa/Madeira-20260924-1814-ml1152.ipa`):**
+  - `capture-ps` takes a comma list, is re-read on every CAP, 8 shots.
+  - madeira.cfg `capture-ps = mdc_8ebea429c3a00923,mdc_e07b85008e1827e3` (foliage prepass
+    PS, base PS). This records vb (incl. the vb1 offsets), iargs and tables for those
+    draws.
+  - `capture-cs` cleared (Empire leftover).
+  - Backup of the previous cfg: scratchpad `madeira-cur.cfg.bak-valley10`.
+
+### ph-valley11 (ml1152): F5 does NOT fix the foliage -> found the stride-0 bug (ml1153)
+
+Log: `research/logs-rdr2/ph-valley11-ml1152.txt`. Capture: scratchpad `capv479` (8 prepass foliage draws' inputs).
+- **Fence mode ruled out.** Switching F6 -> F5 live changed nothing, so it is not an
+  ordering hole.
+- **The captured prepass inputs are sane.**
+  - vb1 per-draw offsets are atomic-allocated ranges (draw 125: IDs 99..116,
+    18 instances; draw 126 starts at 117).
+  - iargs are small instance counts with StartInstanceLocation 0.
+- **Root cause: `mad_air_build_vb_table_mask` (the DXBC/airconv vertex-fetch table).**
+  - It promoted a BOUND stream's StrideInBytes 0 to the PSO's packed stride:
+    `stride ? stride : pso->vb_stride[slot]`.
+  - UE's GPU-culled instanced draws feed the per-draw instance offset as a stride-0 uint
+    stream (ATTRIBUTE13), so every vertex/instance read the NEXT draws' offsets and took
+    other plants' transforms: spiky, popping, different in each pass.
+  - ml904 had fixed exactly this for the vertex-descriptor (MSC) path only.
+  - airconv's fetch is `base + stride*index + offset` (no division, no bounds math), so
+    0 is safe.
+- **ml1153** (installed, `build/ipa/Madeira-20260924-1822-ml1153.ipa`) uses the bound
+  stride as given.
+
+### ph-valley12 (ml1153): PLANTS FIXED; shadow flicker + black horizon remain (Lumen off); next = Lumen back on
+
+Log: `research/logs-rdr2/ph-valley12-ml1153.txt`. Steady ~7.55 GB, peak 7.9 GB.
+- **JIT pool: 560 MB, jetsam-counted on this device.**
+  - The no-footprint RW alias is refused (kr=4); memory notes saying the pool is exempt
+    predate this device.
+  - It is a rotating code cache: images ~241 MB from the head; compiled code rotates
+    through the rest (pool-warmer, pool-rot).
+  - Shrinking it trades memory for recompiles.
+- **Band dirty/resident (MB):**
+  - pool 560/407 (x2 mappings, one set of pages)
+  - hostlow ~670/950
+  - guest ~2,160/1,790 (upload heaps ~0.8 GB are in here)
+  - fex 498/117
+  - compressor 1.73 GB
+  - So the guest band is mostly resident. Widening the swap tier would recover at most
+    its cold part (~0.4 GB compressed today).
+- **Staged:** Lumen back on (the Lumen-off lines removed) with
+  `r.LumenScene.CardAtlasSize=2048` (EA knob; default 4096, so a quarter of the atlas
+  textures). Nanite and texture pool trims kept. Backup: `valley/UserEngine-lumenoff.ini`.
+  - The next log's ml1150 census gives Lumen's exact cost.
+  - Other EA Lumen knobs: r.LumenScene.ClipmapResolution, r.LumenScene.GlobalDFResolution,
+    r.Lumen.Radiosity.IrradianceCache.*, r.DistanceFields.BrickAtlasSizeXYInBricks /
+    BrickAtlasMaxSizeZ.
+
+### ph-valley13 (ml1153, Lumen on with CardAtlasSize 2048): jetsam at the load peak; ml1154 upload buffers onto file-backed storage
+
+Log: `research/logs-rdr2/ph-valley13-ml1153.txt`. Died at cycle 16 (8,050 MB).
+- **The atlas cvar did nothing measurable.**
+  - Census at death: Metal 3,738 MB with categories identical to ph-valley08 (Lumen on,
+    default atlas).
+- **The killer is the LOAD PEAK, not steady state.**
+  - The Lumen-off run (ph-valley12) peaked at 7.9 GB during load, then settled at 7.6 GB
+    as upload buffers fell from ~0.9 GB (buf-shared peak 894) to 0.36 GB.
+- **ml1154** (installed, `build/ipa/Madeira-20260924-1840-ml1154.ipa`):
+  - Non-DEFAULT (UPLOAD/READBACK/CUSTOM) buffers >= 8 MB get storage from our own
+    `VirtualAlloc`, handed to Metal as no-copy.
+  - A fresh >= 8 MB guest commit is file-backed by the ml1077 tier, and dirty
+    file-backed pages are not charged to phys_footprint (ml1076 canary: +2 MB for 512 MB).
+  - Storage is freed through the ml1148 deferred list after the GPU serial passes.
+  - `madeira.cfg upload-swap = 0` disables it.
+  - Log lines: `ml1154 CPU-visible buffer N MB ... Metal accepted it`; census line
+    `ml1154 CPU-visible buffers on file-backed storage: n, MB`.
+  - **UNKNOWN until measured:** whether iOS still charges these pages once Metal wraps
+    them. Watch the ph footprint vs the swap-tier `file-backed now` figure.
+
+### ph-valley14 (ml1154): LUMEN FITS; the recurring objc_release crash; ml1155 probe
+
+Log: `research/logs-rdr2/ph-valley14-ml1154.txt`. The user reports much more natural lighting and still sees shadow flicker.
+- **ml1154 works.**
+  - Load peak 6.8 GB (was 7.6-8.1 GB); steady ~7.7 GB with Lumen on for 80 s.
+  - External (file-backed) jumped to ~1.25 GB; up to 736 MB of upload buffers sat on our
+    storage.
+  - Metal accepted every no-copy wrap; iOS does not charge those pages.
+  - This is a general lever: any CPU-visible allocation we own can move off the footprint.
+- **The crash is NOT jetsam** (footprint 7.67 GB at death).
+  - It is the same native crash as ph-valley04 and 05: `objc_release` of a freed object
+    inside IOGPUMetalCommandBufferStorageReset <- CommandBufferStorageDealloc <- completion
+    notification queue.
+  - ml1148 (deferred MTLHeap release) did NOT fix it.
+  - **Reviewed and cleared:**
+    - GS pipeline records (ml1147) and their failure path;
+    - encoder labels (alloc, set, release: balanced);
+    - encoders (never released by hand);
+    - main command buffers (retained at open, retired once under submit_lock);
+    - the present command buffer (autoreleased, not released);
+    - ring chunks (pooled after their serial).
+- **ml1155** (installed, `build/ipa/Madeira-20260924-1849-ml1155.ipa`):
+  - winemetal `_NSObject_release` records every release that drops the LAST reference
+    (pointer + `object_getClassName`, 16,384-entry lock-free ring).
+  - The Mach native-decline handler (signal_arm64_ios.c) looks up x0 and x8:
+    `[native-bt] ml1155 x0=... was FREED by our NSObject_release: class X, N releases ago`
+    (or "not among ..." -> freed by an autorelease pool or by Metal itself).
+  - The next occurrence names the class.
+- **Structural alternative if needed:** unretained-reference command buffers (the D3D12
+  lifetime rules already require it).
+  - Two objects we release that rely on command-buffer retention: pipeline variant
+    eviction (line ~2519) and ring release on grow failure.
+
+### ph-valley15 (ml1155): the freed object is an MTLBuffer (AGXG19FamilyBuffer); ml1156 stale-binding probe
+
+Log: `research/logs-rdr2/ph-valley15-ml1155.txt`. Crashed during the intro text screen (~48 s, footprint 7.85 GB, not jetsam).
+- **ml1155 answered:**
+  `x0=1777b0000 was FREED by our NSObject_release: class AGXG19FamilyBuffer, 173 releases ago`.
+- **What that implies.**
+  - Our release saw retainCount == 1, so no command buffer held it then.
+  - Yet a completing command buffer released it later.
+  - So a DEAD handle was most likely bound into a later encoder (Metal retains the
+    corpse; the command buffer's reset releases it).
+  - The less likely alternative: an extra non-freeing release earlier.
+- **Reviewed and cleared:**
+  - `MTLHeap_newBufferAtOffset` (+1, released once);
+  - descriptor-heap buffers (never released, deliberately);
+  - ring chunks (pooled after their serial; list release frees only chunks it still owns);
+  - vis chunks;
+  - capture buffers;
+  - fill patterns.
+- **ml1156** (installed, `build/ipa/Madeira-20260924-1919-ml1156.ipa`, winemetal only):
+  - Buffers freed by our release (class contains "Buffer") go into a 64K open-addressing
+    set; they are removed when `_MTLDevice_newBuffer` / `_MTLHeap_newBufferAtOffset`
+    returns that address.
+  - `wmt_stale_check` runs at every binding point: blit copy/fill; compute setBuffer /
+    useResource; render set{Vertex,Fragment,Object,Mesh}Buffer / useResource;
+    index/indirect draws; GS index/args; residency add; buffer newTexture.
+  - Log: `[wmt] ml1156 STALE <where>: <ptr> was freed by our release (class, N releases ago)`
+    (first 48, then powers of two).
+  - The binding kind names the runtime path holding the dead handle.
+
+### ph-valley16 (ml1156): the stale binding is a UAV-clear blit fill; ml1157 fix
+
+Log: `research/logs-rdr2/ph-valley16-ml1156.txt`. Captures f222 (intro, lighting passes present), f340, f374 (ran out of the 383 MB budget before lighting because of the capture-ps inputs).
+- **ml1156 hits:** 2x `STALE blit fill` on 0x11cbd7d80, freed 146 releases earlier. The
+  crash (153 releases after the free) was `objc_release` of that same buffer.
+- **Cause:** `mad_record_uav_clear` ignored the application's `pResource` and resolved the
+  view's GPU address at record time.
+  - `mad_resolve_address` returned the OLDEST live resource among aliases (the "live-order
+    first match"; the rebuild even used the live-array slot, which swap-remove reorders).
+  - With UE's placed transients the oldest alias is the one about to be freed, so the
+    recorded fill held a dead resource when it ran.
+- **ml1157** (installed, `build/ipa/Madeira-20260924-2310-ml1157.ipa`):
+  - the UAV clears use the application's resource (address resolution only as a fallback);
+  - every resource gets a monotonically increasing `track_seq` at mad_track, used by index
+    insert and rebuild;
+  - resolution now picks the NEWEST alias (lock-free, locked and slow paths).
+  - The ml1155/ml1156 probes stay in for verification: expect no STALE lines and no
+    objc_release crash.
+- **Shadow flicker:** one frame cannot show it. f222 shadow masks look clean; the hair is
+  black in scene color at enc 48650 (to check).
+  - madeira.cfg `capture-ps` cleared so the capture budget reaches lighting and post.
+
+### ph-valley17 (ml1157): RENDERS CORRECTLY: Nanite + Lumen + VSM, no flicker, portal area too; 10-12 fps
+
+Log: `research/logs-rdr2/ph-valley17-ml1157.txt` (~5 min).
+- **The ml1157 fix holds:** 0 STALE bindings, 0 native crashes.
+- **The shadow flicker is gone too.** Most likely the same stale-alias resolution: UAV
+  clears and other address-resolved commands hit freed or old aliases.
+- **Memory:** peak 7.95 GB (load), ~7.27 GB late in the run.
+- **ml1158** (installed, `build/ipa/Madeira-20260925-0027-ml1158.ipa`): the ml1156
+  per-binding stale check is off unless `madeira.cfg stale-probe = 1`. The ml1155
+  released-object ring stays (cheap: one retainCount per release).
+- **Perf picture, measured and not yet profiled per pass:**
+  - GPU-bound: 84 ms GPU of a 90 ms frame (Metal HUD).
+  - The SoC power clamp has parked the P-cores by ~5 min (`[xp] P=0`); thermal "Fair".
+  - 246 encoders/frame, 224 of them fence-synced (mode 6).
+  - Barriers ~600/frame.
+  - Attachment traffic per frame: load 557 MB + store 647 MB.
+    - "rebound" 334 MB: stored, then reloaded by the next pass (split passes).
+    - "no use" 93 MB: stored, never read.
+    - UE issues ~1,700 DiscardResource calls/s that we ignore.
+  - **Candidates:**
+    - (1) a Metal System Trace with encoder labels, to split UE's pass costs from our
+      overhead;
+    - (2) honor DiscardResource / dontCare actions;
+    - (3) merge passes that store and reload the same attachments;
+    - (4) quality knobs: r.ScreenPercentage, Lumen downsample factors.
+  - No FPS predictions without the trace.

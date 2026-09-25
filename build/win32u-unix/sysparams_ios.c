@@ -7956,6 +7956,13 @@ ULONG_PTR WINAPI NtUserCallOneParam( ULONG_PTR arg, ULONG code )
 /***********************************************************************
  *	     NtUserCallTwoParam    (win32u.@)
  */
+/* ml668: the gamepad slot reader, in build/win32u-unix/driver_ios.c (same
+ * unix library). Declared rather than headered for the same reason every other
+ * winios bridge symbol in that file is. */
+#ifdef WINE_IOS
+extern ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer );
+#endif
+
 ULONG_PTR WINAPI NtUserCallTwoParam( ULONG_PTR arg1, ULONG_PTR arg2, ULONG code )
 {
     switch(code)
@@ -7990,6 +7997,17 @@ ULONG_PTR WINAPI NtUserCallTwoParam( ULONG_PTR arg1, ULONG_PTR arg2, ULONG code 
     case NtUserCallTwoParam_GetVirtualScreenRect:
         *(RECT *)arg1 = get_virtual_screen_rect( 0, arg2 );
         return 1;
+
+    /* Madeira/iOS (ml668): the host gamepad slot. Body in
+     * build/win32u-unix/driver_ios.c; arg1 packs the user index in its low
+     * byte and a NtUserGamepadOp_* selector above it, arg2 is the guest
+     * output buffer (translated by wow64win for a 32-bit caller). */
+    case NtUserCallTwoParam_GetGamepadState:
+#ifdef WINE_IOS
+        return ios_gamepad_query( arg1 & 0xff, (arg1 >> 8) & 0xff, (void *)arg2 );
+#else
+        return 0;   /* no host gamepad transport off iOS -- see ntuser.h */
+#endif
 
     /* temporary exports */
     case NtUserAllocWinProc:

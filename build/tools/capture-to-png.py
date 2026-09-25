@@ -32,7 +32,34 @@ def tonemap(x):
     x = np.clip(x, 0, None)
     return (x / (1.0 + x)) ** (1 / 2.2)
 
+# ml1141: block-compressed SAMPLED textures (capture-cs / capture-ps inputs),
+# decoded by build/tools/bc-decode.m on the Mac's GPU.
+BC_FORMATS = {130: "BC1", 131: "BC1_sRGB", 132: "BC2", 133: "BC2_sRGB", 134: "BC3", 135: "BC3_sRGB",
+              140: "BC4_R", 141: "BC4_Rsnorm", 142: "BC5_RG", 143: "BC5_RGsnorm",
+              150: "BC6H_signed", 151: "BC6H", 152: "BC7", 153: "BC7_sRGB"}
+
+def bc_decode(raw, w, h, pf):
+    import subprocess, tempfile
+    here = os.path.dirname(os.path.abspath(__file__))
+    tool = os.path.join(tempfile.gettempdir(), "madeira-bc-decode")
+    src = os.path.join(here, "bc-decode.m")
+    if not os.path.exists(tool) or os.path.getmtime(tool) < os.path.getmtime(src):
+        subprocess.check_call(["clang", "-O1", "-fobjc-arc", "-framework", "Metal", "-framework", "Foundation", "-o", tool, src])
+    with tempfile.TemporaryDirectory() as td:
+        i, o = os.path.join(td, "in.raw"), os.path.join(td, "out.f32")
+        open(i, "wb").write(raw)
+        subprocess.check_call([tool, i, str(w), str(h), str(pf), o])
+        v = np.fromfile(o, dtype=np.float32).reshape(h, w, 4)
+    name = BC_FORMATS[pf]
+    if pf in (141, 143): v = v * 0.5 + 0.5                      # snorm -> displayable
+    if pf in (140, 141): img = np.repeat(v[:, :, :1], 3, axis=2)
+    elif pf in (142, 143): img = np.stack([v[:, :, 0], v[:, :, 1], np.full((h, w), 1.0, np.float32)], axis=2)   # normal map XY
+    elif pf in (150, 151): return name, (tonemap(v[:, :, :3]) * 255).astype(np.uint8)
+    else: img = v[:, :, :3]
+    return name, (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
+
 def decode(raw, w, h, pf):
+    if pf in BC_FORMATS: return bc_decode(raw, w, h, pf)
     name, bpp, kind = FORMATS.get(pf, (None, None, None))
     if name is None:
         # unknown: guess from bytes per pixel

@@ -278,6 +278,19 @@ struct madeira_ir_convert_args {
     uint32_t ret_cb_table_bind2;    /* out (object): the hull's constant-buffer table index, ~0u if none */
     uint32_t ret_arg_table_bind2;   /* out (object): the hull's argument table index, ~0u if none */
     uint32_t ret_arg_qwords2;       /* out (object): the hull's argument table size in 64-bit words */
+    /* ml1147: GEOMETRY SHADERS through the DXBC backend's mesh emulation, as
+     * DXMT's D3D11 layer runs them (d3d11_shader.cpp ShaderVariantGeometry-
+     * Vertex / ShaderVariantGeometry). The OBJECT function is the vertex shader
+     * compiled against the geometry shader: vertex-buffer table 16, draw
+     * arguments 21, index buffer 20, its own tables at 29/30. The MESH function
+     * is the geometry shader compiled against the vertex shader, tables 29/30.
+     * gs_stage 1: dxil = the vertex shader, gs_bytecode = the geometry shader
+     * (object; specialised on tess_index_format too). gs_stage 2: dxil = the
+     * geometry shader, gs_bytecode = the vertex shader (mesh). Both are
+     * specialised on a list vs strip input topology. */
+    uint32_t gs_stage;              /* in: 0 none, 1 object (VS for a GS), 2 mesh (GS) */
+    uint32_t gs_strip;              /* in: 1 = the draw's topology is a strip */
+    uint64_t gs_bytecode, gs_bytecode_len;   /* in: the other shader of the pair */
 };
 struct madeira_ir_input_element {
     char semantic[32];

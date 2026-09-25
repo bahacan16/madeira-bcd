@@ -6892,6 +6892,21 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
                                 if (pair[0] <= fp) break;
                                 fp = pair[0];
                             }
+                            {   /* ml1155: did WE free the object this thread is touching? (winemetal records
+                                 * every release that dropped the last reference) */
+                                extern const char *madeira_wmt_released_class( uintptr_t addr, uint64_t *ago ) __attribute__((weak_import));
+                                int r;
+                                if (madeira_wmt_released_class)
+                                    for (r = 0; r < 2; r++)
+                                    {
+                                        uint64_t v = r ? state->__x[8] : state->__x[0], ago = 0;
+                                        const char *cls = madeira_wmt_released_class( (uintptr_t)v, &ago );
+                                        if (cls) dprintf( 2, "[native-bt] ml1155 x%d=%llx was FREED by our NSObject_release: class %s, %llu releases ago\n",
+                                                          r ? 8 : 0, (unsigned long long)v, cls, (unsigned long long)ago );
+                                        else dprintf( 2, "[native-bt] ml1155 x%d=%llx is not among the last 16384 objects our NSObject_release freed\n",
+                                                      r ? 8 : 0, (unsigned long long)v );
+                                    }
+                            }
                         }
                     }
                     return 0;

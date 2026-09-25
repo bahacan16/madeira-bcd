@@ -22,6 +22,7 @@ ObjC exception personality.
 | `rg11b10/` | no | can a compute shader write `RG11B10Float` (and `RGB9E5Float`) through a UAV? | yes, all four formats tested write correctly |
 | `attachless/` | no | does a render pass with NO attachments whose area exceeds the bound resource page-fault? | no — a 100 MB overrun into a 16 KB buffer completes; out-of-bounds fragment writes do not fault |
 | `tex3d/` | yes | does a UAV write into a 3D texture land, through MSC with `ForceTextureArray` + descriptor table? | yes, all 8 depth slices exact |
+| `atomic64/` | yes | (T1) does a converted SM6.6 64-bit `InterlockedMax` on `RWTexture2D<uint64_t>` work on an RG32Uint texture? (T3) does `src/unix/madeira_ags.cpp` turn AMD AGS `AtomicMaxU64` (magic UAV, `cs_6_0`) into the same thing? | T1 yes, 16/16 contested cells exact; T3 yes after the rewrite (refused before it). The converter rejects any shader that READS a 64-bit texture atomic's result |
 
 Build and run:
 
@@ -57,3 +58,23 @@ answer away — which cost a confusing round trip.
   correct maximum with 64 threads contending: `0x80000abcd`. **M4 Max
   (Apple9) only** — untested on the A15 and on the paravirtual device, which
   matters if rendering ever moves back on-device.
+
+`atomic64/` also needs the host LLVM 15 build (`research/dxmt/toolchains/llvm-host-build`)
+for the rewrite driver, and AMD's `ags_shader_intrinsics_dx12.hlsl` (GPUOpen AGS_SDK,
+`ags_lib/hlsl/`, MIT) next to `ags.hlsl` for T3 — it is not kept in git:
+
+```sh
+cd atomic64
+T=../../../../dxmt/toolchains; L=$($T/llvm-host-build/bin/llvm-config --libs bitreader bitwriter core)
+clang++ -std=c++17 -O1 -fno-rtti -I$T/llvm-project/llvm/include -I$T/llvm-host-build/include \
+        ../../../src/unix/madeira_ags.cpp rw_main.cpp -L$T/llvm-host-build/lib $L -o rw
+clang++ -O1 -fobjc-arc -I"$INC" -L"$LIB" -lmetalirconverter -framework Metal -framework Foundation -o t t.mm
+wine ../../../../../toolchains/dxc-win/bin/x64/dxc.exe -T cs_6_6 -E CSMain -Fo CSMain.dxil v.hlsl
+DYLD_LIBRARY_PATH="$LIB" ./t CSMain.dxil                      # T1
+wine ../../../../../toolchains/dxc-win/bin/x64/dxc.exe -T cs_6_0 -E CSMain -Fo ags.dxil ags.hlsl
+./rw ags.dxil ags_rw.dxil && DYLD_LIBRARY_PATH="$LIB" ./t ags_rw.dxil   # T3
+```
+
+`conv.mm` converts any container against a permissive root signature (conversion only);
+`llwrap.cpp` assembles edited LLVM 15 IR text back into a container, and `bcdis.cpp`
+prints a container's bitcode as text -- the pair that found the result-read rule.

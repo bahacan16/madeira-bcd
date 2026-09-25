@@ -21,6 +21,8 @@
 #ifndef WINIOS_DRV_H
 #define WINIOS_DRV_H
 
+#include "WiniosGamepad.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

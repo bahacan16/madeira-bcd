@@ -30,6 +30,32 @@ final class GameControllerManager: ObservableObject {
         }
     }
 
+    /// madeira-bcd: upstream (willfaust/Madeira #22, ml1920/ml1930) now hands
+    /// physical pads to games as real XInput controllers. Mapping the same pad
+    /// to keyboard and mouse as well would give a game every press twice, so
+    /// the keyboard/mouse mapping below is opt-in while XInput is on; detection
+    /// and the live input tester keep working either way.
+    static let keyboardMappingKey = "madeira.controllers.keyboardMapping"
+    @Published var keyboardMapping: Bool = UserDefaults.standard.object(forKey: GameControllerManager.keyboardMappingKey) as? Bool
+        ?? !GameControllerManager.xinputOn {
+        didSet { UserDefaults.standard.set(keyboardMapping, forKey: Self.keyboardMappingKey) }
+    }
+
+    /// Mirrors GamepadInput.enabled (madeira.cfg env.MADEIRA_XINPUT, default on)
+    /// without needing the main actor.
+    static var xinputOn: Bool {
+        let value = MadeiraConfig.get("env.MADEIRA_XINPUT") ?? ProcessInfo.processInfo.environment["MADEIRA_XINPUT"]
+        return value != "0"
+    }
+
+    private func postKey(_ vk: Int32, _ down: Int32) {
+        if keyboardMapping { winios_post_key(vk, down) }
+    }
+
+    private func postPointer(_ x: Int32, _ y: Int32, _ flags: UInt32, _ data: UInt32) {
+        if keyboardMapping { winios_pointer(x, y, flags, data) }
+    }
+
     @Published var connectedControllersCount: Int = 0
     @Published var activeControllerName: String? = nil
 
@@ -167,38 +193,38 @@ final class GameControllerManager: ObservableObject {
         gamepad.buttonA.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "Button A (Cross / Space)" }
-            winios_post_key(self.vkA_button, pressed ? 1 : 0)
+            self.postKey(self.vkA_button, pressed ? 1 : 0)
         }
 
         gamepad.buttonB.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "Button B (Circle / Esc)" }
-            winios_post_key(self.vkB_button, pressed ? 1 : 0)
+            self.postKey(self.vkB_button, pressed ? 1 : 0)
         }
 
         gamepad.buttonX.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "Button X (Square / E)" }
-            winios_post_key(self.vkX_button, pressed ? 1 : 0)
+            self.postKey(self.vkX_button, pressed ? 1 : 0)
         }
 
         gamepad.buttonY.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "Button Y (Triangle / R)" }
-            winios_post_key(self.vkY_button, pressed ? 1 : 0)
+            self.postKey(self.vkY_button, pressed ? 1 : 0)
         }
 
         // --- Bumpers ---
         gamepad.leftShoulder.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "LB / L1 (Sprint)" }
-            winios_post_key(self.vkLB, pressed ? 1 : 0)
+            self.postKey(self.vkLB, pressed ? 1 : 0)
         }
 
         gamepad.rightShoulder.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "RB / R1 (Tab)" }
-            winios_post_key(self.vkRB, pressed ? 1 : 0)
+            self.postKey(self.vkRB, pressed ? 1 : 0)
         }
 
         // --- Triggers (Mouse Left / Right Click) ---
@@ -209,7 +235,7 @@ final class GameControllerManager: ObservableObject {
             if isDown && !self.ltDown { self.lastPressedButton = "LT / L2 (Aim / RightClick)" }
             if isDown != self.ltDown {
                 self.ltDown = isDown
-                winios_pointer(0, 0, isDown ? 0x0008 : 0x0010, 0) // RIGHTDOWN / RIGHTUP
+                self.postPointer(0, 0, isDown ? 0x0008 : 0x0010, 0) // RIGHTDOWN / RIGHTUP
             }
         }
 
@@ -220,7 +246,7 @@ final class GameControllerManager: ObservableObject {
             if isDown && !self.rtDown { self.lastPressedButton = "RT / R2 (Fire / LeftClick)" }
             if isDown != self.rtDown {
                 self.rtDown = isDown
-                winios_pointer(0, 0, isDown ? 0x0002 : 0x0004, 0) // LEFTDOWN / LEFTUP
+                self.postPointer(0, 0, isDown ? 0x0002 : 0x0004, 0) // LEFTDOWN / LEFTUP
             }
         }
 
@@ -228,27 +254,27 @@ final class GameControllerManager: ObservableObject {
         gamepad.leftThumbstickButton?.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "L3 / Left Stick Click (Ctrl)" }
-            winios_post_key(self.vkL3, pressed ? 1 : 0)
+            self.postKey(self.vkL3, pressed ? 1 : 0)
         }
 
         gamepad.rightThumbstickButton?.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "R3 / Right Stick Click (F)" }
-            winios_post_key(self.vkR3, pressed ? 1 : 0)
+            self.postKey(self.vkR3, pressed ? 1 : 0)
         }
 
         // --- Menu / Options / Pause Buttons ---
         gamepad.buttonMenu.pressedChangedHandler = { [weak self] (_, _, pressed) in
             guard let self = self, self.isEnabled else { return }
             if pressed { self.lastPressedButton = "Menu / Options (ESC)" }
-            winios_post_key(0x1B, pressed ? 1 : 0) // ESC
+            self.postKey(0x1B, pressed ? 1 : 0) // ESC
         }
 
         if let buttonOptions = gamepad.buttonOptions {
             buttonOptions.pressedChangedHandler = { [weak self] (_, _, pressed) in
                 guard let self = self, self.isEnabled else { return }
                 if pressed { self.lastPressedButton = "Share / View (ENTER)" }
-                winios_post_key(0x0D, pressed ? 1 : 0) // ENTER
+                self.postKey(0x0D, pressed ? 1 : 0) // ENTER
             }
         }
     }
@@ -280,10 +306,10 @@ final class GameControllerManager: ObservableObject {
         let newKeys = Set(keysForDir(nextDir, keys))
 
         for vk in oldKeys.subtracting(newKeys) {
-            winios_post_key(vk, 0)
+            self.postKey(vk, 0)
         }
         for vk in newKeys.subtracting(oldKeys) {
-            winios_post_key(vk, 1)
+            self.postKey(vk, 1)
         }
 
         switch stickType {

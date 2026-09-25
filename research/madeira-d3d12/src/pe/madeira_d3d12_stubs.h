@@ -12,6 +12,11 @@
  * trail instead of silently taking a fallback path. */
 void madeira_d3d12_note_unimplemented(const char *iface, const char *method);
 
+/* ml1143: private data is really stored, per object and GUID (madeira_d3d12.c). */
+static HRESULT mad_pd_get(const void *obj, REFGUID guid, UINT *data_size, void *data);
+static HRESULT mad_pd_set(const void *obj, REFGUID guid, UINT data_size, const void *data);
+static HRESULT mad_pd_set_iface(const void *obj, REFGUID guid, const IUnknown *data);
+
 /* ---- ID3D12Device10: 79 slots ---- */
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Device10_QueryInterface(ID3D12Device10 *This, REFIID riid, void **ppvObject) {
     madeira_d3d12_note_unimplemented("ID3D12Device10", "QueryInterface");
@@ -26,13 +31,13 @@ static ULONG STDMETHODCALLTYPE stub_ID3D12Device10_Release(ID3D12Device10 *This)
     return 0;
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Device10_GetPrivateData(ID3D12Device10 *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+    return mad_pd_get(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Device10_SetPrivateData(ID3D12Device10 *This, REFGUID guid, UINT data_size, const void *data) {
-    return S_OK;
+    return mad_pd_set(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Device10_SetPrivateDataInterface(ID3D12Device10 *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
+    return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Device10_SetName(ID3D12Device10 *This, const WCHAR *name) {
     return S_OK;
@@ -408,13 +413,13 @@ static ULONG STDMETHODCALLTYPE stub_ID3D12CommandQueue_Release(ID3D12CommandQueu
     return 0;
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandQueue_GetPrivateData(ID3D12CommandQueue *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+    return mad_pd_get(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandQueue_SetPrivateData(ID3D12CommandQueue *This, REFGUID guid, UINT data_size, const void *data) {
-    return S_OK;
+    return mad_pd_set(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandQueue_SetPrivateDataInterface(ID3D12CommandQueue *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
+    return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandQueue_SetName(ID3D12CommandQueue *This, const WCHAR *name) {
     return S_OK;
@@ -498,13 +503,13 @@ static ULONG STDMETHODCALLTYPE stub_ID3D12CommandAllocator_Release(ID3D12Command
     return 0;
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandAllocator_GetPrivateData(ID3D12CommandAllocator *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+    return mad_pd_get(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandAllocator_SetPrivateData(ID3D12CommandAllocator *This, REFGUID guid, UINT data_size, const void *data) {
-    return S_OK;
+    return mad_pd_set(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandAllocator_SetPrivateDataInterface(ID3D12CommandAllocator *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
+    return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandAllocator_SetName(ID3D12CommandAllocator *This, const WCHAR *name) {
     return S_OK;
@@ -530,256 +535,340 @@ static void madeira_fill_ID3D12CommandAllocator(ID3D12CommandAllocatorVtbl *v) {
     v->Reset = stub_ID3D12CommandAllocator_Reset;
 }
 
-/* ---- ID3D12GraphicsCommandList: 60 slots ---- */
-static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_QueryInterface(ID3D12GraphicsCommandList *This, REFIID riid, void **ppvObject) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "QueryInterface");
+/* ---- ID3D12GraphicsCommandList7: 81 slots ---- */
+static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_QueryInterface(ID3D12GraphicsCommandList7 *This, REFIID riid, void **ppvObject) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "QueryInterface");
     return E_NOTIMPL;
 }
-static ULONG STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_AddRef(ID3D12GraphicsCommandList *This) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "AddRef");
+static ULONG STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_AddRef(ID3D12GraphicsCommandList7 *This) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "AddRef");
     return 0;
 }
-static ULONG STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_Release(ID3D12GraphicsCommandList *This) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "Release");
+static ULONG STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_Release(ID3D12GraphicsCommandList7 *This) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "Release");
     return 0;
 }
-static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_GetPrivateData(ID3D12GraphicsCommandList *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_GetPrivateData(ID3D12GraphicsCommandList7 *This, REFGUID guid, UINT *data_size, void *data) {
+    return mad_pd_get(This, guid, data_size, data);
 }
-static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetPrivateData(ID3D12GraphicsCommandList *This, REFGUID guid, UINT data_size, const void *data) {
+static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetPrivateData(ID3D12GraphicsCommandList7 *This, REFGUID guid, UINT data_size, const void *data) {
+    return mad_pd_set(This, guid, data_size, data);
+}
+static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetPrivateDataInterface(ID3D12GraphicsCommandList7 *This, REFGUID guid, const IUnknown *data) {
+    return mad_pd_set_iface(This, guid, data);
+}
+static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetName(ID3D12GraphicsCommandList7 *This, const WCHAR *name) {
     return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetPrivateDataInterface(ID3D12GraphicsCommandList *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
-}
-static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetName(ID3D12GraphicsCommandList *This, const WCHAR *name) {
-    return S_OK;
-}
-static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_GetDevice(ID3D12GraphicsCommandList *This, REFIID riid, void **device) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "GetDevice");
+static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_GetDevice(ID3D12GraphicsCommandList7 *This, REFIID riid, void **device) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "GetDevice");
     return E_NOTIMPL;
 }
-static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_GetType(ID3D12GraphicsCommandList *This) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "GetType");
+static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_GetType(ID3D12GraphicsCommandList7 *This) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "GetType");
     return (D3D12_COMMAND_LIST_TYPE)0;
 }
-static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_Close(ID3D12GraphicsCommandList *This) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "Close");
+static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_Close(ID3D12GraphicsCommandList7 *This) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "Close");
     return E_NOTIMPL;
 }
-static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_Reset(ID3D12GraphicsCommandList *This, ID3D12CommandAllocator *allocator, ID3D12PipelineState *initial_state) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "Reset");
+static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_Reset(ID3D12GraphicsCommandList7 *This, ID3D12CommandAllocator *allocator, ID3D12PipelineState *initial_state) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "Reset");
     return E_NOTIMPL;
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ClearState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pipeline_state) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ClearState");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ClearState(ID3D12GraphicsCommandList7 *This, ID3D12PipelineState *pipeline_state) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ClearState");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_DrawInstanced(ID3D12GraphicsCommandList *This, UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location, UINT start_instance_location) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "DrawInstanced");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_DrawInstanced(ID3D12GraphicsCommandList7 *This, UINT vertex_count_per_instance, UINT instance_count, UINT start_vertex_location, UINT start_instance_location) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "DrawInstanced");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_DrawIndexedInstanced(ID3D12GraphicsCommandList *This, UINT index_count_per_instance, UINT instance_count, UINT start_vertex_location, INT base_vertex_location, UINT start_instance_location) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "DrawIndexedInstanced");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_DrawIndexedInstanced(ID3D12GraphicsCommandList7 *This, UINT index_count_per_instance, UINT instance_count, UINT start_vertex_location, INT base_vertex_location, UINT start_instance_location) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "DrawIndexedInstanced");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT u, UINT z) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "Dispatch");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_Dispatch(ID3D12GraphicsCommandList7 *This, UINT x, UINT u, UINT z) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "Dispatch");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_CopyBufferRegion(ID3D12GraphicsCommandList *This, ID3D12Resource *dst_buffer, UINT64 dst_offset, ID3D12Resource *src_buffer, UINT64 src_offset, UINT64 byte_count) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "CopyBufferRegion");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_CopyBufferRegion(ID3D12GraphicsCommandList7 *This, ID3D12Resource *dst_buffer, UINT64 dst_offset, ID3D12Resource *src_buffer, UINT64 src_offset, UINT64 byte_count) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "CopyBufferRegion");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_CopyTextureRegion(ID3D12GraphicsCommandList *This, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT dst_x, UINT dst_y, UINT dst_z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *src_box) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "CopyTextureRegion");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_CopyTextureRegion(ID3D12GraphicsCommandList7 *This, const D3D12_TEXTURE_COPY_LOCATION *dst, UINT dst_x, UINT dst_y, UINT dst_z, const D3D12_TEXTURE_COPY_LOCATION *src, const D3D12_BOX *src_box) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "CopyTextureRegion");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_CopyResource(ID3D12GraphicsCommandList *This, ID3D12Resource *dst_resource, ID3D12Resource *src_resource) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "CopyResource");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_CopyResource(ID3D12GraphicsCommandList7 *This, ID3D12Resource *dst_resource, ID3D12Resource *src_resource) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "CopyResource");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_CopyTiles(ID3D12GraphicsCommandList *This, ID3D12Resource *tiled_resource, const D3D12_TILED_RESOURCE_COORDINATE *tile_region_start_coordinate, const D3D12_TILE_REGION_SIZE *tile_region_size, ID3D12Resource *buffer, UINT64 buffer_offset, D3D12_TILE_COPY_FLAGS flags) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "CopyTiles");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_CopyTiles(ID3D12GraphicsCommandList7 *This, ID3D12Resource *tiled_resource, const D3D12_TILED_RESOURCE_COORDINATE *tile_region_start_coordinate, const D3D12_TILE_REGION_SIZE *tile_region_size, ID3D12Resource *buffer, UINT64 buffer_offset, D3D12_TILE_COPY_FLAGS flags) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "CopyTiles");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ResolveSubresource(ID3D12GraphicsCommandList *This, ID3D12Resource *dst_resource, UINT dst_sub_resource, ID3D12Resource *src_resource, UINT src_sub_resource, DXGI_FORMAT format) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ResolveSubresource");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ResolveSubresource(ID3D12GraphicsCommandList7 *This, ID3D12Resource *dst_resource, UINT dst_sub_resource, ID3D12Resource *src_resource, UINT src_sub_resource, DXGI_FORMAT format) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ResolveSubresource");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_IASetPrimitiveTopology(ID3D12GraphicsCommandList *This, D3D12_PRIMITIVE_TOPOLOGY primitive_topology) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "IASetPrimitiveTopology");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_IASetPrimitiveTopology(ID3D12GraphicsCommandList7 *This, D3D12_PRIMITIVE_TOPOLOGY primitive_topology) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "IASetPrimitiveTopology");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_RSSetViewports(ID3D12GraphicsCommandList *This, UINT viewport_count, const D3D12_VIEWPORT *viewports) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "RSSetViewports");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_RSSetViewports(ID3D12GraphicsCommandList7 *This, UINT viewport_count, const D3D12_VIEWPORT *viewports) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "RSSetViewports");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_RSSetScissorRects(ID3D12GraphicsCommandList *This, UINT rect_count, const D3D12_RECT *rects) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "RSSetScissorRects");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_RSSetScissorRects(ID3D12GraphicsCommandList7 *This, UINT rect_count, const D3D12_RECT *rects) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "RSSetScissorRects");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT blend_factor[4]) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "OMSetBlendFactor");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_OMSetBlendFactor(ID3D12GraphicsCommandList7 *This, const FLOAT blend_factor[4]) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "OMSetBlendFactor");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_OMSetStencilRef(ID3D12GraphicsCommandList *This, UINT stencil_ref) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "OMSetStencilRef");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_OMSetStencilRef(ID3D12GraphicsCommandList7 *This, UINT stencil_ref) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "OMSetStencilRef");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pipeline_state) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetPipelineState");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetPipelineState(ID3D12GraphicsCommandList7 *This, ID3D12PipelineState *pipeline_state) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetPipelineState");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandList *This, UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ResourceBarrier");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ResourceBarrier(ID3D12GraphicsCommandList7 *This, UINT barrier_count, const D3D12_RESOURCE_BARRIER *barriers) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ResourceBarrier");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ExecuteBundle(ID3D12GraphicsCommandList *This, ID3D12GraphicsCommandList *command_list) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ExecuteBundle");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ExecuteBundle(ID3D12GraphicsCommandList7 *This, ID3D12GraphicsCommandList *command_list) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ExecuteBundle");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetDescriptorHeaps(ID3D12GraphicsCommandList *This, UINT heap_count, ID3D12DescriptorHeap *const *heaps) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetDescriptorHeaps");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetDescriptorHeaps(ID3D12GraphicsCommandList7 *This, UINT heap_count, ID3D12DescriptorHeap *const *heaps) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetDescriptorHeaps");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetComputeRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *root_signature) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetComputeRootSignature");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetComputeRootSignature(ID3D12GraphicsCommandList7 *This, ID3D12RootSignature *root_signature) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetComputeRootSignature");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetGraphicsRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *root_signature) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetGraphicsRootSignature");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetGraphicsRootSignature(ID3D12GraphicsCommandList7 *This, ID3D12RootSignature *root_signature) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetGraphicsRootSignature");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(ID3D12GraphicsCommandList *This, UINT root_parameter_index, D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetComputeRootDescriptorTable");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetComputeRootDescriptorTable(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetComputeRootDescriptorTable");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(ID3D12GraphicsCommandList *This, UINT root_parameter_index, D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetGraphicsRootDescriptorTable");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetGraphicsRootDescriptorTable(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, D3D12_GPU_DESCRIPTOR_HANDLE base_descriptor) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetGraphicsRootDescriptorTable");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetComputeRoot32BitConstant(ID3D12GraphicsCommandList *This, UINT root_parameter_index, UINT data, UINT dst_offset) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetComputeRoot32BitConstant");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetComputeRoot32BitConstant(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, UINT data, UINT dst_offset) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetComputeRoot32BitConstant");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant(ID3D12GraphicsCommandList *This, UINT root_parameter_index, UINT data, UINT dst_offset) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetGraphicsRoot32BitConstant");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetGraphicsRoot32BitConstant(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, UINT data, UINT dst_offset) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetGraphicsRoot32BitConstant");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(ID3D12GraphicsCommandList *This, UINT root_parameter_index, UINT constant_count, const void *data, UINT dst_offset) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetComputeRoot32BitConstants");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetComputeRoot32BitConstants(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, UINT constant_count, const void *data, UINT dst_offset) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetComputeRoot32BitConstants");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(ID3D12GraphicsCommandList *This, UINT root_parameter_index, UINT constant_count, const void *data, UINT dst_offset) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetGraphicsRoot32BitConstants");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetGraphicsRoot32BitConstants(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, UINT constant_count, const void *data, UINT dst_offset) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetGraphicsRoot32BitConstants");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(ID3D12GraphicsCommandList *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetComputeRootConstantBufferView");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetComputeRootConstantBufferView(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetComputeRootConstantBufferView");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(ID3D12GraphicsCommandList *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetGraphicsRootConstantBufferView");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetGraphicsRootConstantBufferView(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetGraphicsRootConstantBufferView");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(ID3D12GraphicsCommandList *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetComputeRootShaderResourceView");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetComputeRootShaderResourceView(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetComputeRootShaderResourceView");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(ID3D12GraphicsCommandList *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetGraphicsRootShaderResourceView");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetGraphicsRootShaderResourceView(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetGraphicsRootShaderResourceView");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(ID3D12GraphicsCommandList *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetComputeRootUnorderedAccessView");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetComputeRootUnorderedAccessView(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetComputeRootUnorderedAccessView");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(ID3D12GraphicsCommandList *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetGraphicsRootUnorderedAccessView");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetGraphicsRootUnorderedAccessView(ID3D12GraphicsCommandList7 *This, UINT root_parameter_index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetGraphicsRootUnorderedAccessView");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_IASetIndexBuffer(ID3D12GraphicsCommandList *This, const D3D12_INDEX_BUFFER_VIEW *view) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "IASetIndexBuffer");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_IASetIndexBuffer(ID3D12GraphicsCommandList7 *This, const D3D12_INDEX_BUFFER_VIEW *view) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "IASetIndexBuffer");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_IASetVertexBuffers(ID3D12GraphicsCommandList *This, UINT start_slot, UINT view_count, const D3D12_VERTEX_BUFFER_VIEW *views) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "IASetVertexBuffers");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_IASetVertexBuffers(ID3D12GraphicsCommandList7 *This, UINT start_slot, UINT view_count, const D3D12_VERTEX_BUFFER_VIEW *views) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "IASetVertexBuffers");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SOSetTargets(ID3D12GraphicsCommandList *This, UINT start_slot, UINT view_count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SOSetTargets");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SOSetTargets(ID3D12GraphicsCommandList7 *This, UINT start_slot, UINT view_count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW *views) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SOSetTargets");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_OMSetRenderTargets(ID3D12GraphicsCommandList *This, UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors, WINBOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "OMSetRenderTargets");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_OMSetRenderTargets(ID3D12GraphicsCommandList7 *This, UINT render_target_descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE *render_target_descriptors, WINBOOL single_descriptor_handle, const D3D12_CPU_DESCRIPTOR_HANDLE *depth_stencil_descriptor) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "OMSetRenderTargets");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList *This, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT *rects) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ClearDepthStencilView");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ClearDepthStencilView(ID3D12GraphicsCommandList7 *This, D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT rect_count, const D3D12_RECT *rects) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ClearDepthStencilView");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ClearRenderTargetView(ID3D12GraphicsCommandList *This, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT rect_count, const D3D12_RECT *rects) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ClearRenderTargetView");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ClearRenderTargetView(ID3D12GraphicsCommandList7 *This, D3D12_CPU_DESCRIPTOR_HANDLE rtv, const FLOAT color[4], UINT rect_count, const D3D12_RECT *rects) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ClearRenderTargetView");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(ID3D12GraphicsCommandList *This, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource *resource, const UINT values[4], UINT rect_count, const D3D12_RECT *rects) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ClearUnorderedAccessViewUint");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ClearUnorderedAccessViewUint(ID3D12GraphicsCommandList7 *This, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource *resource, const UINT values[4], UINT rect_count, const D3D12_RECT *rects) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ClearUnorderedAccessViewUint");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(ID3D12GraphicsCommandList *This, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource *resource, const float values[4], UINT rect_count, const D3D12_RECT *rects) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ClearUnorderedAccessViewFloat");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ClearUnorderedAccessViewFloat(ID3D12GraphicsCommandList7 *This, D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle, ID3D12Resource *resource, const float values[4], UINT rect_count, const D3D12_RECT *rects) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ClearUnorderedAccessViewFloat");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_DiscardResource(ID3D12GraphicsCommandList *This, ID3D12Resource *resource, const D3D12_DISCARD_REGION *region) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "DiscardResource");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_DiscardResource(ID3D12GraphicsCommandList7 *This, ID3D12Resource *resource, const D3D12_DISCARD_REGION *region) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "DiscardResource");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_BeginQuery(ID3D12GraphicsCommandList *This, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "BeginQuery");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_BeginQuery(ID3D12GraphicsCommandList7 *This, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "BeginQuery");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_EndQuery(ID3D12GraphicsCommandList *This, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "EndQuery");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_EndQuery(ID3D12GraphicsCommandList7 *This, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "EndQuery");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ResolveQueryData(ID3D12GraphicsCommandList *This, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT start_index, UINT query_count, ID3D12Resource *dst_buffer, UINT64 aligned_dst_buffer_offset) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ResolveQueryData");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ResolveQueryData(ID3D12GraphicsCommandList7 *This, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT start_index, UINT query_count, ID3D12Resource *dst_buffer, UINT64 aligned_dst_buffer_offset) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ResolveQueryData");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetPredication(ID3D12GraphicsCommandList *This, ID3D12Resource *buffer, UINT64 aligned_buffer_offset, D3D12_PREDICATION_OP operation) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetPredication");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetPredication(ID3D12GraphicsCommandList7 *This, ID3D12Resource *buffer, UINT64 aligned_buffer_offset, D3D12_PREDICATION_OP operation) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetPredication");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_SetMarker(ID3D12GraphicsCommandList *This, UINT metadata, const void *data, UINT size) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "SetMarker");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetMarker(ID3D12GraphicsCommandList7 *This, UINT metadata, const void *data, UINT size) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetMarker");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_BeginEvent(ID3D12GraphicsCommandList *This, UINT metadata, const void *data, UINT size) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "BeginEvent");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_BeginEvent(ID3D12GraphicsCommandList7 *This, UINT metadata, const void *data, UINT size) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "BeginEvent");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_EndEvent(ID3D12GraphicsCommandList *This) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "EndEvent");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_EndEvent(ID3D12GraphicsCommandList7 *This) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "EndEvent");
 }
-static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList_ExecuteIndirect(ID3D12GraphicsCommandList *This, ID3D12CommandSignature *command_signature, UINT max_command_count, ID3D12Resource *arg_buffer, UINT64 arg_buffer_offset, ID3D12Resource *count_buffer, UINT64 count_buffer_offset) {
-    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList", "ExecuteIndirect");
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ExecuteIndirect(ID3D12GraphicsCommandList7 *This, ID3D12CommandSignature *command_signature, UINT max_command_count, ID3D12Resource *arg_buffer, UINT64 arg_buffer_offset, ID3D12Resource *count_buffer, UINT64 count_buffer_offset) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ExecuteIndirect");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_AtomicCopyBufferUINT(ID3D12GraphicsCommandList7 *This, ID3D12Resource *dst_buffer, UINT64 dst_offset, ID3D12Resource *src_buffer, UINT64 src_offset, UINT dependent_resource_count, ID3D12Resource *const *dependent_resources, const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "AtomicCopyBufferUINT");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_AtomicCopyBufferUINT64(ID3D12GraphicsCommandList7 *This, ID3D12Resource *dst_buffer, UINT64 dst_offset, ID3D12Resource *src_buffer, UINT64 src_offset, UINT dependent_resource_count, ID3D12Resource *const *dependent_resources, const D3D12_SUBRESOURCE_RANGE_UINT64 *dependent_sub_resource_ranges) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "AtomicCopyBufferUINT64");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_OMSetDepthBounds(ID3D12GraphicsCommandList7 *This, FLOAT min, FLOAT max) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "OMSetDepthBounds");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetSamplePositions(ID3D12GraphicsCommandList7 *This, UINT sample_count, UINT pixel_count, D3D12_SAMPLE_POSITION *sample_positions) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetSamplePositions");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ResolveSubresourceRegion(ID3D12GraphicsCommandList7 *This, ID3D12Resource *dst_resource, UINT dst_sub_resource_idx, UINT dst_x, UINT dst_y, ID3D12Resource *src_resource, UINT src_sub_resource_idx, D3D12_RECT *src_rect, DXGI_FORMAT format, D3D12_RESOLVE_MODE mode) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ResolveSubresourceRegion");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetViewInstanceMask(ID3D12GraphicsCommandList7 *This, UINT mask) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetViewInstanceMask");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_WriteBufferImmediate(ID3D12GraphicsCommandList7 *This, UINT count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER *parameters, const D3D12_WRITEBUFFERIMMEDIATE_MODE *modes) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "WriteBufferImmediate");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetProtectedResourceSession(ID3D12GraphicsCommandList7 *This, ID3D12ProtectedResourceSession *protected_resource_session) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetProtectedResourceSession");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_BeginRenderPass(ID3D12GraphicsCommandList7 *This, UINT render_targets_count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC *render_targets, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC *depth_stencil, D3D12_RENDER_PASS_FLAGS flags) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "BeginRenderPass");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_EndRenderPass(ID3D12GraphicsCommandList7 *This) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "EndRenderPass");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_InitializeMetaCommand(ID3D12GraphicsCommandList7 *This, ID3D12MetaCommand *meta_command, const void *initialization_parameters_data, SIZE_T initialization_parameters_data_size_in_bytes) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "InitializeMetaCommand");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_ExecuteMetaCommand(ID3D12GraphicsCommandList7 *This, ID3D12MetaCommand *meta_command, const void *execution_parameters_data, SIZE_T execution_parameters_data_size_in_bytes) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "ExecuteMetaCommand");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_BuildRaytracingAccelerationStructure(ID3D12GraphicsCommandList7 *This, const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC *desc, UINT postbuild_info_descs_count, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *postbuild_info_descs) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "BuildRaytracingAccelerationStructure");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_EmitRaytracingAccelerationStructurePostbuildInfo(ID3D12GraphicsCommandList7 *This, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC *desc, UINT src_acceleration_structures_count, const D3D12_GPU_VIRTUAL_ADDRESS *src_acceleration_structure_data) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "EmitRaytracingAccelerationStructurePostbuildInfo");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_CopyRaytracingAccelerationStructure(ID3D12GraphicsCommandList7 *This, D3D12_GPU_VIRTUAL_ADDRESS dst_acceleration_structure_data, D3D12_GPU_VIRTUAL_ADDRESS src_acceleration_structure_data, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "CopyRaytracingAccelerationStructure");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetPipelineState1(ID3D12GraphicsCommandList7 *This, ID3D12StateObject *state_object) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "SetPipelineState1");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_DispatchRays(ID3D12GraphicsCommandList7 *This, const D3D12_DISPATCH_RAYS_DESC *desc) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "DispatchRays");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_RSSetShadingRate(ID3D12GraphicsCommandList7 *This, D3D12_SHADING_RATE base_shading_rate, const D3D12_SHADING_RATE_COMBINER *combiners) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "RSSetShadingRate");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_RSSetShadingRateImage(ID3D12GraphicsCommandList7 *This, ID3D12Resource *shading_rate_image) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "RSSetShadingRateImage");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_DispatchMesh(ID3D12GraphicsCommandList7 *This, UINT thread_group_count_x, UINT thread_group_count_y, UINT thread_group_count_z) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "DispatchMesh");
+}
+static void STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_Barrier(ID3D12GraphicsCommandList7 *This, UINT32 barrier_groups_count, const D3D12_BARRIER_GROUP *barrier_groups) {
+    madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "Barrier");
 }
 
-static void madeira_fill_ID3D12GraphicsCommandList(ID3D12GraphicsCommandListVtbl *v) {
-    v->QueryInterface = stub_ID3D12GraphicsCommandList_QueryInterface;
-    v->AddRef = stub_ID3D12GraphicsCommandList_AddRef;
-    v->Release = stub_ID3D12GraphicsCommandList_Release;
-    v->GetPrivateData = stub_ID3D12GraphicsCommandList_GetPrivateData;
-    v->SetPrivateData = stub_ID3D12GraphicsCommandList_SetPrivateData;
-    v->SetPrivateDataInterface = stub_ID3D12GraphicsCommandList_SetPrivateDataInterface;
-    v->SetName = stub_ID3D12GraphicsCommandList_SetName;
-    v->GetDevice = stub_ID3D12GraphicsCommandList_GetDevice;
-    v->GetType = stub_ID3D12GraphicsCommandList_GetType;
-    v->Close = stub_ID3D12GraphicsCommandList_Close;
-    v->Reset = stub_ID3D12GraphicsCommandList_Reset;
-    v->ClearState = stub_ID3D12GraphicsCommandList_ClearState;
-    v->DrawInstanced = stub_ID3D12GraphicsCommandList_DrawInstanced;
-    v->DrawIndexedInstanced = stub_ID3D12GraphicsCommandList_DrawIndexedInstanced;
-    v->Dispatch = stub_ID3D12GraphicsCommandList_Dispatch;
-    v->CopyBufferRegion = stub_ID3D12GraphicsCommandList_CopyBufferRegion;
-    v->CopyTextureRegion = stub_ID3D12GraphicsCommandList_CopyTextureRegion;
-    v->CopyResource = stub_ID3D12GraphicsCommandList_CopyResource;
-    v->CopyTiles = stub_ID3D12GraphicsCommandList_CopyTiles;
-    v->ResolveSubresource = stub_ID3D12GraphicsCommandList_ResolveSubresource;
-    v->IASetPrimitiveTopology = stub_ID3D12GraphicsCommandList_IASetPrimitiveTopology;
-    v->RSSetViewports = stub_ID3D12GraphicsCommandList_RSSetViewports;
-    v->RSSetScissorRects = stub_ID3D12GraphicsCommandList_RSSetScissorRects;
-    v->OMSetBlendFactor = stub_ID3D12GraphicsCommandList_OMSetBlendFactor;
-    v->OMSetStencilRef = stub_ID3D12GraphicsCommandList_OMSetStencilRef;
-    v->SetPipelineState = stub_ID3D12GraphicsCommandList_SetPipelineState;
-    v->ResourceBarrier = stub_ID3D12GraphicsCommandList_ResourceBarrier;
-    v->ExecuteBundle = stub_ID3D12GraphicsCommandList_ExecuteBundle;
-    v->SetDescriptorHeaps = stub_ID3D12GraphicsCommandList_SetDescriptorHeaps;
-    v->SetComputeRootSignature = stub_ID3D12GraphicsCommandList_SetComputeRootSignature;
-    v->SetGraphicsRootSignature = stub_ID3D12GraphicsCommandList_SetGraphicsRootSignature;
-    v->SetComputeRootDescriptorTable = stub_ID3D12GraphicsCommandList_SetComputeRootDescriptorTable;
-    v->SetGraphicsRootDescriptorTable = stub_ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable;
-    v->SetComputeRoot32BitConstant = stub_ID3D12GraphicsCommandList_SetComputeRoot32BitConstant;
-    v->SetGraphicsRoot32BitConstant = stub_ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstant;
-    v->SetComputeRoot32BitConstants = stub_ID3D12GraphicsCommandList_SetComputeRoot32BitConstants;
-    v->SetGraphicsRoot32BitConstants = stub_ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants;
-    v->SetComputeRootConstantBufferView = stub_ID3D12GraphicsCommandList_SetComputeRootConstantBufferView;
-    v->SetGraphicsRootConstantBufferView = stub_ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView;
-    v->SetComputeRootShaderResourceView = stub_ID3D12GraphicsCommandList_SetComputeRootShaderResourceView;
-    v->SetGraphicsRootShaderResourceView = stub_ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView;
-    v->SetComputeRootUnorderedAccessView = stub_ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView;
-    v->SetGraphicsRootUnorderedAccessView = stub_ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView;
-    v->IASetIndexBuffer = stub_ID3D12GraphicsCommandList_IASetIndexBuffer;
-    v->IASetVertexBuffers = stub_ID3D12GraphicsCommandList_IASetVertexBuffers;
-    v->SOSetTargets = stub_ID3D12GraphicsCommandList_SOSetTargets;
-    v->OMSetRenderTargets = stub_ID3D12GraphicsCommandList_OMSetRenderTargets;
-    v->ClearDepthStencilView = stub_ID3D12GraphicsCommandList_ClearDepthStencilView;
-    v->ClearRenderTargetView = stub_ID3D12GraphicsCommandList_ClearRenderTargetView;
-    v->ClearUnorderedAccessViewUint = stub_ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint;
-    v->ClearUnorderedAccessViewFloat = stub_ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat;
-    v->DiscardResource = stub_ID3D12GraphicsCommandList_DiscardResource;
-    v->BeginQuery = stub_ID3D12GraphicsCommandList_BeginQuery;
-    v->EndQuery = stub_ID3D12GraphicsCommandList_EndQuery;
-    v->ResolveQueryData = stub_ID3D12GraphicsCommandList_ResolveQueryData;
-    v->SetPredication = stub_ID3D12GraphicsCommandList_SetPredication;
-    v->SetMarker = stub_ID3D12GraphicsCommandList_SetMarker;
-    v->BeginEvent = stub_ID3D12GraphicsCommandList_BeginEvent;
-    v->EndEvent = stub_ID3D12GraphicsCommandList_EndEvent;
-    v->ExecuteIndirect = stub_ID3D12GraphicsCommandList_ExecuteIndirect;
+static void madeira_fill_ID3D12GraphicsCommandList7(ID3D12GraphicsCommandList7Vtbl *v) {
+    v->QueryInterface = stub_ID3D12GraphicsCommandList7_QueryInterface;
+    v->AddRef = stub_ID3D12GraphicsCommandList7_AddRef;
+    v->Release = stub_ID3D12GraphicsCommandList7_Release;
+    v->GetPrivateData = stub_ID3D12GraphicsCommandList7_GetPrivateData;
+    v->SetPrivateData = stub_ID3D12GraphicsCommandList7_SetPrivateData;
+    v->SetPrivateDataInterface = stub_ID3D12GraphicsCommandList7_SetPrivateDataInterface;
+    v->SetName = stub_ID3D12GraphicsCommandList7_SetName;
+    v->GetDevice = stub_ID3D12GraphicsCommandList7_GetDevice;
+    v->GetType = stub_ID3D12GraphicsCommandList7_GetType;
+    v->Close = stub_ID3D12GraphicsCommandList7_Close;
+    v->Reset = stub_ID3D12GraphicsCommandList7_Reset;
+    v->ClearState = stub_ID3D12GraphicsCommandList7_ClearState;
+    v->DrawInstanced = stub_ID3D12GraphicsCommandList7_DrawInstanced;
+    v->DrawIndexedInstanced = stub_ID3D12GraphicsCommandList7_DrawIndexedInstanced;
+    v->Dispatch = stub_ID3D12GraphicsCommandList7_Dispatch;
+    v->CopyBufferRegion = stub_ID3D12GraphicsCommandList7_CopyBufferRegion;
+    v->CopyTextureRegion = stub_ID3D12GraphicsCommandList7_CopyTextureRegion;
+    v->CopyResource = stub_ID3D12GraphicsCommandList7_CopyResource;
+    v->CopyTiles = stub_ID3D12GraphicsCommandList7_CopyTiles;
+    v->ResolveSubresource = stub_ID3D12GraphicsCommandList7_ResolveSubresource;
+    v->IASetPrimitiveTopology = stub_ID3D12GraphicsCommandList7_IASetPrimitiveTopology;
+    v->RSSetViewports = stub_ID3D12GraphicsCommandList7_RSSetViewports;
+    v->RSSetScissorRects = stub_ID3D12GraphicsCommandList7_RSSetScissorRects;
+    v->OMSetBlendFactor = stub_ID3D12GraphicsCommandList7_OMSetBlendFactor;
+    v->OMSetStencilRef = stub_ID3D12GraphicsCommandList7_OMSetStencilRef;
+    v->SetPipelineState = stub_ID3D12GraphicsCommandList7_SetPipelineState;
+    v->ResourceBarrier = stub_ID3D12GraphicsCommandList7_ResourceBarrier;
+    v->ExecuteBundle = stub_ID3D12GraphicsCommandList7_ExecuteBundle;
+    v->SetDescriptorHeaps = stub_ID3D12GraphicsCommandList7_SetDescriptorHeaps;
+    v->SetComputeRootSignature = stub_ID3D12GraphicsCommandList7_SetComputeRootSignature;
+    v->SetGraphicsRootSignature = stub_ID3D12GraphicsCommandList7_SetGraphicsRootSignature;
+    v->SetComputeRootDescriptorTable = stub_ID3D12GraphicsCommandList7_SetComputeRootDescriptorTable;
+    v->SetGraphicsRootDescriptorTable = stub_ID3D12GraphicsCommandList7_SetGraphicsRootDescriptorTable;
+    v->SetComputeRoot32BitConstant = stub_ID3D12GraphicsCommandList7_SetComputeRoot32BitConstant;
+    v->SetGraphicsRoot32BitConstant = stub_ID3D12GraphicsCommandList7_SetGraphicsRoot32BitConstant;
+    v->SetComputeRoot32BitConstants = stub_ID3D12GraphicsCommandList7_SetComputeRoot32BitConstants;
+    v->SetGraphicsRoot32BitConstants = stub_ID3D12GraphicsCommandList7_SetGraphicsRoot32BitConstants;
+    v->SetComputeRootConstantBufferView = stub_ID3D12GraphicsCommandList7_SetComputeRootConstantBufferView;
+    v->SetGraphicsRootConstantBufferView = stub_ID3D12GraphicsCommandList7_SetGraphicsRootConstantBufferView;
+    v->SetComputeRootShaderResourceView = stub_ID3D12GraphicsCommandList7_SetComputeRootShaderResourceView;
+    v->SetGraphicsRootShaderResourceView = stub_ID3D12GraphicsCommandList7_SetGraphicsRootShaderResourceView;
+    v->SetComputeRootUnorderedAccessView = stub_ID3D12GraphicsCommandList7_SetComputeRootUnorderedAccessView;
+    v->SetGraphicsRootUnorderedAccessView = stub_ID3D12GraphicsCommandList7_SetGraphicsRootUnorderedAccessView;
+    v->IASetIndexBuffer = stub_ID3D12GraphicsCommandList7_IASetIndexBuffer;
+    v->IASetVertexBuffers = stub_ID3D12GraphicsCommandList7_IASetVertexBuffers;
+    v->SOSetTargets = stub_ID3D12GraphicsCommandList7_SOSetTargets;
+    v->OMSetRenderTargets = stub_ID3D12GraphicsCommandList7_OMSetRenderTargets;
+    v->ClearDepthStencilView = stub_ID3D12GraphicsCommandList7_ClearDepthStencilView;
+    v->ClearRenderTargetView = stub_ID3D12GraphicsCommandList7_ClearRenderTargetView;
+    v->ClearUnorderedAccessViewUint = stub_ID3D12GraphicsCommandList7_ClearUnorderedAccessViewUint;
+    v->ClearUnorderedAccessViewFloat = stub_ID3D12GraphicsCommandList7_ClearUnorderedAccessViewFloat;
+    v->DiscardResource = stub_ID3D12GraphicsCommandList7_DiscardResource;
+    v->BeginQuery = stub_ID3D12GraphicsCommandList7_BeginQuery;
+    v->EndQuery = stub_ID3D12GraphicsCommandList7_EndQuery;
+    v->ResolveQueryData = stub_ID3D12GraphicsCommandList7_ResolveQueryData;
+    v->SetPredication = stub_ID3D12GraphicsCommandList7_SetPredication;
+    v->SetMarker = stub_ID3D12GraphicsCommandList7_SetMarker;
+    v->BeginEvent = stub_ID3D12GraphicsCommandList7_BeginEvent;
+    v->EndEvent = stub_ID3D12GraphicsCommandList7_EndEvent;
+    v->ExecuteIndirect = stub_ID3D12GraphicsCommandList7_ExecuteIndirect;
+    v->AtomicCopyBufferUINT = stub_ID3D12GraphicsCommandList7_AtomicCopyBufferUINT;
+    v->AtomicCopyBufferUINT64 = stub_ID3D12GraphicsCommandList7_AtomicCopyBufferUINT64;
+    v->OMSetDepthBounds = stub_ID3D12GraphicsCommandList7_OMSetDepthBounds;
+    v->SetSamplePositions = stub_ID3D12GraphicsCommandList7_SetSamplePositions;
+    v->ResolveSubresourceRegion = stub_ID3D12GraphicsCommandList7_ResolveSubresourceRegion;
+    v->SetViewInstanceMask = stub_ID3D12GraphicsCommandList7_SetViewInstanceMask;
+    v->WriteBufferImmediate = stub_ID3D12GraphicsCommandList7_WriteBufferImmediate;
+    v->SetProtectedResourceSession = stub_ID3D12GraphicsCommandList7_SetProtectedResourceSession;
+    v->BeginRenderPass = stub_ID3D12GraphicsCommandList7_BeginRenderPass;
+    v->EndRenderPass = stub_ID3D12GraphicsCommandList7_EndRenderPass;
+    v->InitializeMetaCommand = stub_ID3D12GraphicsCommandList7_InitializeMetaCommand;
+    v->ExecuteMetaCommand = stub_ID3D12GraphicsCommandList7_ExecuteMetaCommand;
+    v->BuildRaytracingAccelerationStructure = stub_ID3D12GraphicsCommandList7_BuildRaytracingAccelerationStructure;
+    v->EmitRaytracingAccelerationStructurePostbuildInfo = stub_ID3D12GraphicsCommandList7_EmitRaytracingAccelerationStructurePostbuildInfo;
+    v->CopyRaytracingAccelerationStructure = stub_ID3D12GraphicsCommandList7_CopyRaytracingAccelerationStructure;
+    v->SetPipelineState1 = stub_ID3D12GraphicsCommandList7_SetPipelineState1;
+    v->DispatchRays = stub_ID3D12GraphicsCommandList7_DispatchRays;
+    v->RSSetShadingRate = stub_ID3D12GraphicsCommandList7_RSSetShadingRate;
+    v->RSSetShadingRateImage = stub_ID3D12GraphicsCommandList7_RSSetShadingRateImage;
+    v->DispatchMesh = stub_ID3D12GraphicsCommandList7_DispatchMesh;
+    v->Barrier = stub_ID3D12GraphicsCommandList7_Barrier;
 }
 
 /* ---- ID3D12Fence: 11 slots ---- */
@@ -796,13 +885,13 @@ static ULONG STDMETHODCALLTYPE stub_ID3D12Fence_Release(ID3D12Fence *This) {
     return 0;
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Fence_GetPrivateData(ID3D12Fence *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+    return mad_pd_get(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Fence_SetPrivateData(ID3D12Fence *This, REFGUID guid, UINT data_size, const void *data) {
-    return S_OK;
+    return mad_pd_set(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Fence_SetPrivateDataInterface(ID3D12Fence *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
+    return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Fence_SetName(ID3D12Fence *This, const WCHAR *name) {
     return S_OK;
@@ -852,13 +941,13 @@ static ULONG STDMETHODCALLTYPE stub_ID3D12Resource2_Release(ID3D12Resource2 *Thi
     return 0;
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Resource2_GetPrivateData(ID3D12Resource2 *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+    return mad_pd_get(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Resource2_SetPrivateData(ID3D12Resource2 *This, REFGUID guid, UINT data_size, const void *data) {
-    return S_OK;
+    return mad_pd_set(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Resource2_SetPrivateDataInterface(ID3D12Resource2 *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
+    return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Resource2_SetName(ID3D12Resource2 *This, const WCHAR *name) {
     return S_OK;
@@ -937,13 +1026,13 @@ static ULONG STDMETHODCALLTYPE stub_ID3D12RootSignature_Release(ID3D12RootSignat
     return 0;
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12RootSignature_GetPrivateData(ID3D12RootSignature *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+    return mad_pd_get(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12RootSignature_SetPrivateData(ID3D12RootSignature *This, REFGUID guid, UINT data_size, const void *data) {
-    return S_OK;
+    return mad_pd_set(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12RootSignature_SetPrivateDataInterface(ID3D12RootSignature *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
+    return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12RootSignature_SetName(ID3D12RootSignature *This, const WCHAR *name) {
     return S_OK;
@@ -978,13 +1067,13 @@ static ULONG STDMETHODCALLTYPE stub_ID3D12PipelineState_Release(ID3D12PipelineSt
     return 0;
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12PipelineState_GetPrivateData(ID3D12PipelineState *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+    return mad_pd_get(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12PipelineState_SetPrivateData(ID3D12PipelineState *This, REFGUID guid, UINT data_size, const void *data) {
-    return S_OK;
+    return mad_pd_set(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12PipelineState_SetPrivateDataInterface(ID3D12PipelineState *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
+    return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12PipelineState_SetName(ID3D12PipelineState *This, const WCHAR *name) {
     return S_OK;
@@ -1024,13 +1113,13 @@ static ULONG STDMETHODCALLTYPE stub_ID3D12DescriptorHeap_Release(ID3D12Descripto
     return 0;
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12DescriptorHeap_GetPrivateData(ID3D12DescriptorHeap *This, REFGUID guid, UINT *data_size, void *data) {
-    if (data_size) *data_size = 0; return (HRESULT)0x887A0002; /* DXGI_ERROR_NOT_FOUND */
+    return mad_pd_get(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12DescriptorHeap_SetPrivateData(ID3D12DescriptorHeap *This, REFGUID guid, UINT data_size, const void *data) {
-    return S_OK;
+    return mad_pd_set(This, guid, data_size, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12DescriptorHeap_SetPrivateDataInterface(ID3D12DescriptorHeap *This, REFGUID guid, const IUnknown *data) {
-    return S_OK;
+    return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12DescriptorHeap_SetName(ID3D12DescriptorHeap *This, const WCHAR *name) {
     return S_OK;

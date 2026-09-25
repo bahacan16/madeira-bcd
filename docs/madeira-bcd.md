@@ -1,6 +1,6 @@
 # madeira-bcd: what this fork adds to willfaust/Madeira
 
-Rebased on upstream `5a82d39` (2026-09-24) on 2026-09-24. Upstream carries the
+Rebased on upstream `5a82d39` (2026-09-24) on 2026-09-24; tracks upstream main by merge. Upstream carries the
 runtime (Wine, FEX, DXMT, the native D3D12 runtime); this fork carries a CI
 build and the app-side pieces below. Everything else is upstream's.
 
@@ -54,7 +54,11 @@ step says so when it becomes a no-op:
   per-game settings, the Windows desktop, test programs, settings). The
   original panel is still there under Settings > Developer tools.
 - `GameControllerManager.swift`: physical controllers mapped to keyboard and
-  mouse (ported from SaimSuhailQu/Madeira 72ca339).
+  mouse (ported from SaimSuhailQu/Madeira 72ca339). Since upstream #22 hands
+  pads to games as real XInput controllers (`GamepadInput.swift`), this
+  mapping is opt-in while XInput is on (Controllers sheet, "Also send keyboard
+  and mouse"), so a game does not get every press twice; detection and the
+  live input tester work either way.
 - Game Mode (`GCSupportsGameMode`, games category) in Info.plist.
 - Settings > Experimental > Storage-backed memory writes `swap-mb = 3072` to
   `Documents/madeira.cfg`, which turns on upstream's file-backed guest data tier

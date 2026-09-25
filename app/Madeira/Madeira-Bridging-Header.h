@@ -21,6 +21,9 @@ void madeira_capture_request(int frames);
 // low QoS class (efficiency cores, lower clocks) to save the SoC burst budget.
 void madeira_set_eco(int on);
 int madeira_get_eco(void);
+// ml1136: live GPU encoder-sync mode (winemetal_unix.c): 1, 5, 6; 7 = mode 0 (no fences).
+// The D3D12 runtime applies it at the next Present, for lists that start after that.
+void madeira_set_fence_mode(int mode);
 
 // DXMT vsync-lock toggle (winemetal_unix.c) — 1 = pace presents to 60
 // via afterMinimumDuration, 0 = free-run to display max (120 ProMotion,

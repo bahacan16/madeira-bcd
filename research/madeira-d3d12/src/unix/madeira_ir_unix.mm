@@ -256,6 +256,10 @@ static void mad_air_entry_name(const unsigned char *b, size_t len, char *out, si
  * header pulls in a Windows compatibility layer that redefines BOOL as int --
  * irreconcilable with Objective-C's BOOL in this translation unit. The resolver
  * therefore lives in madeira_sm5_ia.cpp (plain C++) and is reached by prototype. */
+/* ml1149: madeira_ags.cpp (LLVM 15, plain C++ like the IA resolver). */
+extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
+                                   char *note, size_t note_cap);
+
 extern "C" int madeira_sm5_resolve_ia(const void *bc, size_t bclen,
                                       const struct madeira_ir_input_layout *L,
                                       struct SM50_IA_INPUT_ELEMENT *out, uint32_t out_cap,
@@ -283,7 +287,7 @@ extern "C" int madeira_sm5_resolve_ia(const void *bc, size_t bclen,
  * compiled for a different layout, which is far worse than recompiling.
  * ------------------------------------------------------------------------- */
 #define MAD_SC_MAGIC   0x4353444du   /* "MDSC" */
-#define MAD_SC_VERSION 2u   /* ml1083: tessellation fields appended */
+#define MAD_SC_VERSION 3u   /* ml1083: tessellation fields appended; ml1146: v2 entries may hold range COUNTS without range data */
 
 struct mad_sc_header {
     uint32_t magic, version;
@@ -378,6 +382,13 @@ static void mad_sc_store(uint64_t key, const struct madeira_ir_convert_args *a,
     struct mad_sc_header h;
     int fd;
     if (!len || !data) return;
+    /* ml1146: a conversion whose caller asked for no range list (a vertex stage
+     * converted for a geometry pipeline) still COUNTS its ranges. Stored like
+     * that, the header promised N ranges and none followed, so the next caller
+     * that did want them read N ranges out of the metallib bytes: garbage
+     * registers and spaces, and 4,766 draws skipped as "table not reported"
+     * (ph-valley03). An entry is only stored when every list it counts is here. */
+    if ((a->ret_air_nranges && !ranges) || (a->ret_air_nranges2 && !a->out_air_ranges2)) return;
     if (!mad_sc_path(key, path, sizeof path)) return;
     /* Write-then-rename so a crash mid-write can never leave a torn entry that
      * a later run would trust. */
@@ -682,10 +693,149 @@ done:
     return status;
 }
 
+/* ml1147: GEOMETRY SHADERS. See madeira_ir_abi.h for the two-request contract.
+ * Ported from DXMT's D3D11 layer (d3d11_shader.cpp): the same two compiler
+ * entry points, the same argument chains (object: geometry record -> input
+ * layout -> common; mesh: geometry record -> common). The compiler cannot
+ * convert a geometry shader on its own ("Geometry shader cannot be
+ * independently converted"), which is why every DXBC geometry-shader pipeline
+ * lost its geometry stage before this. */
+static int mad_airconv_convert_gs(struct madeira_ir_convert_args *a,
+                                  const unsigned char *bc, size_t bclen)
+{
+    const unsigned char *other = (const unsigned char *)(uintptr_t)a->gs_bytecode;
+    size_t olen = (size_t)a->gs_bytecode_len;
+    struct MTL_SHADER_REFLECTION refl_main, refl_other;
+    sm50_shader_t sh_main = NULL, sh_other = NULL;
+    sm50_error_t err = NULL;
+    sm50_bitcode_t bits = NULL;
+    struct madeira_ir_air_range *out_ranges = (struct madeira_ir_air_range *)(uintptr_t)a->out_air_ranges;
+    struct SM50_IA_INPUT_ELEMENT ia_el[31];
+    uint32_t ia_nel = 0, slot_mask = 0;
+    const int object = a->gs_stage == 1;
+    char name[MADEIRA_IR_ENTRY_MAX], mname[MADEIRA_IR_ENTRY_MAX];
+    uint64_t sc_key = 0;
+    int status;
+
+    memset(&refl_main, 0, sizeof refl_main); memset(&refl_other, 0, sizeof refl_other);
+    a->ret_backend = MADEIRA_IR_BACKEND_AIRCONV;
+    a->ret_cb_table_bind2 = a->ret_arg_table_bind2 = ~0u;
+    a->ret_arg_qwords2 = a->ret_air_nranges2 = 0;
+    a->ret_threads_per_patch = a->ret_tess_out_prim = a->ret_max_potential_factor = 0;
+
+    if (a->gs_stage != 1 && a->gs_stage != 2) { snprintf(a->ret_note, sizeof a->ret_note, "gs_stage %u", a->gs_stage); return MADEIRA_IR_UNSUPPORTED; }
+    if (!other || !olen) {
+        snprintf(a->ret_note, sizeof a->ret_note, "geometry request without the %s shader", object ? "geometry" : "vertex");
+        a->ret_status = MADEIRA_IR_BAD_DXIL; return MADEIRA_IR_BAD_DXIL;
+    }
+    if (object && a->tess_index_format > 2) { snprintf(a->ret_note, sizeof a->ret_note, "index format %u", a->tess_index_format); return MADEIRA_IR_UNSUPPORTED; }
+
+    if (object) {   /* the object function fetches vertices itself, from the resolved layout */
+        const struct madeira_ir_input_layout *L = (const struct madeira_ir_input_layout *)(uintptr_t)a->layout;
+        if (L && L->n) {
+            char why[128] = {0};
+            if (!madeira_sm5_resolve_ia(bc, bclen, L, ia_el, 31, &ia_nel, &slot_mask, why, sizeof why)) {
+                snprintf(a->ret_note, sizeof a->ret_note, "input layout: %s", why);
+                a->ret_status = MADEIRA_IR_UNSUPPORTED_RANGE; return MADEIRA_IR_UNSUPPORTED_RANGE;
+            }
+        }
+        a->ret_vs_input_count = ia_nel;
+        a->ret_air_slot_mask = slot_mask;
+    }
+
+    mad_air_entry_name(bc, bclen, mname, sizeof mname);
+    if (object) snprintf(name, sizeof name, "vsgs_%u%u_%s", a->tess_index_format, a->gs_strip ? 1u : 0u, mname + 4);
+    else snprintf(name, sizeof name, "gs_%u_%s", a->gs_strip ? 1u : 0u, mname + 4);
+    if (a->out_entry) snprintf((char *)(uintptr_t)a->out_entry, MADEIRA_IR_ENTRY_MAX, "%s", name);
+
+    {   /* cache identity: every input that shapes the output */
+        uint64_t key = 1469598103934665603ull;
+        uint32_t mv = SM50_SHADER_METAL_320, ver = MAD_SC_VERSION, st[3] = { a->gs_stage, a->tess_index_format, a->gs_strip ? 1u : 0u };
+        const char *stamp = __DATE__ __TIME__;
+        mad_sc_hash_add(&key, "geom", 4);
+        mad_sc_hash_add(&key, bc, bclen);
+        mad_sc_hash_add(&key, other, olen);
+        mad_sc_hash_add(&key, st, sizeof st);
+        mad_sc_hash_add(&key, &mv, sizeof mv);
+        mad_sc_hash_add(&key, &ver, sizeof ver);
+        mad_sc_hash_add(&key, stamp, strlen(stamp));
+        if (ia_nel) mad_sc_hash_add(&key, ia_el, (size_t)ia_nel * sizeof ia_el[0]);
+        sc_key = key;
+        int hit = mad_sc_load(key, a, out_ranges);
+        if (hit) { a->ret_air_slot_mask = slot_mask; a->ret_vs_input_count = ia_nel; return (int)a->ret_status; }
+    }
+
+    if (SM50Initialize(bc, bclen, &sh_main, &refl_main, &err) != 0) {
+        char msg[192] = {0};
+        if (err) { SM50GetErrorMessage(err, msg, sizeof msg); SM50FreeError(err); err = NULL; }
+        snprintf(a->ret_note, sizeof a->ret_note, "sm5 parse (%s): %s", object ? "vertex" : "geometry", msg[0] ? msg : "(no message)");
+        status = MADEIRA_IR_BAD_DXIL; goto done;
+    }
+    if (SM50Initialize(other, olen, &sh_other, &refl_other, &err) != 0) {
+        char msg[192] = {0};
+        if (err) { SM50GetErrorMessage(err, msg, sizeof msg); SM50FreeError(err); err = NULL; }
+        snprintf(a->ret_note, sizeof a->ret_note, "sm5 parse (%s): %s", object ? "geometry" : "vertex", msg[0] ? msg : "(no message)");
+        status = MADEIRA_IR_BAD_DXIL; goto done;
+    }
+
+    /* Each function binds its OWN shader's tables at the indices the compiler
+     * reports (29/30 for both, per DXMT's pipeline: object 16/21/29/30, mesh 29/30). */
+    status = mad_air_ranges(sh_main, out_ranges, a->air_range_cap, &a->ret_air_nranges, a->ret_note, sizeof a->ret_note);
+    if (status != MADEIRA_IR_OK) goto done;
+    a->ret_cb_table_bind  = refl_main.ConstanttBufferTableBindIndex;
+    a->ret_arg_table_bind = refl_main.ArgumentBufferBindIndex;
+    a->ret_arg_qwords     = refl_main.ArgumentTableQwords;
+
+    {
+        struct SM50_SHADER_COMMON_DATA common;
+        struct SM50_SHADER_IA_INPUT_LAYOUT_DATA ia;
+        struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA geom;
+        int rc;
+        memset(&common, 0, sizeof common); common.type = SM50_SHADER_COMMON; common.metal_version = SM50_SHADER_METAL_320;
+        memset(&geom, 0, sizeof geom); geom.type = SM50_SHADER_PSO_GEOMETRY_SHADER; geom.strip_topology = a->gs_strip ? true : false;
+        if (object) {
+            memset(&ia, 0, sizeof ia);
+            ia.type = SM50_SHADER_IA_INPUT_LAYOUT; ia.next = &common;
+            ia.index_buffer_format = (enum SM50_INDEX_BUFFER_FORAMT)a->tess_index_format;
+            ia.slot_mask = slot_mask; ia.num_elements = ia_nel; ia.elements = ia_el;
+            geom.next = &ia;
+            rc = SM50CompileGeometryPipelineVertex(sh_main, sh_other, (struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&geom, name, &bits, &err);
+        } else {
+            geom.next = &common;
+            rc = SM50CompileGeometryPipelineGeometry(sh_other, sh_main, (struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&geom, name, &bits, &err);
+        }
+        if (rc != 0) {
+            char msg[192] = {0};
+            if (err) { SM50GetErrorMessage(err, msg, sizeof msg); SM50FreeError(err); err = NULL; }
+            snprintf(a->ret_note, sizeof a->ret_note, "sm5 %s compile: %s", object ? "vertex-for-geometry" : "geometry", msg[0] ? msg : "(no message)");
+            status = MADEIRA_IR_COMPILE_FAILED; goto done;
+        }
+    }
+    {
+        struct SM50_COMPILED_BITCODE out;
+        memset(&out, 0, sizeof out);
+        SM50GetCompiledBitcode(bits, &out);
+        a->ret_len = out.Size;
+        if (!out.Size || !out.Data) { snprintf(a->ret_note, sizeof a->ret_note, "sm5 compile produced no bytes"); status = MADEIRA_IR_NO_METALLIB; goto done; }
+        mad_sc_store(sc_key, a, out_ranges, name, (const void *)(uintptr_t)out.Data, out.Size);
+        if (!a->out_buf || a->out_cap < out.Size) { status = MADEIRA_IR_BUFFER_TOO_SMALL; goto done; }
+        memcpy((void *)(uintptr_t)a->out_buf, (const void *)(uintptr_t)out.Data, (size_t)out.Size);
+        status = MADEIRA_IR_OK;
+        a->ret_status = MADEIRA_IR_OK;
+    }
+done:
+    if (bits) SM50DestroyBitcode(bits);
+    if (sh_main) SM50Destroy(sh_main);
+    if (sh_other) SM50Destroy(sh_other);
+    a->ret_status = (uint32_t)status;
+    return status;
+}
+
 static int mad_airconv_convert(struct madeira_ir_convert_args *a,
                                const unsigned char *bc, size_t bclen)
 {
     if (a->tess_stage) return mad_airconv_convert_tess(a, bc, bclen);   /* ml1083 */
+    if (a->gs_stage) return mad_airconv_convert_gs(a, bc, bclen);       /* ml1147 */
     struct MTL_SHADER_REFLECTION refl;
     sm50_shader_t shader = NULL;
     sm50_error_t err = NULL;
@@ -999,6 +1149,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     IRCompiler *compiler = NULL;
     IRMetalLibBinary *lib = NULL;
     IRShaderReflection *refl = NULL;
+    void *ags_buf = NULL;   /* ml1149: rewritten container, borrowed by `input` */
     int status = MADEIRA_IR_COMPILE_FAILED;
     const char *entry = (const char *)(uintptr_t)a->entry_point;
     IRShaderStage stage = IRShaderStageInvalid;
@@ -1090,8 +1241,28 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         goto done;
     }
 
-    input = g_ir.IRObjectCreateFromDXIL((const uint8_t *)(uintptr_t)a->dxil,
-                                        (size_t)a->dxil_len, IRBytecodeOwnershipNone);
+    /* ml1149: AMD AGS 64-bit atomics (magic UAV in space 0x7FFF0ADE) become
+     * native SM6.6 64-bit atomics before the converter sees the module; it
+     * refuses the magic space outright. madeira.cfg ags-rewrite = 0 turns it off. */
+    {
+        static int enabled = -1;
+        const uint8_t *src = (const uint8_t *)(uintptr_t)a->dxil;
+        size_t src_len = (size_t)a->dxil_len, ags_len = 0;
+        char note[192];
+        if (enabled < 0) {
+            char v[16];
+            enabled = !(madeira_cfg_get("ags-rewrite", v, sizeof v) && v[0] == '0');
+        }
+        int rc = enabled ? madeira_ags_rewrite(src, src_len, &ags_buf, &ags_len, note, sizeof note) : 0;
+        if (rc != 0 && a->out_buf) {   /* the sizing pass converts too; say it once */
+            char nm[MADEIRA_IR_ENTRY_MAX];
+            mad_air_entry_name(src, src_len, nm, sizeof nm);
+            dprintf(2, "[madeira-ir] ml1149 AGS %s: %s%s\n", nm + 4, note,
+                    rc < 0 ? " -- converting the original, which the converter will refuse" : "");
+        }
+        input = rc == 1 ? g_ir.IRObjectCreateFromDXIL((const uint8_t *)ags_buf, ags_len, IRBytecodeOwnershipNone)
+                        : g_ir.IRObjectCreateFromDXIL(src, src_len, IRBytecodeOwnershipNone);
+    }
     if (!input) { status = MADEIRA_IR_BAD_DXIL; goto done; }
 
     compiler = g_ir.IRCompilerCreate();
@@ -1136,11 +1307,16 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
          * diagnostics, instead of a code number on a phone. */
         {
             static int dumped;
+            /* ml1139: the app's real Documents folder (where madeira.cfg lives).
+             * Inside a Wine process HOME is the prefix (Documents/wine), so the
+             * old HOME/Documents/... path never existed and nothing was saved. */
+            const char *docs = getenv("MADEIRA_DOCS_DIR");
             const char *home = getenv("HOME");
             char dir[512], path[640];
             if (!home) home = getenv("CFFIXED_USER_HOME");
             if (!home) home = "/tmp";
-            snprintf(dir, sizeof dir, "%s/Documents/madeira-failed-shaders", home);
+            if (docs && docs[0]) snprintf(dir, sizeof dir, "%s/madeira-failed-shaders", docs);
+            else snprintf(dir, sizeof dir, "%s/Documents/madeira-failed-shaders", home);
             if (dumped < 16) {
                 FILE *f;
                 mkdir(dir, 0755);
@@ -1282,6 +1458,7 @@ done:
     free(irs);
     free(irr);
     free(irp);
+    free(ags_buf);
     a->ret_status = (uint32_t)status;
     return status;
 }
