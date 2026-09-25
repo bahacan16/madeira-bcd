@@ -186,7 +186,7 @@ struct FPSOverlay: View {
             .onTapGesture {
                 vsyncMode = vsyncMode == 1 ? 0 : (vsyncMode == 0 ? 2 : 1)
                 madeira_set_vsync_locked(vsyncMode)
-                ProMotionIntent.shared.setActive(vsyncMode != 1)
+                ProMotionIntent.shared.setActive(FrameLimit.wantsHighRefresh(vsyncMode))
             }
     }
 
@@ -253,6 +253,8 @@ struct FPSOverlay: View {
     private var pillLabel: String {
         switch vsyncMode {
         case 1: return "60"
+        case 3: return "30"
+        case 4: return "40"
         case 0: return "MAX(\(UIScreen.main.maximumFramesPerSecond))"
         default: return "RAW"
         }
@@ -260,7 +262,7 @@ struct FPSOverlay: View {
 
     private var pillColor: Color {
         switch vsyncMode {
-        case 1: return .cyan
+        case 1, 3, 4: return .cyan
         case 0: return .pink
         default: return .orange
         }
@@ -281,7 +283,7 @@ struct FPSOverlay: View {
         samples = [(now, c)]
         presentCount = c
         vsyncMode = madeira_get_vsync_locked()
-        ProMotionIntent.shared.setActive(vsyncMode != 1)
+        ProMotionIntent.shared.setActive(FrameLimit.wantsHighRefresh(vsyncMode))
 
         // 100ms sampling — keeps the buffer fresh
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
@@ -297,6 +299,8 @@ struct FPSOverlay: View {
         limitMB = readLimitMB(footprintMB: memMB)
         displayTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
             fps = computeAdaptiveFPS()
+            // The Session panel sets the pacing mode too; follow it.
+            vsyncMode = madeira_get_vsync_locked()
             // ml606: piggybacks on the existing tick, so it costs one extra
             // task_info per 250ms and no additional SwiftUI invalidation.
             memMB = readFootprintMB()

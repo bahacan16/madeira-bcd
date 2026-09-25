@@ -771,6 +771,10 @@ jobs:
             echo "::warning::no Metal Shader Converter headers -- D3D12 shader conversion is a stub in this build"
           fi
 
+      # 30 and 40 FPS caps (pacing modes 3 and 4) for the Session panel.
+      - name: Patch DXMT present pacing with 30/40 FPS modes
+        run: python3 tools/patch-dxmt-frame-limits.py
+
       - name: Build dxmt-ios
         shell: bash
         run: |

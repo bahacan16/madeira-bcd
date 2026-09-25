@@ -59,9 +59,12 @@ enum DisplayFit: String, CaseIterable, Identifiable {
     }
 }
 
-/// DXMT's pacing modes (g_madeira_vsync_mode), the same three the FPS pill
-/// cycles through.
+/// DXMT's pacing modes (g_madeira_vsync_mode). 1/0/2 are upstream's (the FPS
+/// pill cycles through them); 3 and 4 are added in CI by
+/// tools/patch-dxmt-frame-limits.py. Listed in the order the panel shows them.
 enum FrameLimit: Int32, CaseIterable, Identifiable {
+    case locked30 = 3
+    case locked40 = 4
     case locked60 = 1
     case display = 0
     case unlimited = 2
@@ -70,6 +73,8 @@ enum FrameLimit: Int32, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
+        case .locked30: return "30 FPS"
+        case .locked40: return "40 FPS"
         case .locked60: return "60 FPS"
         case .display: return "\(UIScreen.main.maximumFramesPerSecond) FPS"
         case .unlimited: return "Unlimited"
@@ -78,9 +83,16 @@ enum FrameLimit: Int32, CaseIterable, Identifiable {
 
     static var current: FrameLimit { FrameLimit(rawValue: Int32(madeira_get_vsync_locked())) ?? .locked60 }
 
+    /// 30 and 60 divide a 60 Hz panel evenly. 40 does not: 25 ms is three
+    /// refreshes at 120 Hz but rounds to 33 ms at 60 Hz, so it needs the
+    /// ProMotion rate held, as do the display-max and raw modes.
+    static func wantsHighRefresh(_ mode: Int32) -> Bool {
+        mode != FrameLimit.locked60.rawValue && mode != FrameLimit.locked30.rawValue
+    }
+
     static func apply(_ limit: FrameLimit) {
         madeira_set_vsync_locked(Int32(limit.rawValue))
-        ProMotionIntent.shared.setActive(limit != .locked60)
+        ProMotionIntent.shared.setActive(wantsHighRefresh(limit.rawValue))
     }
 }
 
@@ -126,7 +138,7 @@ struct SessionPanelView: View {
                     Text("Touch controls are drawn in landscape. A connected game controller reaches games as an Xbox pad.")
                 }
 
-                Section("Display") {
+                Section {
                     Picker("FPS limit", selection: $frameLimit) {
                         ForEach(FrameLimit.allCases) { Text($0.label).tag($0) }
                     }
@@ -138,6 +150,12 @@ struct SessionPanelView: View {
                     Toggle("Performance overlay", isOn: $session.showPerformance)
                     Toggle("Battery saver (ECO)", isOn: $eco)
                         .onChange(of: eco) { _, on in madeira_set_eco(on ? 1 : 0) }
+                } header: {
+                    Text("Display")
+                } footer: {
+                    Text("ECO runs the game's threads at a low priority, on the efficiency cores. It is not a "
+                         + "frame cap: use it while a game loads, so the phone keeps its heat budget for "
+                         + "gameplay, and turn it off to play.")
                 }
 
                 Section {
