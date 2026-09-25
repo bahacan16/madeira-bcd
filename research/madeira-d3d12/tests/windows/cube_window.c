@@ -105,12 +105,19 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
      * "write no channel". The runtime ignored the mask when this test was
      * verified; since b334510 it honours it, as D3D12 does, and the cube drew
      * every frame without writing a pixel (seen on an iPhone 17 Pro Max: the
-     * clear colour only). Spell out what the zeroed fields used to mean --
-     * solid fill, no culling, no depth test -- plus the write mask. */
+     * clear colour only). Set the write mask, and turn on the depth test
+     * texcube.hlsl is written for ("the face towards the viewer wins the depth
+     * test"): with it off, as the zeroed state had it, faces were drawn in
+     * index order and back faces covered front ones as the cube turned. The
+     * depth buffer below already exists and is cleared to 1.0 every frame. */
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.SampleMask = 0xffffffffu;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.DepthStencilState.DepthEnable = TRUE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     ID3D12PipelineState *pso = NULL;
     hr = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
     if (FAILED(hr) || !pso) { printf("cube: no pipeline %#lx\n", hr); return 1; }
