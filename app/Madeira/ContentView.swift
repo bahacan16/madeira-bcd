@@ -89,6 +89,12 @@ final class MetalBackedView: UIView {
     // → WM_KEYDOWN/WM_CHAR). Lets the user type into Windows dialogs (e.g.
     // Run) directly instead of relying on the browse list.
     static weak var keyboardTarget: MetalBackedView?
+
+    /// Re-place the window-level surface after a Display fit change.
+    static func relayoutLive() {
+        keyboardTarget?.setNeedsLayout()
+        keyboardTarget?.layoutIfNeeded()
+    }
     override var canBecomeFirstResponder: Bool { true }
     static func toggleKeyboard() {
         guard let v = keyboardTarget else { return }
@@ -128,6 +134,9 @@ final class MetalBackedView: UIView {
     /// display edges (2026-07-05). Touch mapping uses the same rect so
     /// letterboxing never skews input.
     private func gameRect() -> CGRect {
+        // Session panel "Display fit": Stretch hands the whole placeholder to
+        // the surface; touch mapping reads this same rect, so input follows.
+        if DisplayFit.current == .stretch { return bounds }
         let gw: CGFloat = 1024, gh: CGFloat = 768
         let scale = min(bounds.width / gw, bounds.height / gh)
         let w = gw * scale, h = gh * scale
@@ -861,6 +870,9 @@ struct ContentView: View {
     /// @ObservedObject rather than @StateObject -- same as `input` above.
     @ObservedObject private var controllers = GameControllerManager.shared
     @State private var showControllerSheet = false
+    /// A game started from the library: the player's view, not the developer's.
+    @ObservedObject private var session = GameSession.shared
+    @State private var sessionPanelOpen = false
     /// The Wine virtual desktop's size. Persisted because it is a property of
     /// the prefix the user set up, not of one launch, and it only takes effect
     /// on the next desktop start.
@@ -921,6 +933,8 @@ struct ContentView: View {
             Group {
                 if vSizeClass == .compact {
                     landscapeBody
+                } else if pendingLaunch != nil {
+                    sessionPortraitBody
                 } else {
                     portraitBody
                 }
@@ -931,7 +945,7 @@ struct ContentView: View {
             // a fresh placeholder only re-parents the same CAMetalLayer.
             .navigationTitle("Madeira")
             .navigationBarTitleDisplayMode(.inline)
-            .navigationBarHidden(vSizeClass == .compact)
+            .navigationBarHidden(vSizeClass == .compact || pendingLaunch != nil)
             .onAppear {
                 jit_install_trap_handler()
                 entitlements = EntitlementStatus.check()
@@ -940,6 +954,8 @@ struct ContentView: View {
                     Self.pendingLaunchConsumed = true
                     launch.apply()
                     logStore.log("Starting \(launch.title) from the library", level: .info)
+                    session.title = launch.title
+                    LaunchSplashHost.show(title: launch.title)
                     // Let the surface lay out first -- the buttons this replaces
                     // were only ever pressed with the view already on screen.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -1018,6 +1034,65 @@ struct ContentView: View {
         }
     }
 
+    /// Portrait for a game started from the library: the game, a readout if
+    /// wanted, and one bar -- Esc, Enter, keyboard, Session. The developer
+    /// view (portraitBody) is still reached from Settings > Developer tools.
+    /// Plain tap gestures rather than Buttons in this window: see keyButton
+    /// (ml896) on SwiftUI press animations while a game runs.
+    private var sessionPortraitBody: some View {
+        VStack(spacing: 0) {
+            MadeiraMetalView()
+                .frame(maxWidth: .infinity)
+                .aspectRatio(4.0 / 3.0, contentMode: .fit)
+                .background(Color.black)
+                .onAppear { TouchControlsHost.attach() }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: UIDevice.orientationDidChangeNotification)) { _ in
+                    TouchControlsHost.attach()
+                }
+            if session.showPerformance {
+                HStack(spacing: 6) {
+                    FPSOverlay()
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 6)
+            }
+            Spacer(minLength: 0)
+            Label("Rotate for full screen and touch controls", systemImage: "rotate.right")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 10)
+            HStack(spacing: 10) {
+                keyButton("Esc", vk: 0x1B)
+                keyButton("⏎", vk: 0x0D)
+                sessionBarButton("keyboard") { MetalBackedView.toggleKeyboard() }
+                Spacer()
+                sessionBarButton("line.3.horizontal") { sessionPanelOpen = true }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+        }
+        .background(Color.black.ignoresSafeArea())
+        .sheet(isPresented: $sessionPanelOpen) {
+            SessionPanelView(onClose: { sessionPanelOpen = false })
+        }
+    }
+
+    private func sessionBarButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
+        Image(systemName: icon)
+            .font(.system(size: 18, weight: .regular))
+            .foregroundStyle(.white)
+            .frame(width: 52, height: 40)
+            .background(Color.secondary.opacity(0.25))
+            .cornerRadius(8)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                action()
+            }
+    }
+
     /// Landscape: game mode. Full-height 4:3 surface centered (aspect-fit
     /// happens in MetalBackedView); ALL controls live in the pillarbox
     /// bars left/right of the game — the window-level surface would cover
@@ -1036,7 +1111,9 @@ struct ContentView: View {
                 HStack(spacing: 0) {
                     Spacer(minLength: 0)
                     VStack {
-                        FPSOverlay(compact: true)
+                        if pendingLaunch == nil || session.showPerformance {
+                            FPSOverlay(compact: true)
+                        }
                         Spacer()
                     }
                     .frame(width: barW)
@@ -2878,7 +2955,11 @@ final class TouchControlsModel: ObservableObject {
 
     @Published var controls: [TouchControl] = [] { didSet { save() } }
     @Published var visible = true               { didSet { save() } }
+    /// Session panel "Opacity" for the play-mode controls (edit mode stays opaque).
+    @Published var opacity: Double = 1.0        { didSet { save() } }
     @Published var editing = false              // transient, never persisted
+    /// The Session panel card is open on this window: it takes every touch.
+    @Published var sessionPanel = false         // transient
     @Published var selected: UUID?              // transient
 
     private var loading = false
@@ -2887,7 +2968,7 @@ final class TouchControlsModel: ObservableObject {
             .appendingPathComponent("madeira-controls.json")
     }
 
-    private struct Saved: Codable { var controls: [TouchControl]; var visible: Bool }
+    private struct Saved: Codable { var controls: [TouchControl]; var visible: Bool; var opacity: Double? }
 
     private init() {
         loading = true
@@ -2895,13 +2976,14 @@ final class TouchControlsModel: ObservableObject {
            let s = try? JSONDecoder().decode(Saved.self, from: d) {
             controls = s.controls
             visible  = s.visible
+            opacity  = s.opacity ?? 1.0
         }
         loading = false
     }
 
     private func save() {
         guard !loading else { return }
-        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible))
+        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible, opacity: opacity))
         else { return }
         try? d.write(to: Self.url, options: .atomic)
     }
@@ -2921,10 +3003,10 @@ final class TouchControlsModel: ObservableObject {
     /// touch in the window. Nothing responded, and edit mode — whose branch
     /// captured everything — could never be entered to mask it.
     func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
-        // Top bar: two 44pt buttons 10pt apart in play mode, centred, 10pt down.
-        // Padded generously; a few points of slop costs nothing and a missed tap
-        // costs a build.
-        let barW: CGFloat = 2 * 44 + 10
+        // Top bar: three 44pt buttons 10pt apart in play mode (controls, edit,
+        // session), centred, 10pt down. Padded generously; a few points of slop
+        // costs nothing and a missed tap costs a build.
+        let barW: CGFloat = 3 * 44 + 2 * 10
         if CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
                   width: barW + 20, height: 68).contains(p) { return true }
         guard visible else { return false }
@@ -2949,7 +3031,7 @@ final class ControlsWindow: UIWindow {
         let m = TouchControlsModel.shared
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
-        if m.editing { return super.hitTest(point, with: event) }
+        if m.editing || m.sessionPanel { return super.hitTest(point, with: event) }
         // Portrait draws nothing here, so it must consume nothing.
         guard bounds.width > bounds.height else { return nil }
         guard m.hitsInteractive(point, in: bounds) else { return nil }
@@ -2997,13 +3079,27 @@ struct TouchControlsOverlay: View {
             ZStack(alignment: .top) {
                 if landscape {
                     if m.visible || m.editing {
-                        ForEach(m.controls) { c in
-                            TouchControlButton(control: c, screen: geo.size)
+                        ZStack {
+                            ForEach(m.controls) { c in
+                                TouchControlButton(control: c, screen: geo.size)
+                            }
                         }
+                        .opacity(m.editing ? 1.0 : m.opacity)
                     }
                     topBar
                     if m.editing, let i = m.index(of: m.selected) {
                         MappingPanel(control: m.controls[i], screen: geo.size)
+                    }
+                    if m.sessionPanel {
+                        Color.black.opacity(0.35)
+                            .contentShape(Rectangle())
+                            .onTapGesture { m.sessionPanel = false }
+                        SessionPanelView(onClose: { m.sessionPanel = false })
+                            .frame(width: min(440, geo.size.width - 40),
+                                   height: min(560, geo.size.height - 24))
+                            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                            .shadow(radius: 24)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
             }
@@ -3032,6 +3128,9 @@ struct TouchControlsOverlay: View {
             glassButton(m.editing ? "checkmark" : "pencil") {
                 m.editing.toggle()
                 if !m.editing { m.selected = nil }
+            }
+            if !m.editing {
+                glassButton("line.3.horizontal") { m.sessionPanel = true }
             }
             if m.editing {
                 glassButton("plus") {

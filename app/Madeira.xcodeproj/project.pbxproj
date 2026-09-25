@@ -57,6 +57,7 @@
 		A1000203 /* GameLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000203 /* GameLibrary.swift */; };
 		A1000204 /* GameControllerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000204 /* GameControllerManager.swift */; };
 		A1000205 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000205 /* HomeView.swift */; };
+		A1000206 /* SessionUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000206 /* SessionUI.swift */; };
 		A1000202 /* FPSOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000202 /* FPSOverlay.swift */; };
 		A1000243 /* GamepadInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000243 /* GamepadInput.swift */; };
 		A1000244 /* Winios/WiniosGamepad.c in Sources */ = {isa = PBXBuildFile; fileRef = A2000244 /* Winios/WiniosGamepad.c */; };
@@ -125,6 +126,7 @@
 		A2000203 /* GameLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameLibrary.swift; sourceTree = "<group>"; };
 		A2000204 /* GameControllerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameControllerManager.swift; sourceTree = "<group>"; };
 		A2000205 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		A2000206 /* SessionUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionUI.swift; sourceTree = "<group>"; };
 		A2000202 /* FPSOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FPSOverlay.swift; sourceTree = "<group>"; };
 		A2000243 /* GamepadInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GamepadInput.swift"; sourceTree = "<group>"; };
 		A2000244 /* Winios/WiniosGamepad.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = "Winios/WiniosGamepad.c"; sourceTree = "<group>"; };
@@ -189,6 +191,7 @@
 				A2000203 /* GameLibrary.swift */,
 				A2000204 /* GameControllerManager.swift */,
 				A2000205 /* HomeView.swift */,
+				A2000206 /* SessionUI.swift */,
 				A2000004 /* JITAllocator.c */,
 				A2000005 /* JITAllocator.h */,
 				A200000B /* FEXBridge.mm */,
@@ -368,6 +371,7 @@
 				A1000203 /* GameLibrary.swift in Sources */,
 				A1000204 /* GameControllerManager.swift in Sources */,
 				A1000205 /* HomeView.swift in Sources */,
+				A1000206 /* SessionUI.swift in Sources */,
 				A1000004 /* JITAllocator.c in Sources */,
 				A1000005 /* EntitlementChecker.swift in Sources */,
 				A1000006 /* FEXBridge.mm in Sources */,

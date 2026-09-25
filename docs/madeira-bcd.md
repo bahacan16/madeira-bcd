@@ -59,6 +59,17 @@ step says so when it becomes a no-op:
   mapping is opt-in while XInput is on (Controllers sheet, "Also send keyboard
   and mouse"), so a game does not get every press twice; detection and the
   live input tester work either way.
+- `SessionUI.swift`, modelled on upstream's unreleased new UI (Madeira
+  Discord), without its Steam sign-in and downloads: a launch screen with the
+  game's cover until its first frame (or 8s after a window appears, for
+  programs that never present), the game alone on screen, and a Session panel
+  -- touch controls on/off and opacity, edit controls, keyboard, FPS limit,
+  display fit (4:3 or stretch), performance overlay, ECO, pointer mode and
+  sensitivities, live log. Landscape opens it from the touch-controls bar
+  (the game surface is a window-level view, so it lives on that window);
+  portrait from the bar under the game. A game started from the library no
+  longer shows the developer view, which stays under Settings > Developer
+  tools.
 - Game Mode (`GCSupportsGameMode`, games category) in Info.plist.
 - Settings > Experimental > Storage-backed memory writes `swap-mb = 3072` to
   `Documents/madeira.cfg`, which turns on upstream's file-backed guest data tier
