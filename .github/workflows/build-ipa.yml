@@ -847,6 +847,13 @@ jobs:
         continue-on-error: true
         run: bash tools/build-madeira-d3d12-dll.sh
 
+      # DXMT's NVAPI (research/dxmt/src/nvapi), which its DXMT build leaves
+      # out; answers games that want a known vendor's driver version once the
+      # library's "Report an NVIDIA GPU" switch sets DXMT_ENABLE_NVEXT=1.
+      - name: Build DXMT nvapi64.dll
+        continue-on-error: true
+        run: bash tools/build-dxmt-nvapi.sh
+
       # Upstream ships no faultrep.dll; games that import it (Ghost of
       # Tsushima) fail in the loader with STATUS_DLL_NOT_FOUND.
       - name: Build faultrep.dll

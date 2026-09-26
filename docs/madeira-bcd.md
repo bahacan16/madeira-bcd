@@ -117,6 +117,15 @@ already did.
   VirtualQuery, never VirtualProtect: on a pool-copied image the protect path
   syncs the PE side into the running copy and would wipe the DLL's state. A local build reproduces upstream's
   `msvcr120.dll` section for section. About +11 MB compressed.
+- `nvapi64.dll` (`tools/build-dxmt-nvapi.sh`): DXMT's own NVAPI
+  (`research/dxmt/src/nvapi`), which its build leaves out, compiled for
+  arm64ec against import libraries of the shipped `winemetal.dll`/`dxgi.dll`.
+  The library's per-game "Report an NVIDIA GPU" switch sets
+  `DXMT_ENABLE_NVEXT=1`: DXGI then reports vendor 0x10DE and NVAPI answers
+  `NvAPI_Initialize` and the driver version (999.99). Ghost of Tsushima, a
+  Nixxes port, otherwise creates its D3D12 device, finds an Apple (0x106B)
+  adapter it has no driver query for, logs "Failed to get GPU Driver Info" and
+  says no graphics card is installed.
 - `vulkan-1.dll` (and d3d10/avifil32 if the build above failed)
   (`tools/build-stub-dlls.py`):
   stand-ins generated from Wine's `.spec` export lists, for games that import

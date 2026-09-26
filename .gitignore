@@ -153,3 +153,6 @@ app/Madeira/arm64ec-windows/d3d10.dll
 app/Madeira/arm64ec-windows/avifil32.dll
 app/Madeira/arm64ec-windows/vulkan-1.dll
 app/Madeira/arm64ec-windows/xtajit64-avx.dll
+# tools/build-dxmt-nvapi.sh output, built in CI
+build/dxmt-nvapi/
+app/Madeira/arm64ec-windows/nvapi64.dll

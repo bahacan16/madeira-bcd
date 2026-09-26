@@ -43,6 +43,9 @@ struct LaunchRequest {
     /// Keep Wine's VC++ runtime instead of overlaying Microsoft's x86_64 one
     /// (WineProcessBridge.m, MADEIRA_WINE_VCRT).
     var wineVCRT = false
+    /// Present the GPU as NVIDIA and answer NVAPI (DXMT's nvapi64.dll,
+    /// DXMT_ENABLE_NVEXT), for games that insist on a known vendor's driver.
+    var nvidia = false
 
     func apply() {
         ExperimentalSettings.exportToEnvironment()
@@ -57,6 +60,7 @@ struct LaunchRequest {
         }
         if avx { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
         if wineVCRT { setenv("MADEIRA_WINE_VCRT", "1", 1) } else { unsetenv("MADEIRA_WINE_VCRT") }
+        if nvidia { setenv("DXMT_ENABLE_NVEXT", "1", 1) } else { unsetenv("DXMT_ENABLE_NVEXT") }
         LogStore.shared.startSessionLog(program: programName)
     }
 
@@ -189,6 +193,7 @@ enum LibraryPrefs {
     private static let desktopKey = "madeira.library.inDesktop"
     private static let avxKey = "madeira.library.avx"
     private static let vcrtKey = "madeira.library.wineVCRT"
+    private static let nvidiaKey = "madeira.library.nvidia"
 
     private static func dict<T>(_ key: String) -> [String: T] {
         (UserDefaults.standard.dictionary(forKey: key) as? [String: T]) ?? [:]
@@ -217,6 +222,9 @@ enum LibraryPrefs {
 
     static func wineVCRT(_ windowsPath: String) -> Bool { (dict(vcrtKey) as [String: Bool])[windowsPath] ?? false }
     static func setWineVCRT(_ on: Bool, for windowsPath: String) { store(on ? true : nil, vcrtKey, windowsPath) }
+
+    static func nvidia(_ windowsPath: String) -> Bool { (dict(nvidiaKey) as [String: Bool])[windowsPath] ?? false }
+    static func setNvidia(_ on: Bool, for windowsPath: String) { store(on ? true : nil, nvidiaKey, windowsPath) }
 }
 
 /// Reads the PE header's Machine field. Two small reads per file, off the main
@@ -647,6 +655,7 @@ struct HomeView: View {
         }
         request.avx = LibraryPrefs.avx(exe.windowsPath)
         request.wineVCRT = LibraryPrefs.wineVCRT(exe.windowsPath)
+        request.nvidia = LibraryPrefs.nvidia(exe.windowsPath)
         LibraryPrefs.markPlayed(game.title)
         start(request)
     }
@@ -831,6 +840,7 @@ struct GameSettingsSheet: View {
     @State private var inDesktop: Bool
     @State private var avx: Bool
     @State private var wineVCRT: Bool
+    @State private var nvidia: Bool
     @State private var photo: PhotosPickerItem?
     @State private var tick = 0
 
@@ -845,6 +855,7 @@ struct GameSettingsSheet: View {
         _inDesktop = State(initialValue: LibraryPrefs.inDesktop(exe.windowsPath))
         _avx = State(initialValue: LibraryPrefs.avx(exe.windowsPath))
         _wineVCRT = State(initialValue: LibraryPrefs.wineVCRT(exe.windowsPath))
+        _nvidia = State(initialValue: LibraryPrefs.nvidia(exe.windowsPath))
     }
 
     /// What the exe will get: the typed arguments, else the suggestion.
@@ -938,6 +949,7 @@ struct GameSettingsSheet: View {
                     Toggle("Run inside the Wine desktop", isOn: $inDesktop)
                     Toggle("AVX / AVX2", isOn: $avx)
                     Toggle("Wine's C++ runtime", isOn: $wineVCRT)
+                    Toggle("Report an NVIDIA GPU", isOn: $nvidia)
                 } header: {
                     Text("Launch options")
                 } footer: {
@@ -945,7 +957,9 @@ struct GameSettingsSheet: View {
                          + "quits at start with \"illegal instruction\" (c000001d) in the log: it was built "
                          + "for AVX CPUs. Emulated AVX is slower, so leave it off otherwise. Wine's C++ runtime "
                          + "replaces Microsoft's concrt140/msvcp140_* for a game that crashes right after "
-                         + "loading them.")
+                         + "loading them. Report an NVIDIA GPU makes DXGI name NVIDIA as the vendor and answers "
+                         + "NVAPI, for games that stop with \"no graphics card\" or \"failed to get GPU driver "
+                         + "info\" (Ghost of Tsushima).")
                 }
 
                 Section {
@@ -994,6 +1008,7 @@ struct GameSettingsSheet: View {
                 inDesktop = LibraryPrefs.inDesktop(newPath)
                 avx = LibraryPrefs.avx(newPath)
                 wineVCRT = LibraryPrefs.wineVCRT(newPath)
+                nvidia = LibraryPrefs.nvidia(newPath)
             }
             .onChange(of: photo) { _, item in
                 guard let item else { return }
@@ -1017,6 +1032,7 @@ struct GameSettingsSheet: View {
         LibraryPrefs.setInDesktop(inDesktop, for: exePath)
         LibraryPrefs.setAVX(avx, for: exePath)
         LibraryPrefs.setWineVCRT(wineVCRT, for: exePath)
+        LibraryPrefs.setNvidia(nvidia, for: exePath)
     }
 }
 
