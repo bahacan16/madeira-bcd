@@ -41,6 +41,8 @@ compile_one() {
         SUCCEEDED=$((SUCCEEDED + 1))
     else
         echo "FAILED"
+        # madeira-bcd: the reason, not just the name (CI keeps no obj/).
+        grep -m 6 -A 3 "error:" "$OBJ_DIR/$name.err" | sed 's/^/      /'
         FAILED=$((FAILED + 1))
         FAILED_FILES="$FAILED_FILES $name"
     fi
