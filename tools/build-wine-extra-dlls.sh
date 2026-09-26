@@ -44,7 +44,10 @@ if [ ! -f "$B/Makefile" ]; then
           --without-freetype --without-gnutls ${TOOLS:+--with-wine-tools="$TOOLS"} ) > "$B.cfg.log" 2>&1 \
         || { tail -20 "$B.cfg.log"; echo "::error::wine arm64ec configure failed"; exit 1; }
 fi
+# msvcr*: mirror the data exports into the PE mapping (see the script).
+python3 "$R/tools/patch-wine-msvcrt-datasync.py" "$R/wine/dlls/msvcrt/main.c"
 make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
+git -C "$R/wine" checkout -- dlls/msvcrt/main.c
 built=0; failed=""
 for d in $todo; do
     f="$B/dlls/$d/arm64ec-windows/$d.dll"

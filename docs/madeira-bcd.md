@@ -69,7 +69,12 @@ step says so when it becomes a no-op:
   X3DAudio / XAPOFX, built from the wine submodule for arm64ec in CI the way
   upstream configures `wine/build-arm64ec`, stripped and padded like the
   shipped builtins, never replacing one upstream ships. Crysis's
-  `Crysis64.exe` needs msvcr80. A local build reproduces upstream's
+  `Crysis64.exe` needs msvcr80. The msvcr* builds carry
+  `tools/patch-wine-msvcrt-datasync.py`: an ARM64EC DLL runs from its JIT-pool
+  copy, so its live globals are the copy's and an importer's data imports
+  (bound to the PE mapping) read a stale snapshot -- Crysis64's CRT startup
+  read a NULL `_acmdln`. At the end of process attach the DLL copies its
+  writable sections over the PE mapping's. A local build reproduces upstream's
   `msvcr120.dll` section for section. About +11 MB compressed.
 - `vulkan-1.dll` (and d3d10/avifil32 if the build above failed)
   (`tools/build-stub-dlls.py`):
