@@ -57,6 +57,17 @@ variant from the pinned source and checks it against upstream's pre-merge
 module (fetched by commit). The two conflicts with this fork were the same
 TEB retarget fix (125hz's version kept) and the `[xp]` `pgw` placeholder.
 
+The series' unix side needs 125hz's companion source changes, so the `wine`
+and `research/dxmt` submodules point at 125hz's public forks:
+`125hz/wine` `pr/wow64-core` (c9c186e, upstream's wine pin 723d1bf plus 10
+commits: `ProcessWineIosWowGuestBase`, the wow64 thunks, fastsync) and
+`125hz/dxmt` `pr/d3d9` (462a77e, upstream's dxmt pin ca8a251 plus 18 commits:
+the D3D9 frontend and its unix-call slots 145-150, which the series'
+`winemetal.dll` calls). Without them the ntdll unix side and DXMT's unix half
+do not build (build 154), and a D3D11 title would call unix slots the old
+`winemetal_unix.c` does not have. When upstream moves either pin, the sync
+has to move to a 125hz commit that contains upstream's, or drop the series.
+
 ## Runtime
 
 - TEB retarget pass (`build/ntdll-unix/virtual_ios.c`, pass 0 of the x18
