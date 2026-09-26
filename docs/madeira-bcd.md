@@ -99,6 +99,13 @@ step says so when it becomes a no-op:
   config.h does not define it, and without the flush every x64 guest died in a
   FEX JIT block tail (fault PCs all 64-byte aligned).
 
+- User folders (`WineProcessBridge.m`, after upstream's ml719): Wine's profile
+  is named after the unix user (`mobile`), not the template's `madeira`, so
+  `C:\users\mobile\Documents` and friends can be missing; Ghost of Tsushima
+  stops with "Unable to create the game's save folder". Documents, Desktop,
+  Downloads, Music, Pictures, Videos, Saved Games and AppData\{Local,
+  LocalLow,Roaming} are made real directories for both names at launch.
+
 ## App
 
 - `HomeView.swift`: a library-first home screen (games with covers and

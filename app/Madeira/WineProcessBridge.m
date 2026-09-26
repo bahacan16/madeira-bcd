@@ -19,6 +19,7 @@
 #include <dirent.h>
 #include "../../build/madeira_cfg.h"   /* ml1095: one config file */
 #include <sys/stat.h>
+#include <pwd.h>
 #include <limits.h>
 #include <string.h>
 
@@ -847,6 +848,43 @@ static void *wine_process_thread(void *arg) {
                 }
                 dprintf(STDERR_FILENO, "[shell-dir] ml719 %d repaired, %d already good\n",
                         repaired, already);
+            }
+
+            /* madeira-bcd: the same folders for the user Wine actually runs as.
+             * ml719 covers C:\users\madeira (the template's user), but Wine
+             * names the profile after the unix user -- "mobile" on iOS -- so
+             * %USERPROFILE% is C:\users\mobile, where Documents may be
+             * missing or a dangling link. Ghost of Tsushima then stops with
+             * "Unable to create the game's save folder" before touching the
+             * filesystem. Make every folder games write to a real directory
+             * (Saved Games and AppData too), for both names. */
+            {
+                NSMutableOrderedSet *names = [NSMutableOrderedSet orderedSetWithObject:@"madeira"];
+                struct passwd *pw = getpwuid(getuid());
+                if (pw && pw->pw_name && pw->pw_name[0]) [names addObject:@(pw->pw_name)];
+                const char *envUser = getenv("USER");
+                if (envUser && envUser[0]) [names addObject:@(envUser)];
+                NSArray *rels = @[ @"Documents", @"Desktop", @"Downloads", @"Music", @"Pictures",
+                                   @"Videos", @"Saved Games", @"AppData/Local", @"AppData/LocalLow",
+                                   @"AppData/Roaming" ];
+                int made = 0;
+                for (NSString *name in names) {
+                    NSString *home = [prefix stringByAppendingPathComponent:
+                        [@"drive_c/users" stringByAppendingPathComponent:name]];
+                    for (NSString *rel in rels) {
+                        NSString *path = [home stringByAppendingPathComponent:rel];
+                        const char *cp = path.fileSystemRepresentation;
+                        struct stat lst, tgt;
+                        if (lstat(cp, &lst) == 0) {
+                            if (!S_ISLNK(lst.st_mode) || stat(cp, &tgt) == 0) continue;
+                            unlink(cp);                       /* dangling link */
+                        }
+                        if ([fm createDirectoryAtPath:path withIntermediateDirectories:YES
+                                           attributes:nil error:nil]) made++;
+                    }
+                }
+                dprintf(STDERR_FILENO, "[shell-dir] user folders for %s: %d created\n",
+                        [[names.array componentsJoinedByString:@", "] UTF8String], made);
             }
 
             // Layer Microsoft's real VC++ Runtime DLLs ON TOP of the ARM64EC
