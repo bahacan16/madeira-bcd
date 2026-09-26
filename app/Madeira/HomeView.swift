@@ -866,6 +866,31 @@ struct GameSettingsSheet: View {
         _wineVCRT = State(initialValue: LibraryPrefs.wineVCRT(exe.windowsPath))
     }
 
+    /// What the exe will get: the typed arguments, else the suggestion.
+    private var effectiveArgs: String {
+        let typed = args.trimmingCharacters(in: .whitespaces)
+        return typed.isEmpty ? GameArguments.suggestion(for: selected) : typed
+    }
+
+    private func hasFlag(_ flag: String) -> Bool {
+        args.split(separator: " ").contains { $0.caseInsensitiveCompare(flag) == .orderedSame }
+    }
+
+    /// Adds the flag, or takes it out when it is already there. The DX
+    /// choices exclude each other.
+    private func toggleFlag(_ flag: String) {
+        var parts = args.split(separator: " ").map(String.init)
+        if hasFlag(flag) {
+            parts.removeAll { $0.caseInsensitiveCompare(flag) == .orderedSame }
+        } else {
+            if flag.hasPrefix("-dx") { parts.removeAll { $0.lowercased().hasPrefix("-dx") } }
+            if flag == "-windowed" { parts.removeAll { $0.lowercased() == "-fullscreen" } }
+            if flag == "-fullscreen" { parts.removeAll { $0.lowercased() == "-windowed" } }
+            parts.append(flag)
+        }
+        args = parts.joined(separator: " ")
+    }
+
     private var selected: GuestExecutable {
         game.executables.first(where: { $0.windowsPath == exePath }) ?? game.primary
     }
@@ -874,21 +899,35 @@ struct GameSettingsSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    CoverArt(title: game.title, tick: tick)
-                        .frame(height: 200)
-                        .listRowInsets(EdgeInsets())
-                    PhotosPicker(selection: $photo, matching: .images) {
-                        Label("Choose cover image", systemImage: "photo.on.rectangle")
-                    }
-                    if CoverStore.hasCover(game.title) {
-                        Button(role: .destructive) {
-                            CoverStore.remove(game.title)
-                            tick += 1
-                            onCoverChanged()
-                        } label: {
-                            Label("Remove cover image", systemImage: "trash")
+                    TextField("Arguments", text: $args,
+                              prompt: Text(GameArguments.suggestion(for: selected).isEmpty
+                                           ? "none"
+                                           : GameArguments.suggestion(for: selected)),
+                              axis: .vertical)
+                        .font(.body.monospaced())
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .lineLimit(1...4)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(["-dx11", "-dx10", "-dx9", "-dx12", "-windowed", "-fullscreen", "-nosplash"], id: \.self) { flag in
+                                Button(flag) { toggleFlag(flag) }
+                                    .buttonStyle(.bordered)
+                                    .tint(hasFlag(flag) ? Color.accentColor : Color.gray)
+                                    .font(.caption.monospaced())
+                            }
                         }
                     }
+                    Text(selected.fileName + " " + effectiveArgs)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                } header: {
+                    Text("Arguments")
+                } footer: {
+                    Text("Passed to the exe on every launch; the line under the chips is what will run. Empty uses "
+                         + "the suggestion shown. Unreal Engine titles default to DX12 -- try -dx11. Crysis picks "
+                         + "its renderer with -dx10 / -dx9.")
                 }
 
                 Section {
@@ -915,26 +954,35 @@ struct GameSettingsSheet: View {
                 }
 
                 Section {
-                    TextField("Arguments", text: $args,
-                              prompt: Text(GameArguments.suggestion(for: selected).isEmpty
-                                           ? "none"
-                                           : GameArguments.suggestion(for: selected)))
-                        .font(.body.monospaced())
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
                     Toggle("Run inside the Wine desktop", isOn: $inDesktop)
                     Toggle("AVX / AVX2", isOn: $avx)
                     Toggle("Wine's C++ runtime", isOn: $wineVCRT)
                 } header: {
                     Text("Launch options")
                 } footer: {
-                    Text("Empty arguments use the suggestion shown. Unreal Engine titles default to DX12, "
-                         + "which Madeira does not implement -- they need -dx11. The Wine desktop gives a "
-                         + "program a window manager; most games do not need one. Turn on AVX when a game "
+                    Text("The Wine desktop gives a program a window manager; most games do not need one. Turn on AVX when a game "
                          + "quits at start with \"illegal instruction\" (c000001d) in the log: it was built "
                          + "for AVX CPUs. Emulated AVX is slower, so leave it off otherwise. Wine's C++ runtime "
                          + "replaces Microsoft's concrt140/msvcp140_* for a game that crashes right after "
                          + "loading them.")
+                }
+
+                Section {
+                    CoverArt(title: game.title, tick: tick)
+                        .frame(height: 200)
+                        .listRowInsets(EdgeInsets())
+                    PhotosPicker(selection: $photo, matching: .images) {
+                        Label("Choose cover image", systemImage: "photo.on.rectangle")
+                    }
+                    if CoverStore.hasCover(game.title) {
+                        Button(role: .destructive) {
+                            CoverStore.remove(game.title)
+                            tick += 1
+                            onCoverChanged()
+                        } label: {
+                            Label("Remove cover image", systemImage: "trash")
+                        }
+                    }
                 }
 
                 Section {
