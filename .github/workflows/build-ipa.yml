@@ -807,6 +807,12 @@ jobs:
         continue-on-error: true
         run: bash tools/build-madeira-d3d12-dll.sh
 
+      # Upstream ships no faultrep.dll; games that import it (Ghost of
+      # Tsushima) fail in the loader with STATUS_DLL_NOT_FOUND.
+      - name: Build faultrep.dll
+        continue-on-error: true
+        run: bash tools/build-faultrep-dll.sh
+
       # The PE-side DXMT DLLs (d3d11/dxgi/winemetal/d3d10core) are committed
       # under app/Madeira/aarch64-windows/ despite the README calling them
       # gitignored, so there is nothing to build here -- just confirm they

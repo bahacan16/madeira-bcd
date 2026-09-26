@@ -35,6 +35,15 @@ struct GuestExecutable: Identifiable, Hashable {
 
     var fileName: String { url.lastPathComponent }
 
+    /// The folder holding the exe, as the guest names it without the drive:
+    /// "Crysis\Bin64". What tells two same-named exes apart on a card.
+    var folderDescription: String {
+        var parts = windowsPath.split(separator: "\\").map(String.init)
+        if parts.first?.hasSuffix(":") == true { parts.removeFirst() }
+        if !parts.isEmpty { parts.removeLast() }
+        return parts.isEmpty ? "C:\\" : parts.joined(separator: "\\")
+    }
+
     var sizeDescription: String {
         let mb = Double(sizeBytes) / (1024 * 1024)
         if mb < 1 { return String(format: "%.0f KB", Double(sizeBytes) / 1024) }
@@ -46,9 +55,25 @@ struct GuestExecutable: Identifiable, Hashable {
 
 enum GameLibrary {
 
-    /// Directories under drive_c that are Wine's, not the user's.
+    /// Directories under drive_c that are Wine's, not the user's. users is
+    /// walked (people copy games to the Desktop or Public), minus its caches.
     private static let skippedRoots: Set<String> = [
-        "windows", "users", "proc", "programdata",
+        "windows", "proc", "programdata",
+    ]
+
+    /// Never games at any depth: per-user caches and temp trees are large and
+    /// full of helper exes.
+    private static let skippedAnywhere: Set<String> = [
+        "appdata", "temp", "$recycle.bin", "_commonredist", "commonredist", "redist",
+        "directx", "__installer", "support",
+    ]
+
+    /// Folders that hold a game's binaries rather than a game. A container
+    /// folder whose exes all sit under different subfolders is split into one
+    /// title per subfolder -- unless those subfolders are one of these.
+    private static let binaryFolders: Set<String> = [
+        "bin", "bin32", "bin64", "bin_x64", "bin_x86", "binaries", "x64", "x86", "win64", "win32",
+        "game", "engine", "system", "program", "exe", "launcher", "retail", "shipping",
     ]
 
     /// Launchers and tooling that ship beside a game and are never the thing you want.
@@ -57,6 +82,10 @@ enum GameLibrary {
         "vcredist_x64.exe", "vcredist_x86.exe", "dxwebsetup.exe",
         "dotnetfx.exe", "oalinst.exe", "crashreporter.exe",
         "crashhandler.exe", "ueprereqsetup_x64.exe",
+        "vc_redist.x64.exe", "vc_redist.x86.exe", "unitycrashhandler64.exe",
+        "unitycrashhandler32.exe", "crashreportclient.exe", "crashpad_handler.exe",
+        "dxsetup.exe", "installermessage.exe", "easyanticheat_setup.exe",
+        "easyanticheat_eos_setup.exe", "cleanup.exe", "touchup.exe",
     ]
 
     static var driveC: URL? {
@@ -69,7 +98,7 @@ enum GameLibrary {
     ///
     /// Depth is bounded because a game tree can be arbitrarily deep and a scan that
     /// walks all of it on the main thread would stall the UI on first open.
-    static func scan(maxDepth: Int = 6) -> [GuestExecutable] {
+    static func scan(maxDepth: Int = 12) -> [GuestExecutable] {
         guard let root = driveC else { return [] }
         var found: [GuestExecutable] = []
         let fm = FileManager.default
@@ -85,7 +114,9 @@ enum GameLibrary {
             for entry in entries {
                 let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
                 if values?.isDirectory == true {
-                    if depth == 0 && skippedRoots.contains(entry.lastPathComponent.lowercased()) { continue }
+                    let lower = entry.lastPathComponent.lowercased()
+                    if depth == 0 && skippedRoots.contains(lower) { continue }
+                    if skippedAnywhere.contains(lower) { continue }
                     // The first directory below drive_c (or below Program Files) names the title.
                     walk(entry, depth: depth + 1, title: title ?? titleFor(entry))
                 } else if entry.pathExtension.lowercased() == "exe" {
@@ -102,6 +133,7 @@ enum GameLibrary {
         }
 
         walk(root, depth: 0, title: nil)
+        found = splitContainers(found, root: root)
 
         // Biggest first: a game's shipping binary dwarfs the launchers next to it,
         // so this puts the thing you actually want at the top without guessing.
@@ -109,6 +141,45 @@ enum GameLibrary {
             $0.title == $1.title ? $0.sizeBytes > $1.sizeBytes
                                  : $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
         }
+    }
+
+    /// "C:\\Games\\GTA\\gta.exe" and "C:\\Games\\Crysis\\Bin64\\Crysis.exe" are two games,
+    /// not one called Games. A title folder with no exe of its own whose exes
+    /// sit in two or more subfolders is a container: each subfolder becomes a
+    /// title. Repeats so a container inside a container splits too. Subfolders
+    /// named like binary directories (Bin32/Bin64, Engine) keep the title whole.
+    private static func splitContainers(_ exes: [GuestExecutable], root: URL) -> [GuestExecutable] {
+        let rootPath = root.standardizedFileURL.path
+        // Components of each exe's directory, from the title folder down.
+        func below(_ exe: GuestExecutable, _ title: String) -> [String]? {
+            let rel = exe.url.deletingLastPathComponent().standardizedFileURL.path
+            guard rel.hasPrefix(rootPath + "/") else { return nil }
+            let comps = rel.dropFirst(rootPath.count + 1).split(separator: "/").map(String.init)
+            guard let i = comps.firstIndex(of: title) else { return nil }
+            return Array(comps[(i + 1)...])
+        }
+        var current = exes
+        for _ in 0..<5 {
+            var changed = false
+            let byTitle = Dictionary(grouping: current, by: { $0.title })
+            var next: [GuestExecutable] = []
+            for (title, group) in byTitle {
+                let subs = group.map { below($0, title) }
+                let firsts = Set(subs.compactMap { $0?.first?.lowercased() })
+                let isContainer = !subs.contains { $0 == nil || $0!.isEmpty }
+                    && firsts.count >= 2
+                    && firsts.isDisjoint(with: binaryFolders)
+                if !isContainer { next += group; continue }
+                changed = true
+                for (exe, sub) in zip(group, subs) {
+                    next.append(GuestExecutable(windowsPath: exe.windowsPath, url: exe.url,
+                                                title: sub?.first ?? title, sizeBytes: exe.sizeBytes))
+                }
+            }
+            current = next
+            if !changed { break }
+        }
+        return current
     }
 
     /// The folder a person would name: the one under Program Files, else the one

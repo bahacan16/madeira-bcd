@@ -121,8 +121,10 @@ struct RootView: View {
 struct LibraryGame: Identifiable {
     let title: String
     let executables: [GuestExecutable]
+    /// Set when one title is shown as several cards (one per exe).
+    var key: String? = nil
 
-    var id: String { title }
+    var id: String { key ?? title }
 
     /// The exe the card launches: the one chosen in settings, else the biggest.
     /// The biggest is a good default because a game's shipping binary dwarfs
@@ -304,12 +306,24 @@ struct HomeView: View {
     @State private var editing: LibraryGame?
     @State private var showSettings = false
     @State private var coverTick = 0
+    @AppStorage("madeira.library.everyExe") private var everyExe = false
 
     private let columns = [GridItem(.adaptive(minimum: 148), spacing: 14)]
 
+    /// One card per title, or one per exe when every exe is asked for.
+    private var displayed: [LibraryGame] {
+        guard everyExe else { return games }
+        return games.flatMap { g in
+            g.executables.map { LibraryGame(title: g.title, executables: [$0], key: $0.windowsPath) }
+        }
+    }
+
     private var filtered: [LibraryGame] {
         let q = search.trimmingCharacters(in: .whitespaces)
-        return q.isEmpty ? games : games.filter { $0.title.localizedCaseInsensitiveContains(q) }
+        return q.isEmpty ? displayed : displayed.filter { game in
+            game.title.localizedCaseInsensitiveContains(q)
+                || game.executables.contains { exe in exe.windowsPath.localizedCaseInsensitiveContains(q) }
+        }
     }
 
     private var recent: LibraryGame? {
@@ -488,7 +502,13 @@ struct HomeView: View {
 
     private var librarySection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader(title: "Library", detail: scanning ? "Scanning C:\\…" : nil)
+            SectionHeader(title: "Library", detail: scanning ? "Scanning C:\\…"
+                          : scannedOnce ? "\(games.reduce(0) { $0 + $1.executables.count }) exe" : nil)
+            Picker("Show", selection: $everyExe) {
+                Text("Games").tag(false)
+                Text("Every .exe").tag(true)
+            }
+            .pickerStyle(.segmented)
             if filtered.isEmpty {
                 emptyLibrary
             } else {
@@ -764,6 +784,18 @@ private struct GameCard: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+            HStack(spacing: 4) {
+                Image(systemName: "folder")
+                Text(game.primary.folderDescription)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                if game.executables.count > 1 {
+                    Spacer(minLength: 2)
+                    Text("\(game.executables.count) exe")
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
         }
     }
 }

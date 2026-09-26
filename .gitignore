@@ -146,3 +146,5 @@ research/madeira-d3d12/tests/offline/sm51/
 # Metal Shader Converter headers extracted by CI from the msc-private release;
 # staged per build, never committed.
 build/madeira-d3d12/msc-include/
+build/faultrep/out/
+app/Madeira/arm64ec-windows/faultrep.dll
