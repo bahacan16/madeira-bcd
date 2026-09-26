@@ -44,8 +44,10 @@ step says so when it becomes a no-op:
 
 ## Runtime
 
-- `xtajit64.dll` (FEX's ARM64EC module) is rebuilt by
-  `tools/build-xtajit64.sh` with `tools/patch-fex-ios-avx.py`: the iOS path of
+- `xtajit64-avx.dll`: FEX's ARM64EC module rebuilt by
+  `tools/build-xtajit64.sh` with `tools/patch-fex-ios-avx.py`, shipped beside
+  upstream's untouched `xtajit64.dll` and linked in as
+  `system32\xtajit64.dll` only for a game with AVX on (WineProcessBridge.m): the iOS path of
   `FetchHostFeatures` never sets `SupportsAVX` and skips the HostFeatures
   override, so titles compiled for AVX (Ghost of Tsushima) die on their first
   VEX instruction (c000001d). `MADEIRA_FEX_AVX=1` turns on FEX's 128-bit AVX

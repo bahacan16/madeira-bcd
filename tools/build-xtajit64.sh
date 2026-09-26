@@ -1,8 +1,9 @@
 #!/bin/bash
-# Rebuild the ARM64EC FEX module (libarm64ecfex.dll, shipped as xtajit64.dll)
-# from the FEX submodule with tools/patch-fex-ios-avx.py applied, so a game can
-# opt in to AVX with MADEIRA_FEX_AVX=1. Without the variable the module behaves
-# exactly like the committed one.
+# Build the ARM64EC FEX module (libarm64ecfex.dll) from the FEX submodule with
+# tools/patch-fex-ios-avx.py applied and ship it as xtajit64-avx.dll, next to
+# upstream's untouched xtajit64.dll. WineProcessBridge.m links it in as
+# system32\xtajit64.dll only for a game whose settings turn AVX on
+# (MADEIRA_FEX_AVX=1); every other game runs upstream's module.
 #
 # build/fex-arm64ec/build.sh does not record everything the committed DLL was
 # built with; the options below reproduce it (same exports and imports, and
@@ -16,6 +17,7 @@ MINGW="${MINGW:-$R/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin}"
 export PATH="$MINGW:$PATH"
 B="${FEX_ARM64EC_BUILD:-$R/FEX/build-arm64ec}"
 SHIP="$R/app/Madeira/arm64ec-windows/xtajit64.dll"
+AVX="$R/app/Madeira/arm64ec-windows/xtajit64-avx.dll"
 CPUF="Source/Windows/Common/CPUFeatures.cpp"
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 
@@ -65,7 +67,7 @@ PY
 echo "=== unpatched rebuild, compared with the committed xtajit64.dll ==="
 build
 if ! diff <(fingerprint "$SHIP") <(fingerprint "$B/Bin/libarm64ecfex.dll"); then
-    echo "::warning::the rebuilt FEX module does not match the committed xtajit64.dll -- keeping the committed one (no AVX opt-in this build)"
+    echo "::warning::the rebuilt FEX module does not match the committed xtajit64.dll -- not shipping an AVX build"
     exit 1
 fi
 echo "  matches the committed module"
@@ -74,5 +76,5 @@ echo "=== with the AVX opt-in ==="
 python3 "$R/tools/patch-fex-ios-avx.py" "$R/FEX/$CPUF"
 build
 git -C FEX checkout -- "$CPUF"
-cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
-echo "::notice::xtajit64.dll rebuilt from FEX $(git -C FEX rev-parse --short HEAD) with the MADEIRA_FEX_AVX opt-in and shipped"
+cp "$B/Bin/libarm64ecfex.dll" "$AVX"
+echo "::notice::xtajit64-avx.dll built from FEX $(git -C FEX rev-parse --short HEAD) with the MADEIRA_FEX_AVX opt-in and shipped (xtajit64.dll stays upstream's)"

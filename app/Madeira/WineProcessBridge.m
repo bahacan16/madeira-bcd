@@ -771,6 +771,29 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
+            /* madeira-bcd: the AVX opt-in lives in a separately built FEX module
+             * (tools/build-xtajit64.sh ships it as xtajit64-avx.dll). Only a
+             * game whose settings ask for AVX gets it; everything else keeps
+             * upstream's xtajit64.dll. Wine loads the emulator as
+             * C:\windows\system32\xtajit64.dll, one of the links made above. */
+            {
+                const char *avxEnv = getenv("MADEIRA_FEX_AVX");
+                if (use_arm64ec && avxEnv && avxEnv[0] == '1') {
+                    NSString *avxDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
+                                        stringByAppendingPathComponent:@"xtajit64-avx.dll"];
+                    if ([fm fileExistsAtPath:avxDll]) {
+                        for (NSString *dir in @[ sys32Dir, [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"] ]) {
+                            NSString *dst = [dir stringByAppendingPathComponent:@"xtajit64.dll"];
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm createSymbolicLinkAtPath:dst withDestinationPath:avxDll error:nil];
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_FEX_AVX=1: xtajit64.dll -> xtajit64-avx.dll\n");
+                    } else {
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_FEX_AVX=1 but this build has no xtajit64-avx.dll -- AVX stays off\n");
+                    }
+                }
+            }
+
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.
              *
