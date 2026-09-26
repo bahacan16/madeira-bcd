@@ -126,6 +126,12 @@ already did.
   Nixxes port, otherwise creates its D3D12 device, finds an Apple (0x106B)
   adapter it has no driver query for, logs "Failed to get GPU Driver Info" and
   says no graphics card is installed.
+  `tools/patch-dxmt-nvapi.py` (applied to a copy at build time) adds the
+  entry points the game then asked for and DXMT lacks
+  (`NvAPI_GetLogicalGPUFromPhysicalGPU`, `NvAPI_GetPhysicalGPUsFromLogicalGPU`,
+  `NvAPI_GetAssociatedNvidiaDisplayHandle`, `NvAPI_GetAssociatedDisplayOutputId`,
+  `NvAPI_GPU_GetPCIIdentifiers`) and logs each queried function once as
+  `[nvapi] query`.
 - `vulkan-1.dll` (and d3d10/avifil32 if the build above failed)
   (`tools/build-stub-dlls.py`):
   stand-ins generated from Wine's `.spec` export lists, for games that import
