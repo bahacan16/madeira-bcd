@@ -96,7 +96,7 @@ for dll, cfg in DLLS.items():
         continue
     dest = os.path.join(ship, dll + ".dll")
     if os.path.exists(dest):
-        print("::warning::%s already exists -- leaving it" % dest)
+        print("::notice::%s.dll is shipped for real -- no stand-in needed" % dll)
         continue
     open(dest, "wb").write(open(dllout, "rb").read())
     print("::notice::%s.dll stand-in built (%d exports) and shipped" % (dll, len(names)))

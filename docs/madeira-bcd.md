@@ -61,7 +61,16 @@ step says so when it becomes a no-op:
   Wine set has none, and games that import it fail in the loader with
   STATUS_DLL_NOT_FOUND. Wine's exports plus `WerReportHang`, all succeeding
   without doing anything.
-- `d3d10.dll`, `avifil32.dll`, `vulkan-1.dll` (`tools/build-stub-dlls.py`):
+- Extra Wine DLLs (`tools/build-wine-extra-dlls.sh`): the VC++ 2002-2012
+  runtimes (msvcr70-110, msvcp60-120, vcomp*), D3DX9 24-42, D3DX10, D3DX11,
+  d3dcompiler_33-46, d3d10, d3d10_1, avifil32, msvfw32, dinput, XAudio2 /
+  X3DAudio / XAPOFX, built from the wine submodule for arm64ec in CI the way
+  upstream configures `wine/build-arm64ec`, stripped and padded like the
+  shipped builtins, never replacing one upstream ships. Crysis's
+  `Crysis64.exe` needs msvcr80. A local build reproduces upstream's
+  `msvcr120.dll` section for section. About +11 MB compressed.
+- `vulkan-1.dll` (and d3d10/avifil32 if the build above failed)
+  (`tools/build-stub-dlls.py`):
   stand-ins generated from Wine's `.spec` export lists, for games that import
   them statically (Crysis Remastered). vulkan-1 reports
   VK_ERROR_INCOMPATIBLE_DRIVER and NULL from the *ProcAddr entry points (Wine's

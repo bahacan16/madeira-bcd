@@ -836,6 +836,28 @@ jobs:
         continue-on-error: true
         run: bash tools/build-faultrep-dll.sh
 
+      # Wine PE DLLs upstream does not ship but games import (VC++ 2002-2012
+      # runtimes, D3DX9/10/11, d3d10, avifil32, XAudio2, dinput), built from
+      # the wine submodule for arm64ec. Never replaces a shipped DLL.
+      - name: Restore wine arm64ec build
+        id: wineeccache
+        uses: actions/cache/restore@v4
+        with:
+          path: wine/build-arm64ec
+          key: wine-arm64ec-${{ steps.winerev.outputs.sha }}-v1
+
+      - name: Build extra Wine DLLs for arm64ec
+        continue-on-error: true
+        run: bash tools/build-wine-extra-dlls.sh "$GITHUB_WORKSPACE/wine/build-native"
+
+      - name: Save wine arm64ec build
+        if: steps.wineeccache.outputs.cache-hit != 'true' && hashFiles('wine/build-arm64ec/dlls/msvcr80/arm64ec-windows/msvcr80.dll') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: wine/build-arm64ec
+          key: wine-arm64ec-${{ steps.winerev.outputs.sha }}-v1
+
       # d3d10/avifil32/vulkan-1 stand-ins from Wine's .spec export lists:
       # Crysis Remastered imports all three and fails to load without them.
       - name: Build stand-in DLLs (d3d10, avifil32, vulkan-1)
