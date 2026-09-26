@@ -106,6 +106,12 @@ step says so when it becomes a no-op:
   Downloads, Music, Pictures, Videos, Saved Games and AppData\{Local,
   LocalLow,Roaming} are made real directories for both names at launch.
 
+- `device_Release` (`research/madeira-d3d12/src/pe/madeira_d3d12.c`) released
+  the device's GPU-timeline `MTLSharedEvent` before the heap reclaim that
+  reads it; a device created and dropped at once (Ghost of Tsushima's adapter
+  probe) crashed in `objc_msgSend` and the game reported "No installed
+  graphics card". The event is now released last.
+
 ## App
 
 - `HomeView.swift`: a library-first home screen (games with covers and

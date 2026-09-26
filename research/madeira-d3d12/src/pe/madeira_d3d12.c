@@ -5329,7 +5329,6 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
             CloseHandle(d->fence_thread); CloseHandle(d->fence_wake);
             d->fence_thread = NULL;
         }
-        if (d->gpu_event) NSObject_release(d->gpu_event);
         {   /* ml1072: the runtime's texture heaps die with the device */
             unsigned k;
             if (g_hp_dev == d) g_hp_dev = NULL;
@@ -5339,6 +5338,11 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
             free(d->theaps); free(d->hret);
             DeleteCriticalSection(&d->heap_lock);
         }
+        /* madeira-bcd: released only after the heap reclaim above, which reads the
+         * GPU timeline through it (mad_gpu_completed). Released first, a device
+         * created and dropped straight away (Ghost of Tsushima's adapter probe)
+         * sent signaledValue to a freed MTLSharedEvent. */
+        if (d->gpu_event) { NSObject_release(d->gpu_event); d->gpu_event = 0; }
         DeleteCriticalSection(&d->fence_lock); DeleteCriticalSection(&d->ring_lock);
         free(d->fence_jobs); free(d->ring_pool); free(d->ring_retired);
         /* These were retained on creation and were previously leaked. */
