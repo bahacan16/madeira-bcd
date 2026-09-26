@@ -8299,6 +8299,57 @@ static void mad_ir_convert_cached(struct madeira_ir_convert_args *a) {
     }
 }
 
+/* madeira-bcd: SHARED METAL LIBRARIES. A game's pipelines repeat the same
+ * shader stage many times: Ghost of Tsushima created 30,370 libraries at New
+ * Game from only ~11,400 distinct converter outputs, and Metal allocates
+ * GPU-side storage per library -- 5.1 GB there, which with everything else
+ * reached iOS's limit (a 1 MB allocation failed and the game stopped itself).
+ * Identical metallib bytes with the same entry now share one MTLLibrary and
+ * MTLFunction; each pipeline takes its own reference, so pso_Release stays
+ * balanced. The table keeps one reference per distinct library. */
+struct mad_libshare { UINT64 k0, k1; obj_handle_t lib, fn; };
+static struct mad_libshare *g_libshare; static SIZE_T g_libshare_cap, g_libshare_n;
+static SRWLOCK g_libshare_lock = SRWLOCK_INIT;
+static volatile LONG g_libshare_hits;
+static struct mad_libshare *mad_libshare_slot(UINT64 k0, UINT64 k1) {
+    SIZE_T i;
+    if (!g_libshare_cap) return NULL;
+    for (i = (SIZE_T)(k0 & (g_libshare_cap - 1));; i = (i + 1) & (g_libshare_cap - 1))
+        if (!g_libshare[i].lib || (g_libshare[i].k0 == k0 && g_libshare[i].k1 == k1)) return &g_libshare[i];
+}
+static int mad_libshare_find(UINT64 k0, UINT64 k1, obj_handle_t *lib, obj_handle_t *fn) {
+    struct mad_libshare *e; int ok = 0;
+    AcquireSRWLockShared(&g_libshare_lock);
+    e = mad_libshare_slot(k0, k1);
+    if (e && e->lib) { NSObject_retain(e->lib); NSObject_retain(e->fn); *lib = e->lib; *fn = e->fn; ok = 1; }
+    ReleaseSRWLockShared(&g_libshare_lock);
+    if (ok) {
+        LONG n = InterlockedIncrement(&g_libshare_hits);
+        if (n == 1 || (n % 2000) == 0)
+            d3d12_log("[madeira-d3d12] shared shader libraries: %ld reuses, %lu distinct\n", n, (unsigned long)g_libshare_n);
+    }
+    return ok;
+}
+static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_t fn) {
+    struct mad_libshare *e;
+    AcquireSRWLockExclusive(&g_libshare_lock);
+    if ((g_libshare_n + 1) * 10 >= g_libshare_cap * 7) {
+        SIZE_T ncap = g_libshare_cap ? g_libshare_cap * 2 : 4096, i, oldcap = g_libshare_cap;
+        struct mad_libshare *old = g_libshare, *nw = calloc(ncap, sizeof *nw);
+        if (nw) {
+            g_libshare = nw; g_libshare_cap = ncap;
+            for (i = 0; i < oldcap; i++) if (old[i].lib) *mad_libshare_slot(old[i].k0, old[i].k1) = old[i];
+            free(old);
+        }
+    }
+    e = mad_libshare_slot(k0, k1);
+    if (e && !e->lib) {
+        NSObject_retain(lib); NSObject_retain(fn);
+        e->k0 = k0; e->k1 = k1; e->lib = lib; e->fn = fn; g_libshare_n++;
+    }
+    ReleaseSRWLockExclusive(&g_libshare_lock);
+}
+
 /* ml1011: mad_convert_stage (the no-options wrapper) was removed -- every
  * caller now passes options, because the DXBC backend needs them. */
 static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_rootsig *rs,
@@ -8475,8 +8526,22 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     if (vsin_n) *vsin_n = a.ret_vs_input_count < vsin_cap ? a.ret_vs_input_count : vsin_cap;
     if (nlocs) *nlocs = a.ret_loc_count < MAD_LOC_MAX ? a.ret_loc_count : MAD_LOC_MAX;
     if (tg_out) { tg_out[0] = a.ret_tg_size[0]; tg_out[1] = a.ret_tg_size[1]; tg_out[2] = a.ret_tg_size[2]; }
-    obj_handle_t dd = DispatchData_alloc_init((uint64_t)(uintptr_t)buf, (uint64_t)a.ret_len);
     obj_handle_t fn = 0, err = 0, lib = 0;
+    UINT64 share_k0, share_k1;
+    {   /* madeira-bcd: an identical library already exists -- share it */
+        struct mad_sc_hash sh = { 0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull };
+        mad_sc_feed(&sh, buf, (SIZE_T)a.ret_len);
+        mad_sc_feed(&sh, name, strlen(name) + 1);
+        share_k0 = sh.a; share_k1 = sh.b;
+        if (mad_libshare_find(share_k0, share_k1, &lib, &fn)) {
+            snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
+            if (o && o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);   /* ml927b */
+            *lib_out = lib;
+            free(buf);
+            return fn;
+        }
+    }
+    obj_handle_t dd = DispatchData_alloc_init((uint64_t)(uintptr_t)buf, (uint64_t)a.ret_len);
     if (dd) {
         lib = MTLDevice_newLibrary(d->mtl_device, dd, &err);
         NSObject_release(dd);
@@ -8515,6 +8580,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
             d3d12_log("[dxil-hex] end\n");
         }
     }
+    mad_libshare_add(share_k0, share_k1, lib, fn);   /* madeira-bcd */
     *lib_out = lib;
     free(buf);
     return fn;
@@ -9345,6 +9411,15 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
         if (said++ < 16)
             d3d12_log("[madeira-d3d12] ml1138 geometry-shader pipeline could not be built; returning a placeholder whose draws are skipped "
                       "(%u targets, gs %u B)\n", desc->NumRenderTargets, (unsigned)desc->GS.BytecodeLength);
+    } else if (!p->rps && !p->tess && !p->lazy && p->has_tess) {
+        /* madeira-bcd: the same placeholder rule for a hull+domain pipeline the
+         * tessellation path cannot build. Ghost of Tsushima logged
+         * "CreateGraphicsPipelineState failed" for these and treated it as an
+         * error; a missing tessellated material is recoverable. */
+        static unsigned said;
+        if (said++ < 16)
+            d3d12_log("[madeira-d3d12] tessellation pipeline could not be built; returning a placeholder whose draws are skipped "
+                      "(%u targets, depth %u)\n", desc->NumRenderTargets, (unsigned)desc->DSVFormat);
     } else if (!p->rps && !p->tess && !p->lazy) {
         d3d12_log("[madeira-d3d12] newRenderPipelineState failed (%u targets, depth %u, %u input elements%s)\n",
                   desc->NumRenderTargets, (unsigned)desc->DSVFormat, desc->InputLayout.NumElements,

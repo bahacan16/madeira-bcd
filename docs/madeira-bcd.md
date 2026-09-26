@@ -164,6 +164,13 @@ already did.
   deleted in the background. Ghost of Tsushima's New Game converts ~29,000
   stages (several hundred MB on disk). `shader-cache = 0` in madeira.cfg
   turns it off.
+- Shared Metal libraries (`mad_libshare_*`): identical metallib bytes with
+  the same entry share one MTLLibrary/MTLFunction (each pipeline holds its own
+  reference). Ghost of Tsushima made 30,370 libraries from ~11,400 distinct
+  outputs; with lazy pipelines alone Metal still held 5.1 GB and the game
+  stopped itself after a failed allocation at 7.9 GB. A tessellation pipeline
+  the runtime cannot build is now a placeholder (draws skipped) rather than
+  E_FAIL, as ml1138 already did for geometry shaders.
 - Virtual display adapter in the registry (`build/win32u-unix/sysparams_ios.c`,
   `ios_register_virtual_gpu`): this port never enumerates display devices, so
   the registry had no display adapter at all -- no `Enum\PCI` entry for
