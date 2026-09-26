@@ -44,6 +44,13 @@ step says so when it becomes a no-op:
 
 ## Runtime
 
+- TEB retarget pass (`build/ntdll-unix/virtual_ios.c`, pass 0 of the x18
+  patcher): its literal-pool guard indexed the per-word BITMAP as a byte per
+  word, reading past the allocation for code beyond the first eighth of
+  `.text`. Upstream's FEX module keeps its hand-written TEB reads near the
+  start and never tripped it; a rebuild that links them later lost all six
+  retargets and FEX read the TEB from the wrong TSD slot (NULL).
+
 - `xtajit64-avx.dll`: FEX's ARM64EC module rebuilt by
   `tools/build-xtajit64.sh` with `tools/patch-fex-ios-avx.py`, shipped beside
   upstream's untouched `xtajit64.dll` and linked in as
@@ -74,7 +81,9 @@ step says so when it becomes a no-op:
   copy, so its live globals are the copy's and an importer's data imports
   (bound to the PE mapping) read a stale snapshot -- Crysis64's CRT startup
   read a NULL `_acmdln`. At the end of process attach the DLL copies its
-  writable sections over the PE mapping's. A local build reproduces upstream's
+  writable sections over the PE mapping's -- with plain stores after a
+  VirtualQuery, never VirtualProtect: on a pool-copied image the protect path
+  syncs the PE side into the running copy and would wipe the DLL's state. A local build reproduces upstream's
   `msvcr120.dll` section for section. About +11 MB compressed.
 - `vulkan-1.dll` (and d3d10/avifil32 if the build above failed)
   (`tools/build-stub-dlls.py`):

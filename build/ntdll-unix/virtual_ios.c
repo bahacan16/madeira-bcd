@@ -4525,8 +4525,19 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             uint32_t i0, i1, i2;
             unsigned reg;
 
-            if (data_map && (data_map[i / 4] || data_map[(i + 4) / 4] || data_map[(i + 8) / 4]))
+            /* madeira-bcd: data_map is a BITMAP, one bit per instruction
+             * word (ios_x18_build_data_map, text_size/32+1 bytes). This
+             * test indexed it as a byte per word: for code past the first
+             * eighth of .text that reads beyond the allocation, and heap
+             * garbage there skipped real TSD reads. Upstream's
+             * libarm64ecfex.dll keeps its Module.S code near the start of
+             * .text and never noticed; a rebuild that links it at +0x113f20
+             * lost all six retargets and FEX loaded the TEB from slot 0x898
+             * (NULL) on its first x64 exit. */
+#define IOS_DATA_WORD(off) (data_map[((off) / 4) >> 3] & (1 << (((off) / 4) & 7)))
+            if (data_map && (IOS_DATA_WORD(i) || IOS_DATA_WORD(i + 4) || IOS_DATA_WORD(i + 8)))
                 continue;
+#undef IOS_DATA_WORD
 
             i0 = *(uint32_t *)(text_rw + i);
             if ((i0 & 0xffffffe0) != 0xd53bd060) continue;      /* mrs xN, TPIDRRO_EL0 */

@@ -42,13 +42,20 @@ static void madeira_sync_data_exports( HINSTANCE pe_image )
     sec = IMAGE_FIRST_SECTION( nt );
     for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
-        DWORD size = sec[i].Misc.VirtualSize, old;
-        void *dst = pe + sec[i].VirtualAddress;
+        DWORD size = sec[i].Misc.VirtualSize;
+        char *dst = pe + sec[i].VirtualAddress;
+        MEMORY_BASIC_INFORMATION mbi;
         if (!size || (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ||
             !(sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)) continue;
-        if (!VirtualProtect( dst, size, PAGE_READWRITE, &old )) continue;
+        /* No VirtualProtect: on a pool-copied image Madeira's protect path
+         * syncs the PE side INTO the running copy, which would first wipe
+         * everything this DllMain just initialised (build 151: msvcr80's
+         * lock table, then _lock recursing into a stack overflow). Copy only
+         * while every page is already writable. */
+        if (!VirtualQuery( dst, &mbi, sizeof(mbi) ) ||
+            !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) ||
+            (char *)mbi.BaseAddress + mbi.RegionSize < dst + size) continue;
         memcpy( dst, live + sec[i].VirtualAddress, size );
-        VirtualProtect( dst, size, old, &old );
     }
 }
 #endif
