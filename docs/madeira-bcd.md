@@ -118,6 +118,11 @@ step says so when it becomes a no-op:
   sections, adds it as a `.mreloc` section, clears RELOCS_STRIPPED and keeps
   the original as `<exe>.madeira-orig`. Validated against the real `.reloc` of
   41 x64 binaries; images with a writable executable section are skipped.
+- Session logs (`LogStore.startSessionLog`): every launch also names its log
+  `Documents/logs/<exe>-<yyyy-MM-dd_HH-mm-ss>.txt` -- a hard link to
+  madeira-log.txt, so every writer's lines land in both and the next
+  launch's rotation leaves the finished run under its own name. The newest
+  40 are kept.
 - Game Mode (`GCSupportsGameMode`, games category) in Info.plist.
 - Settings > Experimental > Storage-backed memory writes `swap-mb = 3072` to
   `Documents/madeira.cfg`, which turns on upstream's file-backed guest data tier

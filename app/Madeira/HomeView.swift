@@ -57,6 +57,20 @@ struct LaunchRequest {
         }
         if avx { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
         if wineVCRT { setenv("MADEIRA_WINE_VCRT", "1", 1) } else { unsetenv("MADEIRA_WINE_VCRT") }
+        LogStore.shared.startSessionLog(program: programName)
+    }
+
+    /// The exe the session is about: the program explorer is asked to start
+    /// in a desktop launch ("C:\\Crysis\\Bin64\\Crysis64.exe" in its
+    /// arguments), else the exe itself.
+    private var programName: String {
+        if exe.lowercased() == "explorer.exe", let a = args,
+           let open = a.firstIndex(of: "\""),
+           let close = a[a.index(after: open)...].firstIndex(of: "\"") {
+            let path = a[a.index(after: open)..<close]
+            if let name = path.split(separator: "\\").last, !name.isEmpty { return String(name) }
+        }
+        return exe.split(separator: "\\").last.map(String.init) ?? exe
     }
 
     /// Identical to the "Wine Virtual Desktop" button: explorer as the shell,
