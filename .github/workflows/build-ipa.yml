@@ -1089,6 +1089,18 @@ jobs:
 
       # docs/BUILDING.md: "Debug is the configuration that runs the games;
       # Release builds have crashed the guest."
+      # Version = 0.1.<build number>, the run number GitHub shows for this
+      # build, in the app (what Feather and Settings > General show) and in
+      # the IPA's name, so an installed copy can be matched to its run.
+      - name: Stamp version 0.1.${{ github.run_number }}
+        shell: bash
+        run: |
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString 0.1.${{ github.run_number }}" \
+            -c "Set :CFBundleVersion ${{ github.run_number }}" \
+            app/Madeira/Info.plist
+          echo "::notice::version 0.1.${{ github.run_number }} (build ${{ github.run_number }})"
+
       - name: Archive (unsigned)
         shell: bash
         run: |
@@ -1177,13 +1189,13 @@ jobs:
         run: |
           mkdir -p build-out/Payload
           cp -R build-out/Madeira.xcarchive/Products/Applications/Madeira.app build-out/Payload/
-          cd build-out && ditto -c -k --keepParent Payload Madeira-unsigned.ipa
+          cd build-out && ditto -c -k --keepParent Payload Madeira-0.1.${{ github.run_number }}-unsigned.ipa
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: madeira-unsigned-ipa
-          path: build-out/Madeira-unsigned.ipa
+          name: madeira-0.1.${{ github.run_number }}-unsigned-ipa
+          path: build-out/Madeira-0.1.${{ github.run_number }}-unsigned.ipa
           if-no-files-found: ignore
 
       # Full logs as an artifact -- the annotations above are truncated, and

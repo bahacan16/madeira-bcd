@@ -14,6 +14,11 @@ source (below). The Microsoft VC++ runtime is fetched from
 Microsoft at build time and never committed. Archived as Debug, per upstream's
 docs/BUILDING.md.
 
+**Version.** CI stamps `Info.plist` with version `0.1.<run number>` and build
+`<run number>` before archiving, and names the IPA (and its artifact)
+`Madeira-0.1.<run number>-unsigned.ipa`, so the version an installer such as
+Feather shows is the Actions run it came from. The committed plist keeps 0.1.0.
+
 **Metal Shader Converter.** The D3D12 runtime's unix half compiles against
 Apple's converter headers, which upstream does not track. Apple's installer
 (`Metal_Shader_Converter_4.0_beta_2.pkg`, from developer.apple.com/download) is
