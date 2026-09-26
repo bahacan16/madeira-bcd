@@ -8794,6 +8794,9 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (target_name->header.id != monitor->output_id) continue;
+            /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
+             * series) has no source; QueryDisplayConfig reports no path for it either. */
+            if (!monitor->source) continue;
             if (memcmp( &target_name->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))
                 continue;
@@ -8841,6 +8844,9 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (preferred_mode->header.id != monitor->output_id) continue;
+            /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
+             * series) has no source; QueryDisplayConfig reports no path for it either. */
+            if (!monitor->source) continue;
             if (memcmp( &preferred_mode->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))
                 continue;
@@ -8946,6 +8952,9 @@ NTSTATUS WINAPI NtUserDisplayConfigGetDeviceInfo( DISPLAYCONFIG_DEVICE_INFO_HEAD
         LIST_FOR_EACH_ENTRY(monitor, &monitors, struct monitor, entry)
         {
             if (color_info->header.id != monitor->output_id) continue;
+            /* madeira-bcd: the virtual monitor (the only one on iOS since the WoW64
+             * series) has no source; QueryDisplayConfig reports no path for it either. */
+            if (!monitor->source) continue;
             if (memcmp( &color_info->header.adapterId, &monitor->source->gpu->luid,
                         sizeof(monitor->source->gpu->luid) ))
                 continue;

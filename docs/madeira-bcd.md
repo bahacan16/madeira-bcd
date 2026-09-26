@@ -68,6 +68,12 @@ do not build (build 154), and a D3D11 title would call unix slots the old
 `winemetal_unix.c` does not have. When upstream moves either pin, the sync
 has to move to a 125hz commit that contains upstream's, or drop the series.
 
+With the series the only monitor is the virtual one, which has no source.
+`NtUserDisplayConfigGetDeviceInfo` (`build/win32u-unix/sysparams_ios.c`)
+dereferenced `monitor->source->gpu` for it and Ghost of Tsushima died in the
+syscall; it now skips source-less monitors, as `NtUserQueryDisplayConfig`
+already did.
+
 ## Runtime
 
 - TEB retarget pass (`build/ntdll-unix/virtual_ios.c`, pass 0 of the x18
