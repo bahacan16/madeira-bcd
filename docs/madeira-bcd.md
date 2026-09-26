@@ -135,8 +135,12 @@ already did.
   entry points the game then asked for and DXMT lacks
   (`NvAPI_GetLogicalGPUFromPhysicalGPU`, `NvAPI_GetPhysicalGPUsFromLogicalGPU`,
   `NvAPI_GetAssociatedNvidiaDisplayHandle`, `NvAPI_GetAssociatedDisplayOutputId`,
-  `NvAPI_GPU_GetPCIIdentifiers`) and logs each queried function once as
-  `[nvapi] query`.
+  `NvAPI_GPU_GetPCIIdentifiers`, `NvAPI_GPU_GetThermalSettings` -- one GPU
+  sensor at 50 C) and logs each queried function once as `[nvapi] query`.
+- `madeira_d3d12.c`: `GetAdapterLuid` returns the adapter's LUID and
+  `GetDeviceRemovedReason` returns S_OK unless the device is lost; both were
+  generated stubs (a zero LUID, E_NOTIMPL). Ghost of Tsushima polls the
+  latter and took E_NOTIMPL for "Device removed detected", then crashed.
 - Virtual display adapter in the registry (`build/win32u-unix/sysparams_ios.c`,
   `ios_register_virtual_gpu`): this port never enumerates display devices, so
   the registry had no display adapter at all -- no `Enum\PCI` entry for

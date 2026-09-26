@@ -10005,6 +10005,15 @@ static HRESULT STDMETHODCALLTYPE rootsig_GetDevice(ID3D12RootSignature *This, RE
 }
 
 /* ---- vtable construction ------------------------------------------------- */
+/* madeira-bcd: ID3D12Device::GetDeviceRemovedReason (was the E_NOTIMPL stub).
+ * Engines poll it; Ghost of Tsushima read E_NOTIMPL as "Device removed
+ * detected" and crashed. S_OK unless the device really is lost (RemoveDevice,
+ * or the Metal device gone -- the same flag the rest of the runtime reports
+ * DXGI_ERROR_DEVICE_REMOVED from). */
+static HRESULT STDMETHODCALLTYPE device_GetDeviceRemovedReason(ID3D12Device10 *This) {
+    return ((struct mad_device *)This)->device_lost ? DXGI_ERROR_DEVICE_REMOVED : S_OK;
+}
+
 /* madeira-bcd: ID3D12Device::GetAdapterLuid (was the zero-LUID stub). */
 static LUID * STDMETHODCALLTYPE device_GetAdapterLuid(ID3D12Device10 *This, LUID *ret) {
     *ret = ((struct mad_device *)This)->adapter_luid;
@@ -10036,6 +10045,7 @@ static void build_vtables(void) {
     g_device_vtbl.SetEventOnMultipleFenceCompletion  = device_SetEventOnMultipleFenceCompletion;
     g_device_vtbl.QueryInterface = (void *)device_QI;
     g_device_vtbl.GetAdapterLuid = device_GetAdapterLuid;   /* madeira-bcd */
+    g_device_vtbl.GetDeviceRemovedReason = device_GetDeviceRemovedReason;   /* madeira-bcd */
     g_device_vtbl.AddRef = (void *)device_AddRef;
     g_device_vtbl.Release = (void *)device_Release;
     g_device_vtbl.GetNodeCount = (void *)device_GetNodeCount;

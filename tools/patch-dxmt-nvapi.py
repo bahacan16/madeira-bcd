@@ -109,6 +109,32 @@ NvAPI_GPU_GetPCIIdentifiers(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pDeviceId, 
   return NVAPI_OK;
 }
 
+NVAPI_INTERFACE
+NvAPI_GPU_GetThermalSettings(NvPhysicalGpuHandle hPhysicalGpu, NvU32 sensorIndex,
+                             NV_GPU_THERMAL_SETTINGS *pThermalSettings) {
+  if (!pThermalSettings)
+    return NVAPI_INVALID_ARGUMENT;
+  if (!madeira_gpu_exists(uint64_t(hPhysicalGpu)))
+    return NVAPI_EXPECTED_PHYSICAL_GPU_HANDLE;
+  if (pThermalSettings->version != NV_GPU_THERMAL_SETTINGS_VER_1 &&
+      pThermalSettings->version != NV_GPU_THERMAL_SETTINGS_VER_2)
+    return NVAPI_INCOMPATIBLE_STRUCT_VERSION;
+  if (sensorIndex != NVAPI_THERMAL_TARGET_ALL && sensorIndex != 0)
+    return NVAPI_INVALID_ARGUMENT;
+  /* iOS reports only a coarse thermal state, not a temperature; one GPU
+   * sensor at a steady, safe reading keeps thermal-aware engines content. */
+  NvU32 version = pThermalSettings->version;
+  memset(pThermalSettings, 0, sizeof(*pThermalSettings));
+  pThermalSettings->version = version;
+  pThermalSettings->count = 1;
+  pThermalSettings->sensor[0].controller = NVAPI_THERMAL_CONTROLLER_GPU_INTERNAL;
+  pThermalSettings->sensor[0].defaultMinTemp = 0;
+  pThermalSettings->sensor[0].defaultMaxTemp = 95;
+  pThermalSettings->sensor[0].currentTemp = 50;
+  pThermalSettings->sensor[0].target = NVAPI_THERMAL_TARGET_GPU;
+  return NVAPI_OK;
+}
+
 '''
 
 anchor = 'extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {'
@@ -129,6 +155,8 @@ src = src.replace(case_anchor, case_anchor + """  case 0xadd604d1:
     return (void *)&NvAPI_GetAssociatedDisplayOutputId;
   case 0x2ddfb66e:
     return (void *)&NvAPI_GPU_GetPCIIdentifiers;
+  case 0xe3640a56:
+    return (void *)&NvAPI_GPU_GetThermalSettings;
 """)
 
 # Name every entry point the game asks for, once, so a log shows what a title
