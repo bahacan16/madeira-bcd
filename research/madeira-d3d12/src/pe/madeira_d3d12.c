@@ -597,6 +597,7 @@ struct mad_rootsig {
      * end of the top-level argument buffer for the static samplers; this is
      * the table it points at (nsamplers sampler descriptors, built once). */
     obj_handle_t stab; UINT64 stab_gpu;
+    const struct mad_descriptor *stab_cpu;   /* madeira-bcd: the same table, for the DXBC backend's copies */
 };
 struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
@@ -2770,13 +2771,21 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
     }
 
     /* Static samplers are baked into the shader by the DXIL converter, but the
-     * DXBC backend expects them in the table like any other sampler. */
+     * DXBC backend expects them in the table like any other sampler.
+     * madeira-bcd: the root signature already built each one's descriptor (the
+     * ml923 table the DXIL path points at); copy it into the slot. Skipping
+     * the draw instead left Ghost of Tsushima's intro videos and final image
+     * black -- one draw per frame, every frame. */
     if (rg->type == MADEIRA_IR_AIR_SAMPLER) {
         for (i = 0; i < rs->nsamplers && i < 32; i++)
             if (rs->samplers[i].shader_register == rg->lower_bound &&
                 rs->samplers[i].register_space == rg->space &&
                 (rs->samplers[i].visibility >= 32 || ((1u << rs->samplers[i].visibility) & vis_mask))) {
-                *why = "static sampler (not yet placed in the sm5 argument table)";
+                if (rs->stab_cpu && rs->stab_cpu[i].gpu_va) {
+                    *desc = rs->stab_cpu[i];
+                    return 1;
+                }
+                *why = "static sampler (its Metal sampler state could not be created)";
                 return 0;
             }
     }
@@ -7301,7 +7310,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
      * same in root signature versions 1.0 and 1.1 (1.2 adds a flags word and
      * is refused above by version). */
     r->nsamplers = nsampler;
-    r->stab = 0; r->stab_gpu = 0;
+    r->stab = 0; r->stab_gpu = 0; r->stab_cpu = NULL;
     for (UINT32 i = 0; i < nsampler; i++) {
         struct madeira_ir_static_sampler *ss = &r->samplers[i];
         UINT32 at = soff + 52 * i, w[13], k;
@@ -7335,6 +7344,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
             }
             mad_resident(dd, r->stab);
             r->stab_gpu = bi.gpu_address;
+            r->stab_cpu = tab;
             { static unsigned said; if (said++ < 4) d3d12_log("[madeira-d3d12] static sampler table: %u/%u samplers at %llx\n", ok, nsampler, (unsigned long long)r->stab_gpu); }
         } else { if (r->stab) { NSObject_release(r->stab); r->stab = 0; } d3d12_log("[madeira-d3d12] static sampler table: buffer creation failed\n"); }
     }

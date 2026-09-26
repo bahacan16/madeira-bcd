@@ -141,6 +141,12 @@ already did.
   `GetDeviceRemovedReason` returns S_OK unless the device is lost; both were
   generated stubs (a zero LUID, E_NOTIMPL). Ghost of Tsushima polls the
   latter and took E_NOTIMPL for "Device removed detected", then crashed.
+- `madeira_d3d12.c` `mad_air_resolve`: a DXBC (SM5) shader's static samplers
+  were refused ("not yet placed in the sm5 argument table") and the draw was
+  skipped. They now take the descriptor the root signature already builds for
+  the DXIL path (its ml923 static sampler table). Ghost of Tsushima lost one
+  draw every frame to this: intro videos with sound and no picture, then a
+  black screen at ~17 fps.
 - Virtual display adapter in the registry (`build/win32u-unix/sysparams_ios.c`,
   `ios_register_virtual_gpu`): this port never enumerates display devices, so
   the registry had no display adapter at all -- no `Enum\PCI` entry for
