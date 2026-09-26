@@ -59,6 +59,13 @@ step says so when it becomes a no-op:
   Wine set has none, and games that import it fail in the loader with
   STATUS_DLL_NOT_FOUND. Wine's exports plus `WerReportHang`, all succeeding
   without doing anything.
+- `d3d10.dll`, `avifil32.dll`, `vulkan-1.dll` (`tools/build-stub-dlls.py`):
+  stand-ins generated from Wine's `.spec` export lists, for games that import
+  them statically (Crysis Remastered). vulkan-1 reports
+  VK_ERROR_INCOMPATIBLE_DRIVER and NULL from the *ProcAddr entry points (Wine's
+  forwards to winevulkan, which needs a host driver), so games fall back to
+  D3D; d3d10 keeps Wine's forwards to the shipped d3dcompiler_43 and answers
+  E_NOTIMPL otherwise; avifil32 returns AVIERR_UNSUPPORTED.
 
 - `NtFlushInstructionCache` (`build/ntdll-unix/virtual_ios.c`) invalidates the
   icache under `WINE_IOS` regardless of `HAVE___CLEAR_CACHE`. CI's generated

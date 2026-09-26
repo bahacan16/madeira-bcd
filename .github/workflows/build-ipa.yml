@@ -836,6 +836,15 @@ jobs:
         continue-on-error: true
         run: bash tools/build-faultrep-dll.sh
 
+      # d3d10/avifil32/vulkan-1 stand-ins from Wine's .spec export lists:
+      # Crysis Remastered imports all three and fails to load without them.
+      - name: Build stand-in DLLs (d3d10, avifil32, vulkan-1)
+        continue-on-error: true
+        run: |
+          M=toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin
+          python3 tools/build-stub-dlls.py wine build/stub-dlls "$M/arm64ec-w64-mingw32-clang" \
+            "$M/llvm-readobj" app/Madeira/arm64ec-windows
+
       # The PE-side DXMT DLLs (d3d11/dxgi/winemetal/d3d10core) are committed
       # under app/Madeira/aarch64-windows/ despite the README calling them
       # gitignored, so there is nothing to build here -- just confirm they
