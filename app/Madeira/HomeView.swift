@@ -37,6 +37,9 @@ struct LaunchRequest {
     let args: String?
     /// Wine virtual desktop size, or nil to run the program directly.
     let desktop: (w: Int, h: Int)?
+    /// Tell FEX to expose AVX/AVX2 (tools/patch-fex-ios-avx.py). Off unless
+    /// the game's settings turn it on.
+    var avx = false
 
     func apply() {
         ExperimentalSettings.exportToEnvironment()
@@ -49,6 +52,7 @@ struct LaunchRequest {
         } else {
             unsetenv("MADEIRA_DESKTOP")
         }
+        if avx { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
     }
 
     /// Identical to the "Wine Virtual Desktop" button: explorer as the shell,
@@ -165,6 +169,7 @@ enum LibraryPrefs {
     private static let primaryKey = "madeira.library.primaryExe"
     private static let playedKey = "madeira.library.lastPlayed"
     private static let desktopKey = "madeira.library.inDesktop"
+    private static let avxKey = "madeira.library.avx"
 
     private static func dict<T>(_ key: String) -> [String: T] {
         (UserDefaults.standard.dictionary(forKey: key) as? [String: T]) ?? [:]
@@ -187,6 +192,9 @@ enum LibraryPrefs {
 
     static func inDesktop(_ windowsPath: String) -> Bool { (dict(desktopKey) as [String: Bool])[windowsPath] ?? false }
     static func setInDesktop(_ on: Bool, for windowsPath: String) { store(on ? true : nil, desktopKey, windowsPath) }
+
+    static func avx(_ windowsPath: String) -> Bool { (dict(avxKey) as [String: Bool])[windowsPath] ?? false }
+    static func setAVX(_ on: Bool, for windowsPath: String) { store(on ? true : nil, avxKey, windowsPath) }
 }
 
 /// Reads the PE header's Machine field. Two small reads per file, off the main
@@ -620,7 +628,7 @@ struct HomeView: View {
         }
         let saved = GameArguments.get(exe.windowsPath)
         let args = saved.isEmpty ? GameArguments.suggestion(for: exe) : saved
-        let request: LaunchRequest
+        var request: LaunchRequest
         if LibraryPrefs.inDesktop(exe.windowsPath) {
             let size = ContentView.desktopSize(desktopRes)
             let program = "\"\(exe.windowsPath)\"" + (args.isEmpty ? "" : " " + args)
@@ -630,6 +638,7 @@ struct HomeView: View {
         } else {
             request = LaunchRequest(title: game.title, exe: exe.windowsPath, args: args, desktop: nil)
         }
+        request.avx = LibraryPrefs.avx(exe.windowsPath)
         LibraryPrefs.markPlayed(game.title)
         start(request)
     }
@@ -812,6 +821,7 @@ struct GameSettingsSheet: View {
     @State private var exePath: String
     @State private var args: String
     @State private var inDesktop: Bool
+    @State private var avx: Bool
     @State private var photo: PhotosPickerItem?
     @State private var tick = 0
 
@@ -824,6 +834,7 @@ struct GameSettingsSheet: View {
         _exePath = State(initialValue: exe.windowsPath)
         _args = State(initialValue: GameArguments.get(exe.windowsPath))
         _inDesktop = State(initialValue: LibraryPrefs.inDesktop(exe.windowsPath))
+        _avx = State(initialValue: LibraryPrefs.avx(exe.windowsPath))
     }
 
     private var selected: GuestExecutable {
@@ -883,12 +894,15 @@ struct GameSettingsSheet: View {
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                     Toggle("Run inside the Wine desktop", isOn: $inDesktop)
+                    Toggle("AVX / AVX2", isOn: $avx)
                 } header: {
                     Text("Launch options")
                 } footer: {
                     Text("Empty arguments use the suggestion shown. Unreal Engine titles default to DX12, "
                          + "which Madeira does not implement -- they need -dx11. The Wine desktop gives a "
-                         + "program a window manager; most games do not need one.")
+                         + "program a window manager; most games do not need one. Turn on AVX when a game "
+                         + "quits at start with \"illegal instruction\" (c000001d) in the log: it was built "
+                         + "for AVX CPUs. Emulated AVX is slower, so leave it off otherwise.")
                 }
 
                 Section {
@@ -920,6 +934,7 @@ struct GameSettingsSheet: View {
                 // Arguments and the desktop choice belong to an exe, not a title.
                 args = GameArguments.get(newPath)
                 inDesktop = LibraryPrefs.inDesktop(newPath)
+                avx = LibraryPrefs.avx(newPath)
             }
             .onChange(of: photo) { _, item in
                 guard let item else { return }
@@ -941,6 +956,7 @@ struct GameSettingsSheet: View {
         LibraryPrefs.setPrimaryPath(exePath, for: game.title)
         GameArguments.set(args, for: exePath)
         LibraryPrefs.setInDesktop(inDesktop, for: exePath)
+        LibraryPrefs.setAVX(avx, for: exePath)
     }
 }
 

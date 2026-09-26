@@ -8,8 +8,9 @@ build and the app-side pieces below. Everything else is upstream's.
 
 Builds an unsigned IPA on a GitHub macOS runner from a clean checkout: Wine's
 unix side, wineserver, win32u, FEX's iOS archives, LLVM 15 for iOS, DXMT's unix
-half and the app. The PE-side DLLs (ntdll, xtajit64, DXMT, the D3D12 runtime)
-are upstream's tracked builds. The Microsoft VC++ runtime is fetched from
+half and the app. The PE-side DLLs (ntdll, DXMT) are upstream's tracked
+builds; `madeira_d3d12.dll`, `xtajit64.dll` and `faultrep.dll` are built from
+source (below). The Microsoft VC++ runtime is fetched from
 Microsoft at build time and never committed. Archived as Debug, per upstream's
 docs/BUILDING.md.
 
@@ -43,6 +44,22 @@ step says so when it becomes a no-op:
 
 ## Runtime
 
+- `xtajit64.dll` (FEX's ARM64EC module) is rebuilt by
+  `tools/build-xtajit64.sh` with `tools/patch-fex-ios-avx.py`: the iOS path of
+  `FetchHostFeatures` never sets `SupportsAVX` and skips the HostFeatures
+  override, so titles compiled for AVX (Ghost of Tsushima) die on their first
+  VEX instruction (c000001d). `MADEIRA_FEX_AVX=1` turns on FEX's 128-bit AVX
+  emulation for that launch; the game settings' "AVX / AVX2" switch sets it.
+  Off by default, so titles that check CPUID keep their SSE paths. The script
+  first rebuilds the unpatched source and ships nothing unless it matches the
+  committed DLL (sections and exports); the recipe (`MINGW_TRIPLE`,
+  `FEX_IOS_HOST_BUILD`, `-DFEX_IOS_HOST=1`, LTO off) is not in upstream's
+  `build/fex-arm64ec/build.sh`.
+- `faultrep.dll` (`build/faultrep`, `tools/build-faultrep-dll.sh`): upstream's
+  Wine set has none, and games that import it fail in the loader with
+  STATUS_DLL_NOT_FOUND. Wine's exports plus `WerReportHang`, all succeeding
+  without doing anything.
+
 - `NtFlushInstructionCache` (`build/ntdll-unix/virtual_ios.c`) invalidates the
   icache under `WINE_IOS` regardless of `HAVE___CLEAR_CACHE`. CI's generated
   config.h does not define it, and without the flush every x64 guest died in a
@@ -70,6 +87,12 @@ step says so when it becomes a no-op:
   portrait from the bar under the game. A game started from the library no
   longer shows the developer view, which stays under Settings > Developer
   tools.
+- Library (`GameLibrary.swift`, `HomeView.swift`): scans 12 levels deep,
+  includes `C:\users` (without AppData/Temp), skips redistributable folders,
+  splits a folder that only holds other games into one card each, shows each
+  card's exe folder and exe count, and a Games / Every .exe switch. 64-bit exes
+  are preferred as a title's default and 32-bit ones are refused with an
+  explanation (WoW64 needs the low 2 GB, which iOS reserves).
 - Game Mode (`GCSupportsGameMode`, games category) in Info.plist.
 - Settings > Experimental > Storage-backed memory writes `swap-mb = 3072` to
   `Documents/madeira.cfg`, which turns on upstream's file-backed guest data tier

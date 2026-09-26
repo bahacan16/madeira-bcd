@@ -570,6 +570,29 @@ jobs:
           path: FEX/build-ios
           key: fex-ios-${{ steps.fexrev.outputs.sha }}-v3
 
+      # xtajit64.dll (FEX's ARM64EC module) with the MADEIRA_FEX_AVX opt-in:
+      # games built for AVX (Ghost of Tsushima) die on their first VEX
+      # instruction otherwise. The script keeps the committed DLL unless an
+      # unpatched rebuild matches it first.
+      - name: Restore FEX ARM64EC build
+        id: fexeccache
+        uses: actions/cache/restore@v4
+        with:
+          path: FEX/build-arm64ec
+          key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v1
+
+      - name: Build xtajit64.dll with the AVX opt-in
+        if: env.MINGW_OK == '1'
+        continue-on-error: true
+        run: bash tools/build-xtajit64.sh
+
+      - name: Save FEX ARM64EC build
+        if: steps.fexeccache.outputs.cache-hit != 'true' && hashFiles('FEX/build-arm64ec/Bin/libarm64ecfex.dll') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: FEX/build-arm64ec
+          key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v1
+
       - name: Restore LLVM 15.0.7 iOS build
         id: llvmcache
         uses: actions/cache/restore@v4
