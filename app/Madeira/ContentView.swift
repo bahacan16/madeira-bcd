@@ -2089,6 +2089,8 @@ struct ContentView: View {
         /* ml1095: one config file. Written once from any legacy madeira-*.txt. */
         MadeiraConfig.migrateLegacy { self.logStore.log($0) }
         MadeiraConfig.deleteLegacyFiles { self.logStore.log($0) }   /* ml1096: the old files go once the cfg exists */
+        /* ml1990: player 1 exists before the game enumerates XInput. */
+        GamepadInput.shared.reserveSessionSlot(touchControls: TouchControlsModel.shared.offersControllerInput)
         if MadeiraConfig.present {
             let cfg = MadeiraConfig.all().sorted { $0.key < $1.key }
             logStore.log("madeira.cfg: " + (cfg.isEmpty ? "(empty)" : cfg.map { "\($0.key)=\($0.value)" }.joined(separator: " ")))
@@ -3017,10 +3019,23 @@ final class TouchControlsModel: ObservableObject {
     @Published var visible = true               { didSet { save() } }
     /// Session panel "Opacity" for the play-mode controls (edit mode stays opaque).
     @Published var opacity: Double = 1.0        { didSet { save() } }
-    @Published var editing = false              // transient, never persisted
+    @Published var editing = false {            // transient, never persisted
+        didSet {
+            // ml1970: an ended edit is written back to the custom layout it came from.
+            if !oldValue && editing { editBaseline = controls }
+            if oldValue && !editing { ControlPresetsModel.shared.editingEnded(baseline: editBaseline) }
+        }
+    }
     /// The Session panel card is open on this window: it takes every touch.
     @Published var sessionPanel = false         // transient
     @Published var selected: UUID?              // transient
+    /// ml1970: the named layout (TouchControlPresets.swift) these controls were
+    /// loaded from; nil for controls no layout holds.
+    @Published var layoutID: String?            { didSet { save() } }
+    /// ml1970: no controls file existed at launch, so the built-in controller
+    /// layout may be applied once (ControlPresetsModel.applyDefaultIfNeeded).
+    var needsDefaultLayout = false
+    private var editBaseline: [TouchControl] = []
 
     private var loading = false
     private static var url: URL {
@@ -3028,7 +3043,8 @@ final class TouchControlsModel: ObservableObject {
             .appendingPathComponent("madeira-controls.json")
     }
 
-    private struct Saved: Codable { var controls: [TouchControl]; var visible: Bool; var opacity: Double? }
+    /// `opacity` and `layout` are optional so files written before them still decode.
+    private struct Saved: Codable { var controls: [TouchControl]; var visible: Bool; var opacity: Double?; var layout: String? }
 
     private init() {
         loading = true
@@ -3037,15 +3053,24 @@ final class TouchControlsModel: ObservableObject {
             controls = s.controls
             visible  = s.visible
             opacity  = s.opacity ?? 1.0
+            layoutID = s.layout
         }
+        needsDefaultLayout = !FileManager.default.fileExists(atPath: Self.url.path)
         loading = false
     }
 
     private func save() {
         guard !loading else { return }
-        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible, opacity: opacity))
+        guard let d = try? JSONEncoder().encode(Saved(controls: controls, visible: visible, opacity: opacity, layout: layoutID))
         else { return }
         try? d.write(to: Self.url, options: .atomic)
+    }
+
+    /// ml1990: touch controls will feed player 1 this session (visible
+    /// controller mappings, or the controller layout a new user is about to get).
+    var offersControllerInput: Bool {
+        visible && (controls.contains { $0.action.padName.map(TouchPadAction.supported) ?? false }
+                    || ControlPresetsModel.shared.defaultPending)
     }
 
     func index(of id: UUID?) -> Int? {
@@ -3064,9 +3089,11 @@ final class TouchControlsModel: ObservableObject {
     /// captured everything — could never be entered to mask it.
     func hitsInteractive(_ p: CGPoint, in bounds: CGRect) -> Bool {
         // Top bar: three 44pt buttons 10pt apart in play mode (controls, edit,
-        // session), centred, 10pt down. Padded generously; a few points of slop
+        // session), centred, 10pt down, plus the layout menu while touch
+        // controls are on (ml1970). Padded generously; a few points of slop
         // costs nothing and a missed tap costs a build.
-        let barW: CGFloat = 3 * 44 + 2 * 10
+        let buttons: CGFloat = TouchControlsOverlay.showsLayoutMenu(self) ? 4 : 3
+        let barW: CGFloat = buttons * 44 + (buttons - 1) * 10
         if CGRect(x: bounds.midX - barW / 2 - 10, y: 0,
                   width: barW + 20, height: 68).contains(p) { return true }
         guard visible else { return false }
@@ -3092,6 +3119,12 @@ final class ControlsWindow: UIWindow {
         // Edit mode owns the whole screen: drags and the scale pinch must not
         // leak through and swing the camera while you are arranging buttons.
         if m.editing || m.sessionPanel { return super.hitTest(point, with: event) }
+        // ml1970: the layout menu and its dialogs are UIKit presentations
+        // outside the hosting view (an alert's dimming view covers the screen).
+        // While one is up it takes the touches it covers; otherwise its buttons
+        // would be dead wherever they are not over the top bar or a control.
+        if ControlPresetsModel.enabled, let root = rootViewController?.view,
+           let hit = super.hitTest(point, with: event), hit !== self, !hit.isDescendant(of: root) { return hit }
         // Portrait draws nothing here, so it must consume nothing.
         guard bounds.width > bounds.height else { return nil }
         guard m.hitsInteractive(point, in: bounds) else { return nil }
@@ -3166,8 +3199,8 @@ struct TouchControlsOverlay: View {
             .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .contentShape(Rectangle())
             .gesture(scalePinch, including: m.editing ? .all : .subviews)
-            .onAppear { configureGamepad(landscape: landscape) }
-            .onChange(of: geo.size) { _, _ in configureGamepad(landscape: landscape) }
+            .onAppear { applyDefaultLayout(geo); configureGamepad(landscape: landscape) }
+            .onChange(of: geo.size) { _, _ in applyDefaultLayout(geo); configureGamepad(landscape: landscape) }
             .onChange(of: m.controls) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.visible) { _, _ in configureGamepad(landscape: landscape) }
             .onChange(of: m.editing) { _, _ in configureGamepad(landscape: landscape) }
@@ -3182,12 +3215,56 @@ struct TouchControlsOverlay: View {
         GamepadInput.shared.configureTouch(controls: Set(ids))
     }
 
+    /// ml1970: a new user's first landscape overlay gets the built-in controller
+    /// layout, laid out for this screen (never over an existing controls file).
+    private func applyDefaultLayout(_ geo: GeometryProxy) {
+        guard m.needsDefaultLayout, geo.size.width > geo.size.height else { return }
+        let i = geo.safeAreaInsets
+        ControlPresetsModel.shared.applyDefaultIfNeeded(screen: ControlPresetScreen(
+            width: Double(geo.size.width), height: Double(geo.size.height),
+            left: Double(i.leading), right: Double(i.trailing),
+            top: Double(i.top), bottom: Double(i.bottom)))
+    }
+
+    /// ml1970: while editing, a Done button ends the edit (keeping it in the
+    /// active custom layout) in place of the checkmark, and the show/hide glyph
+    /// is hidden. MADEIRA_CONTROLS_EDITOR_DONE=0 restores the previous bar.
+    static let editorDone = GamepadInput.flag("MADEIRA_CONTROLS_EDITOR_DONE")
+
+    /// ml1970: the layout menu, offered only while touch controls are shown.
+    static func showsLayoutMenu(_ m: TouchControlsModel) -> Bool {
+        ControlPresetsModel.enabled && m.visible && !m.editing
+    }
+
     private var topBar: some View {
         HStack(spacing: 10) {
-            glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
-            glassButton(m.editing ? "checkmark" : "pencil") {
-                m.editing.toggle()
-                if !m.editing { m.selected = nil }
+            if m.editing && Self.editorDone {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        m.selected = nil
+                        m.editing = false
+                    }
+                } label: {
+                    Text("Done")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 18)
+                        .frame(height: 44)
+                        .background(GlassShape())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Done editing controls")
+            } else {
+                glassButton("gamecontroller", dim: !m.visible) { m.visible.toggle() }
+                if Self.showsLayoutMenu(m) {
+                    ControlLayoutMenu()
+                        .transition(.opacity.combined(with: .scale))
+                }
+                glassButton(m.editing ? "checkmark" : "pencil") {
+                    m.editing.toggle()
+                    if !m.editing { m.selected = nil }
+                }
             }
             if !m.editing {
                 glassButton("line.3.horizontal") { m.sessionPanel = true }
