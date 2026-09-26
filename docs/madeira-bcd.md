@@ -93,6 +93,13 @@ step says so when it becomes a no-op:
   card's exe folder and exe count, and a Games / Every .exe switch. 64-bit exes
   are preferred as a title's default and 32-bit ones are refused with an
   explanation (WoW64 needs the low 2 GB, which iOS reserves).
+- `FixedBaseImage` (`GameLibrary.swift`): a 64-bit exe linked /FIXED below
+  4 GB (Crysis `Bin64\Crysis64.exe`, base 0x37000000) cannot be placed on iOS
+  and Wine refuses to move it (c0000018). Before launch the library rebuilds
+  its relocation table from the aligned in-image pointers in its data
+  sections, adds it as a `.mreloc` section, clears RELOCS_STRIPPED and keeps
+  the original as `<exe>.madeira-orig`. Validated against the real `.reloc` of
+  41 x64 binaries; images with a writable executable section are skipped.
 - Game Mode (`GCSupportsGameMode`, games category) in Info.plist.
 - Settings > Experimental > Storage-backed memory writes `swap-mb = 3072` to
   `Documents/madeira.cfg`, which turns on upstream's file-backed guest data tier

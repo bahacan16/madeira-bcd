@@ -626,6 +626,10 @@ struct HomeView: View {
             blocked32 = game
             return
         }
+        // Relocation-stripped exes based below 4 GB cannot load on iOS as they
+        // are; FixedBaseImage gives them a relocation table (once, keeping the
+        // original).
+        if let note = FixedBaseImage.prepare(exe.url) { LogStore.shared.log(note) }
         let saved = GameArguments.get(exe.windowsPath)
         let args = saved.isEmpty ? GameArguments.suggestion(for: exe) : saved
         var request: LaunchRequest

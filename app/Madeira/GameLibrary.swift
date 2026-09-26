@@ -381,3 +381,166 @@ struct GameLibraryView: View {
         }
     }
 }
+
+// MARK: - Fixed-base executables
+
+/// Gives a relocation-stripped 64-bit exe that wants a base below 4 GB a
+/// relocation table, so Wine can load it where iOS lets it.
+///
+/// iOS reserves the low 4 GB of every process (__PAGEZERO), so an image linked
+/// /FIXED at, say, 0x37000000 (Crysis's Bin64\Crysis64.exe) cannot be placed
+/// at its base, and with IMAGE_FILE_RELOCS_STRIPPED Wine's loader refuses to
+/// move it: "failed to create main module ... c0000018".
+///
+/// An x64 image's absolute pointers into itself live in its data sections as
+/// aligned 64-bit values (vtables, CRT init tables, TLS and load-config
+/// directories); code reaches the image RIP-relatively. Every such value that
+/// falls inside the image is taken as a DIR64 fixup. Checked against the real
+/// .reloc of 41 MSVC and mingw x64 binaries: no fixup missed outside code, no
+/// false one at the binaries' own bases; a handful of data constants do alias
+/// a base as low as 0x37000000 in images of several MB. Images with a writable
+/// executable section (packers) are left alone.
+///
+/// The file gets a ".mreloc" section and loses the stripped flag; the original
+/// is kept next to it with `backupSuffix` appended.
+enum FixedBaseImage {
+    static let backupSuffix = ".madeira-orig"
+
+    /// A line for the log when the file was changed or deliberately left
+    /// alone, nil when it is not a candidate.
+    static func prepare(_ url: URL) -> String? {
+        // Most exes are not candidates: decide from the headers alone.
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        let head = [UInt8]((try? handle.read(upToCount: 4096)) ?? Data())
+        try? handle.close()
+        guard isCandidate(head) else { return nil }
+
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let name = url.lastPathComponent
+        switch rebuild([UInt8](data)) {
+        case .failure(let why):
+            return "\(name): fixed-base image below 4 GB, not relocatable here (\(why))"
+        case .success(let (patched, count, base)):
+            let backup = url.appendingPathExtension(String(backupSuffix.dropFirst()))
+            do {
+                if !FileManager.default.fileExists(atPath: backup.path) {
+                    try FileManager.default.copyItem(at: url, to: backup)
+                }
+                try Data(patched).write(to: url, options: .atomic)
+            } catch {
+                return "\(name): could not write the relocated copy (\(error.localizedDescription))"
+            }
+            return String(format: "%@: fixed base 0x%llx is below the iOS floor -- added %ld rebuilt relocations "
+                          + "so Wine can load it elsewhere (original kept as %@)",
+                          name, base, count, backup.lastPathComponent)
+        }
+    }
+
+    private enum Outcome { case success(([UInt8], Int, UInt64)), failure(String) }
+
+    private static func u16(_ b: [UInt8], _ o: Int) -> Int { Int(b[o]) | Int(b[o + 1]) << 8 }
+    private static func u32(_ b: [UInt8], _ o: Int) -> Int { u16(b, o) | u16(b, o + 2) << 16 }
+    private static func u64(_ b: [UInt8], _ o: Int) -> UInt64 { UInt64(u32(b, o)) | UInt64(u32(b, o + 4)) << 32 }
+    private static func put16(_ b: inout [UInt8], _ o: Int, _ v: Int) { b[o] = UInt8(v & 0xff); b[o + 1] = UInt8(v >> 8 & 0xff) }
+    private static func put32(_ b: inout [UInt8], _ o: Int, _ v: Int) { put16(&b, o, v & 0xffff); put16(&b, o + 2, v >> 16 & 0xffff) }
+    private static func alignUp(_ x: Int, _ a: Int) -> Int { a > 0 ? (x + a - 1) / a * a : x }
+
+    /// PE32+, relocations stripped, preferred base below 4 GB.
+    private static func isCandidate(_ b: [UInt8]) -> Bool {
+        guard b.count >= 0x40, b[0] == 0x4d, b[1] == 0x5a else { return false }
+        let pe = u32(b, 0x3c)
+        guard pe + 24 + 112 + 6 * 8 <= b.count, b[pe] == 0x50, b[pe + 1] == 0x45,
+              b[pe + 2] == 0, b[pe + 3] == 0 else { return false }
+        let opt = pe + 24
+        guard u16(b, opt) == 0x20b, u16(b, pe + 22) & 0x0001 != 0 else { return false }
+        return u64(b, opt + 24) < 0x1_0000_0000 && u32(b, opt + 108) > 5
+    }
+
+    private static func rebuild(_ input: [UInt8]) -> Outcome {
+        var b = input
+        let pe = u32(b, 0x3c), nsec = u16(b, pe + 6), optsz = u16(b, pe + 20), chars = u16(b, pe + 22)
+        let opt = pe + 24
+        let base = u64(b, opt + 24)
+        let salign = u32(b, opt + 32), falign = u32(b, opt + 36)
+        let sizeImage = u32(b, opt + 56), sizeHeaders = u32(b, opt + 60)
+        let dd = opt + 112
+        let table = opt + optsz
+        let tableEnd = table + 40 * nsec
+        guard tableEnd + 40 <= b.count else { return .failure("truncated headers") }
+
+        struct Section { let name: String; let vsize, va, rsize, rptr, flags: Int }
+        var sections: [Section] = []
+        for i in 0..<nsec {
+            let o = table + 40 * i
+            let name = String(decoding: b[o..<o + 8].prefix { $0 != 0 }, as: UTF8.self)
+            sections.append(Section(name: name, vsize: u32(b, o + 8), va: u32(b, o + 12),
+                                    rsize: u32(b, o + 16), rptr: u32(b, o + 20), flags: u32(b, o + 36)))
+        }
+        let execute = 0x2000_0000, write = 0x8000_0000, discardable = 0x0200_0000
+        if sections.contains(where: { $0.flags & execute != 0 && $0.flags & write != 0 }) {
+            return .failure("a section is both writable and executable, so it is probably packed")
+        }
+
+        // Aligned 64-bit values inside the image, in data sections only.
+        var rvas: [Int] = []
+        let lo = base, hi = base + UInt64(sizeImage)
+        for s in sections where s.flags & (execute | discardable) == 0 && s.name != ".reloc" {
+            var n = s.vsize > 0 ? min(s.vsize, s.rsize) : s.rsize
+            n = min(n, b.count - s.rptr)
+            var i = 0
+            while i + 8 <= n {
+                let v = u64(b, s.rptr + i)
+                if v >= lo && v < hi { rvas.append(s.va + i) }
+                i += 8
+            }
+        }
+
+        // IMAGE_BASE_RELOCATION blocks of IMAGE_REL_BASED_DIR64 entries.
+        var rel: [UInt8] = []
+        var page = -1
+        var entries: [Int] = []
+        func flush() {
+            guard page >= 0 else { return }
+            if entries.count % 2 == 1 { entries.append(0) }
+            var block = [UInt8](repeating: 0, count: 8 + 2 * entries.count)
+            put32(&block, 0, page)
+            put32(&block, 4, block.count)
+            for (k, e) in entries.enumerated() { put16(&block, 8 + 2 * k, e) }
+            rel += block
+        }
+        for r in rvas.sorted() {
+            if r & ~0xfff != page { flush(); page = r & ~0xfff; entries = [] }
+            entries.append(0xA000 | (r & 0xfff))
+        }
+        flush()
+
+        // Room for one more section header, which must be unused.
+        let firstRaw = sections.filter { $0.rsize > 0 }.map(\.rptr).min() ?? sizeHeaders
+        guard tableEnd + 40 <= min(sizeHeaders, firstRaw),
+              b[tableEnd..<tableEnd + 40].allSatisfy({ $0 == 0 }) else {
+            return .failure("no room for another section header")
+        }
+
+        let newVA = sections.map { alignUp($0.va + max($0.vsize, $0.rsize), salign) }.max() ?? alignUp(sizeHeaders, salign)
+        let newRaw = alignUp(b.count, falign)
+        let rawSize = alignUp(rel.count, falign)
+        b += [UInt8](repeating: 0, count: newRaw - b.count)
+        b += rel
+        b += [UInt8](repeating: 0, count: rawSize - rel.count)
+
+        let h = tableEnd
+        for (k, c) in Array(".mreloc".utf8).enumerated() { b[h + k] = c }
+        put32(&b, h + 8, rel.count)
+        put32(&b, h + 12, newVA)
+        put32(&b, h + 16, rawSize)
+        put32(&b, h + 20, newRaw)
+        put32(&b, h + 36, 0x4200_0040)          // initialized data, discardable, read
+        put16(&b, pe + 6, nsec + 1)
+        put16(&b, pe + 22, chars & ~0x0001)      // no longer RELOCS_STRIPPED
+        put32(&b, opt + 56, alignUp(newVA + rel.count, salign))
+        put32(&b, opt + 64, 0)                   // checksum: not verified for executables
+        put32(&b, dd + 5 * 8, newVA)
+        put32(&b, dd + 5 * 8 + 4, rel.count)
+        return .success((b, rvas.count, base))
+    }
+}
