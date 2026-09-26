@@ -60,7 +60,16 @@ struct LaunchRequest {
         }
         if avx { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
         if wineVCRT { setenv("MADEIRA_WINE_VCRT", "1", 1) } else { unsetenv("MADEIRA_WINE_VCRT") }
-        if nvidia { setenv("DXMT_ENABLE_NVEXT", "1", 1) } else { unsetenv("DXMT_ENABLE_NVEXT") }
+        if nvidia {
+            setenv("DXMT_ENABLE_NVEXT", "1", 1)
+            // The same GeForce RTX 3060 (10DE:2544) win32u registers as the
+            // display adapter (sysparams_ios.c, ios_virtual_gpu_ids); merged
+            // into DXMT_CONFIG by ContentView.
+            setenv("MADEIRA_DXMT_EXTRA", "dxgi.customDeviceId=2544", 1)
+        } else {
+            unsetenv("DXMT_ENABLE_NVEXT")
+            unsetenv("MADEIRA_DXMT_EXTRA")
+        }
         LogStore.shared.startSessionLog(program: programName)
     }
 

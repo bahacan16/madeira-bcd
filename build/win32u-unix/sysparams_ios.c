@@ -3153,6 +3153,78 @@ void reset_monitor_update_serial(void)
     pthread_mutex_unlock( &display_lock );
 }
 
+#ifdef WINE_IOS
+/* madeira-bcd: the GPU the virtual-monitor regime reports. Apple 106B:0001,
+ * the identity D3D9/DirectDraw/DXGI use -- unless the game's "Report an
+ * NVIDIA GPU" switch is on (DXMT_ENABLE_NVEXT=1), where DXGI says NVIDIA and
+ * the library passes dxgi.customDeviceId=2544 (GeForce RTX 3060) to match. */
+static void ios_virtual_gpu_ids( UINT16 *vendor, UINT16 *device )
+{
+    const char *nv = getenv( "DXMT_ENABLE_NVEXT" );
+    if (nv && nv[0] == '1') { *vendor = 0x10de; *device = 0x2544; }
+    else { *vendor = 0x106b; *device = 0x0001; }
+}
+
+/* madeira-bcd: this port never enumerates display devices (the service-process
+ * branch below), so the registry held no display adapter at all: no
+ * Enum\PCI entry for SetupAPI, no Class\{display}\0000 with DriverVersion, no
+ * DirectX\{guid} key -- and the DeviceKey EnumDisplayDevices hands out named a
+ * key that did not exist. Engines that read the driver version from there
+ * (Ghost of Tsushima: "Failed to get GPU Driver Info", then "No installed
+ * graphics card") found nothing. Write one adapter with Wine's own
+ * write_gpu_to_registry, once per process, without adding it to `gpus`: the
+ * display topology stays the virtual monitor's. */
+static void ios_register_virtual_gpu(void)
+{
+    static const char video_guid[] = "{8C0C2A5B-0E7E-4B0E-9E3F-1D0A6B5C4D21}";
+    static int done;
+    struct pci_id pci = {0};
+    struct gpu gpu = {0};
+    const char *name;
+    char buffer[MAX_PATH];
+    WCHAR bufferW[128];
+    DWORD len;
+    HKEY hkey;
+
+    if (done) return;
+    done = 1;
+    if (!enum_key) enum_key = reg_create_ascii_key( NULL, enum_keyA, 0, NULL );
+    if (!control_key) control_key = reg_create_ascii_key( NULL, control_keyA, 0, NULL );
+    if (!enum_key || !control_key) return;
+
+    ios_virtual_gpu_ids( &pci.vendor, &pci.device );
+    name = gpu_device_name( pci.vendor, pci.device, "Madeira Display" );
+    RtlUTF8ToUnicodeN( gpu.name, sizeof(gpu.name) - sizeof(WCHAR), &len, name, strlen( name ) );
+    gpu.refcount = 1;
+    gpu.index = 0;
+    memcpy( gpu.guid, video_guid, sizeof(gpu.guid) );
+    NtAllocateLocallyUniqueId( &gpu.luid );
+    snprintf( gpu.path, sizeof(gpu.path), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_00\\%08X",
+              pci.vendor, pci.device, gpu.index );
+    if (!write_gpu_to_registry( &gpu, &pci, (ULONGLONG)4096 * 1024 * 1024 ))
+    {
+        dprintf( 2, "[vgpu] could not write the virtual GPU to the registry\n" );
+        return;
+    }
+
+    /* The DeviceKey EnumDisplayDevices returns for the adapter. On Windows it
+     * carries the driver's identity too; give it the same values. */
+    snprintf( buffer, sizeof(buffer), "Video\\%s\\0000", video_guid );
+    if ((hkey = reg_create_ascii_key( control_key, buffer, 0, NULL )))
+    {
+        set_reg_ascii_value( hkey, "DriverVersion", driver_vendor_to_version( pci.vendor ) );
+        set_reg_ascii_value( hkey, "ProviderName", driver_vendor_to_name( pci.vendor ) );
+        asciiz_to_unicode( bufferW, "DriverDesc" );
+        set_reg_value( hkey, bufferW, REG_SZ, gpu.name, (wcslen( gpu.name ) + 1) * sizeof(WCHAR) );
+        asciiz_to_unicode( bufferW, "HardwareInformation.AdapterString" );
+        set_reg_value( hkey, bufferW, REG_SZ, gpu.name, (wcslen( gpu.name ) + 1) * sizeof(WCHAR) );
+        NtClose( hkey );
+    }
+    dprintf( 2, "[vgpu] registered %s (%04x:%04x) driver %s\n", gpu.path, pci.vendor, pci.device,
+             driver_vendor_to_version( pci.vendor ) );
+}
+#endif
+
 static BOOL lock_display_devices( BOOL force )
 {
     static const WCHAR wine_service_station_name[] =
@@ -3221,6 +3293,9 @@ static BOOL lock_display_devices( BOOL force )
         clear_display_devices();
         list_add_tail( &monitors, &virtual_monitor.entry );
         set_winstation_monitors( TRUE );
+#ifdef WINE_IOS
+        ios_register_virtual_gpu();
+#endif
         return TRUE;
     }
 
@@ -4714,8 +4789,13 @@ NTSTATUS WINAPI NtUserEnumDisplayDevices( UNICODE_STRING *device, DWORD index,
                 if (flags & EDD_GET_DEVICE_INTERFACE_NAME)
                     *info->DeviceID = 0;
                 else
-                    asciiz_to_unicode( info->DeviceID,
-                                       "PCI\\VEN_106B&DEV_0001&SUBSYS_00000000&REV_00" );
+                {
+                    UINT16 vendor, device;
+                    char id[64];
+                    ios_virtual_gpu_ids( &vendor, &device );   /* madeira-bcd: the registered GPU's ids */
+                    snprintf( id, sizeof(id), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_00000000&REV_00", vendor, device );
+                    asciiz_to_unicode( info->DeviceID, id );
+                }
             }
             else if (flags & EDD_GET_DEVICE_INTERFACE_NAME)
             {

@@ -2259,12 +2259,21 @@ struct ContentView: View {
             // d3d11.mipClampBC=N is the one that matters for memory: this GPU cannot
             // sample BC, so those textures are expanded to uncompressed and cost 2-8x
             // their shipped size.
-            if let txt = MadeiraConfig.get("dxmt") {
-                let v = txt.replacingOccurrences(of: ";", with: "\n").trimmingCharacters(in: .whitespacesAndNewlines)   /* ml1095: "a=b;c=d" on one line */
-                if !v.isEmpty {
-                    setenv("DXMT_CONFIG", v, 1)
-                    logStore.log("DXMT config: \(v) via madeira.cfg dxmt")
+            do {
+                var parts: [String] = []
+                if let txt = MadeiraConfig.get("dxmt") {
+                    let v = txt.replacingOccurrences(of: ";", with: "\n").trimmingCharacters(in: .whitespacesAndNewlines)   /* ml1095: "a=b;c=d" on one line */
+                    if !v.isEmpty {
+                        parts.append(v)
+                        logStore.log("DXMT config: \(v) via madeira.cfg dxmt")
+                    }
                 }
+                // madeira-bcd: per-game options from the library (LaunchRequest).
+                if let c = getenv("MADEIRA_DXMT_EXTRA"), case let extra = String(cString: c), !extra.isEmpty {
+                    parts.append(extra)
+                    logStore.log("DXMT config: \(extra) via the game's settings")
+                }
+                if parts.isEmpty { unsetenv("DXMT_CONFIG") } else { setenv("DXMT_CONFIG", parts.joined(separator: "\n"), 1) }
             }
 
             // Native D3D9 frontend A/B. The i386 d3d9.dll a 32-bit program imports

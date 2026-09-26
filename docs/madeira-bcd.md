@@ -137,6 +137,18 @@ already did.
   `NvAPI_GetAssociatedNvidiaDisplayHandle`, `NvAPI_GetAssociatedDisplayOutputId`,
   `NvAPI_GPU_GetPCIIdentifiers`) and logs each queried function once as
   `[nvapi] query`.
+- Virtual display adapter in the registry (`build/win32u-unix/sysparams_ios.c`,
+  `ios_register_virtual_gpu`): this port never enumerates display devices, so
+  the registry had no display adapter at all -- no `Enum\PCI` entry for
+  SetupAPI, no `Class\{display}\0000` with `DriverVersion`, no DirectX key, and
+  the `DeviceKey` EnumDisplayDevices returns did not exist. Each process now
+  writes one adapter with Wine's `write_gpu_to_registry` (not added to the GPU
+  list; the topology stays the virtual monitor's). It is Apple 106B:0001, or
+  NVIDIA GeForce RTX 3060 10DE:2544 with driver 35.0.15.6094 when the game's
+  "Report an NVIDIA GPU" is on, in which case DXGI gets
+  `dxgi.customDeviceId=2544` too (appended to `DXMT_CONFIG`), so DXGI,
+  EnumDisplayDevices, SetupAPI and NVAPI name one GPU. Ghost of Tsushima still
+  said "Failed to get GPU Driver Info" with NVAPI alone.
 - `vulkan-1.dll` (and d3d10/avifil32 if the build above failed)
   (`tools/build-stub-dlls.py`):
   stand-ins generated from Wine's `.spec` export lists, for games that import
