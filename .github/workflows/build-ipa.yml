@@ -109,6 +109,23 @@ jobs:
           else:
               print("::error::makedep.c anchor not found -- wine moved, review this step")
               sys.exit(1)
+          # The WoW64 series' wine (125hz pr/wow64-core) includes Madeira's
+          # iOS shim headers (ios_fastsync.h, ios_srv_stats.h, ...) by bare
+          # name; the iOS builds find them with -I build/ntdll-unix/shims,
+          # makedep does not and stops configure. They are outside the tree
+          # like a system header, so skip them the way makedep skips those.
+          s = open(p).read()
+          old = '    if (make->external) return NULL; /* ignore missing files in external libs */\n'
+          new = old + ('    if (!strncmp( source->name, "ios_", 4 )) return NULL;  '
+                       '/* madeira-bcd CI: build/ntdll-unix/shims */\n')
+          if new in s:
+              print("makedep: ios_* shims already skipped")
+          elif s.count(old) == 1:
+              open(p, "w").write(s.replace(old, new))
+              print("makedep: missing ios_* shim headers are skipped")
+          else:
+              print("::error::makedep.c external-lib anchor not found -- wine moved, review this step")
+              sys.exit(1)
           PYEOF
 
       - name: Restore native wine tools
