@@ -835,6 +835,23 @@ static void *wine_process_thread(void *arg) {
             // msvcp140 / vcruntime140 binaries from VC_redist.x64.exe so games
             // that exercise the full C++ runtime (parallel_for, atomic_wait,
             // <filesystem>, etc.) don't trip __wine_unimplemented stubs.
+            /* madeira-bcd: MADEIRA_WINE_VCRT=1 (a per-game switch) keeps
+             * Wine's ARM64EC builtins for every VC++ runtime DLL. Ghost of
+             * Tsushima dies right after loading the MS x86_64 concrt140,
+             * in the x64<->EC transition the two exemptions below describe. */
+            const char *wineVcrt = getenv("MADEIRA_WINE_VCRT");
+            if (use_arm64ec && wineVcrt && wineVcrt[0] == '1') {
+                for (NSString *dll in [fm contentsOfDirectoryAtPath:[bundlePath stringByAppendingPathComponent:@"x86_64-vcruntime"] error:nil]) {
+                    NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
+                    NSString *builtin = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"] stringByAppendingPathComponent:dll];
+                    if ([fm fileExistsAtPath:builtin]) {
+                        [fm removeItemAtPath:dst error:nil];
+                        [fm createSymbolicLinkAtPath:dst withDestinationPath:builtin error:nil];
+                    }
+                }
+                LOG("MADEIRA_WINE_VCRT=1: Wine's ARM64EC VC++ runtime builtins kept, no MS overlay");
+                dprintf(STDERR_FILENO, "[WineProc] MADEIRA_WINE_VCRT=1: MS VC++ runtime overlay skipped\n");
+            } else
             if (use_arm64ec) {
                 NSString *vcrtSource = [bundlePath stringByAppendingPathComponent:@"x86_64-vcruntime"];
                 NSArray *vcrtDlls = [fm contentsOfDirectoryAtPath:vcrtSource error:nil];

@@ -40,6 +40,9 @@ struct LaunchRequest {
     /// Tell FEX to expose AVX/AVX2 (tools/patch-fex-ios-avx.py). Off unless
     /// the game's settings turn it on.
     var avx = false
+    /// Keep Wine's VC++ runtime instead of overlaying Microsoft's x86_64 one
+    /// (WineProcessBridge.m, MADEIRA_WINE_VCRT).
+    var wineVCRT = false
 
     func apply() {
         ExperimentalSettings.exportToEnvironment()
@@ -53,6 +56,7 @@ struct LaunchRequest {
             unsetenv("MADEIRA_DESKTOP")
         }
         if avx { setenv("MADEIRA_FEX_AVX", "1", 1) } else { unsetenv("MADEIRA_FEX_AVX") }
+        if wineVCRT { setenv("MADEIRA_WINE_VCRT", "1", 1) } else { unsetenv("MADEIRA_WINE_VCRT") }
     }
 
     /// Identical to the "Wine Virtual Desktop" button: explorer as the shell,
@@ -170,6 +174,7 @@ enum LibraryPrefs {
     private static let playedKey = "madeira.library.lastPlayed"
     private static let desktopKey = "madeira.library.inDesktop"
     private static let avxKey = "madeira.library.avx"
+    private static let vcrtKey = "madeira.library.wineVCRT"
 
     private static func dict<T>(_ key: String) -> [String: T] {
         (UserDefaults.standard.dictionary(forKey: key) as? [String: T]) ?? [:]
@@ -195,6 +200,9 @@ enum LibraryPrefs {
 
     static func avx(_ windowsPath: String) -> Bool { (dict(avxKey) as [String: Bool])[windowsPath] ?? false }
     static func setAVX(_ on: Bool, for windowsPath: String) { store(on ? true : nil, avxKey, windowsPath) }
+
+    static func wineVCRT(_ windowsPath: String) -> Bool { (dict(vcrtKey) as [String: Bool])[windowsPath] ?? false }
+    static func setWineVCRT(_ on: Bool, for windowsPath: String) { store(on ? true : nil, vcrtKey, windowsPath) }
 }
 
 /// Reads the PE header's Machine field. Two small reads per file, off the main
@@ -643,6 +651,7 @@ struct HomeView: View {
             request = LaunchRequest(title: game.title, exe: exe.windowsPath, args: args, desktop: nil)
         }
         request.avx = LibraryPrefs.avx(exe.windowsPath)
+        request.wineVCRT = LibraryPrefs.wineVCRT(exe.windowsPath)
         LibraryPrefs.markPlayed(game.title)
         start(request)
     }
@@ -826,6 +835,7 @@ struct GameSettingsSheet: View {
     @State private var args: String
     @State private var inDesktop: Bool
     @State private var avx: Bool
+    @State private var wineVCRT: Bool
     @State private var photo: PhotosPickerItem?
     @State private var tick = 0
 
@@ -839,6 +849,7 @@ struct GameSettingsSheet: View {
         _args = State(initialValue: GameArguments.get(exe.windowsPath))
         _inDesktop = State(initialValue: LibraryPrefs.inDesktop(exe.windowsPath))
         _avx = State(initialValue: LibraryPrefs.avx(exe.windowsPath))
+        _wineVCRT = State(initialValue: LibraryPrefs.wineVCRT(exe.windowsPath))
     }
 
     private var selected: GuestExecutable {
@@ -899,6 +910,7 @@ struct GameSettingsSheet: View {
                         .textInputAutocapitalization(.never)
                     Toggle("Run inside the Wine desktop", isOn: $inDesktop)
                     Toggle("AVX / AVX2", isOn: $avx)
+                    Toggle("Wine's C++ runtime", isOn: $wineVCRT)
                 } header: {
                     Text("Launch options")
                 } footer: {
@@ -906,7 +918,9 @@ struct GameSettingsSheet: View {
                          + "which Madeira does not implement -- they need -dx11. The Wine desktop gives a "
                          + "program a window manager; most games do not need one. Turn on AVX when a game "
                          + "quits at start with \"illegal instruction\" (c000001d) in the log: it was built "
-                         + "for AVX CPUs. Emulated AVX is slower, so leave it off otherwise.")
+                         + "for AVX CPUs. Emulated AVX is slower, so leave it off otherwise. Wine's C++ runtime "
+                         + "replaces Microsoft's concrt140/msvcp140_* for a game that crashes right after "
+                         + "loading them.")
                 }
 
                 Section {
@@ -939,6 +953,7 @@ struct GameSettingsSheet: View {
                 args = GameArguments.get(newPath)
                 inDesktop = LibraryPrefs.inDesktop(newPath)
                 avx = LibraryPrefs.avx(newPath)
+                wineVCRT = LibraryPrefs.wineVCRT(newPath)
             }
             .onChange(of: photo) { _, item in
                 guard let item else { return }
@@ -961,6 +976,7 @@ struct GameSettingsSheet: View {
         GameArguments.set(args, for: exePath)
         LibraryPrefs.setInDesktop(inDesktop, for: exePath)
         LibraryPrefs.setAVX(avx, for: exePath)
+        LibraryPrefs.setWineVCRT(wineVCRT, for: exePath)
     }
 }
 
