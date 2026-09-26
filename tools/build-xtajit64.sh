@@ -23,10 +23,14 @@ JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 # built from the pristine submodule, as the committed one was.
 git -C FEX diff --name-only | while read -r f; do git -C FEX checkout -- "$f"; done
 
-if [ ! -f "$B/CMakeCache.txt" ]; then
+# TUNE_CPU: FEX's default "native" probes /proc/cpuinfo through a script that
+# needs pkg_resources; on a Linux x86 host it settles on cortex-a78, which is
+# what reproduces the committed module, and on the macOS runner it aborts the
+# configure. Name it outright.
+if [ ! -f "$B/build.ninja" ]; then
     cmake -S "$R/FEX" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE="$R/FEX/Data/CMake/toolchain_mingw.cmake" \
-        -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
+        -DMINGW_TRIPLE=arm64ec-w64-mingw32 -DTUNE_CPU=cortex-a78 \
         -DFEX_IOS_HOST_BUILD=ON \
         -DCMAKE_C_FLAGS=-DFEX_IOS_HOST=1 -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST=1 \
         -DENABLE_LTO=OFF -DENABLE_FEX_ALLOCATOR=ON -DENABLE_JEMALLOC_GLIBC_ALLOC=ON \
