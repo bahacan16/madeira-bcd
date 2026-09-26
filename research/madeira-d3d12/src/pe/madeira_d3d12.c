@@ -8016,6 +8016,289 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
                                       struct madeira_ir_vs_input *vsin, unsigned vsin_cap, unsigned *vsin_n,
                                       UINT *tg_out, struct madeira_ir_loc *locs, unsigned *nlocs,
                                       const struct mad_convert_opts *o);
+/* madeira-bcd: PERSISTENT SHADER CACHE. Every DXIL/DXBC -> metallib
+ * conversion is keyed by a hash of ALL its inputs (bytecode, entry, root
+ * signature, static samplers, input layout, paired stages, pixel flags, target)
+ * and stored under %LOCALAPPDATA%\Madeira\ShaderCache\<build>\ with every
+ * output the converter returns. A game's second launch then skips the
+ * converter for every shader it saw before (Ghost of Tsushima converts ~29,000
+ * stages at New Game; a PC takes 2-3 minutes for its own shader cache there).
+ * The build stamp is part of the key and the path, so a different
+ * madeira_d3d12 build never reads another build's output; older build
+ * directories are deleted in the background. madeira.cfg shader-cache = 0
+ * turns it off. */
+#define MAD_SC_MAGIC 0x3143534du   /* "MSC1" */
+struct mad_sc_hdr {
+    UINT32 magic, hdr_size;
+    UINT64 key[2];
+    UINT64 ret_len, ret_len2;
+    UINT32 ret_stage, ret_status, ret_error_code, ret_vs_input_count;
+    UINT32 ret_tg_size[3], ret_loc_count;
+    UINT32 ret_vs_output_size, ret_gs_max_prims, ret_gs_payload, ret_gs_passthrough;
+    UINT32 ret_air_nranges, ret_backend, ret_cb_table_bind, ret_arg_table_bind, ret_arg_qwords, ret_air_slot_mask;
+    UINT32 ret_threads_per_patch, ret_tess_out_prim, ret_max_potential_factor, ret_air_nranges2;
+    UINT32 ret_cb_table_bind2, ret_arg_table_bind2, ret_arg_qwords2;
+    UINT32 n_vsin, n_loc, n_air, n_air2, entry_len;
+    char note[128];
+};
+static int g_sc_on = -1;
+static WCHAR g_sc_root[MAX_PATH], g_sc_build[64], g_sc_dir[MAX_PATH];
+static volatile LONG g_sc_hit, g_sc_miss, g_sc_store;
+static const char g_sc_stamp[] = "madeira_d3d12 " __DATE__ " " __TIME__;
+
+struct mad_sc_hash { UINT64 a, b; };
+static void mad_sc_feed(struct mad_sc_hash *h, const void *p, SIZE_T n) {
+    const unsigned char *c = (const unsigned char *)p; SIZE_T i;
+    UINT64 a = h->a, b = h->b;
+    for (i = 0; i < n; i++) {
+        a = (a ^ c[i]) * 0x100000001b3ull;
+        b = (b + c[i] + 1) * 0x9e3779b97f4a7c15ull; b ^= b >> 31;
+    }
+    a ^= (UINT64)n; a *= 0xff51afd7ed558ccdull;
+    h->a = a; h->b = b;
+}
+static void mad_sc_feed_u64(struct mad_sc_hash *h, UINT64 v) { mad_sc_feed(h, &v, sizeof v); }
+static void mad_sc_feed_str(struct mad_sc_hash *h, UINT64 p) {
+    const char *s = (const char *)(uintptr_t)p;
+    if (s) mad_sc_feed(h, s, strlen(s) + 1); else mad_sc_feed_u64(h, 0);
+}
+static void mad_sc_feed_blob(struct mad_sc_hash *h, UINT64 p, UINT64 n) {
+    if (p && n) mad_sc_feed(h, (const void *)(uintptr_t)p, (SIZE_T)n); else mad_sc_feed_u64(h, 0);
+}
+
+/* The key: every input field. Output pointers and capacities are left out on
+ * purpose -- the sizing call and the real call carry different ones and must
+ * find the same entry. */
+static void mad_sc_key(const struct madeira_ir_convert_args *a, UINT64 key[2]) {
+    struct mad_sc_hash h = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
+    const struct madeira_ir_input_layout *lay = (const struct madeira_ir_input_layout *)(uintptr_t)a->layout;
+    mad_sc_feed(&h, g_sc_stamp, sizeof g_sc_stamp);
+    mad_sc_feed_blob(&h, a->dxil, a->dxil_len);
+    mad_sc_feed_str(&h, a->entry_point);
+    mad_sc_feed_blob(&h, a->params, a->num_params * sizeof(struct madeira_ir_root_param));
+    mad_sc_feed_blob(&h, a->ranges, a->num_ranges * sizeof(struct madeira_ir_root_range));
+    mad_sc_feed_blob(&h, a->samplers, (UINT64)a->num_samplers * sizeof(struct madeira_ir_static_sampler));
+    mad_sc_feed_u64(&h, a->root_flags);
+    mad_sc_feed_u64(&h, ((UINT64)a->target_os << 32) | a->gpu_family);
+    mad_sc_feed_str(&h, a->os_version);
+    mad_sc_feed_u64(&h, ((UINT64)a->gs_emulation << 32) | a->input_topology);
+    if (lay) {
+        UINT32 n = lay->n < 31 ? lay->n : 31;
+        mad_sc_feed(&h, &lay->n, sizeof lay->n);
+        mad_sc_feed(&h, lay->el, n * sizeof lay->el[0]);
+    } else mad_sc_feed_u64(&h, 0);
+    mad_sc_feed_u64(&h, ((UINT64)a->ps_valid << 32) | a->ps_sample_mask);
+    mad_sc_feed_u64(&h, ((UINT64)a->ps_flags << 32) | a->ps_unorm_output_mask);
+    mad_sc_feed_blob(&h, a->vs_bytecode, a->vs_bytecode_len);
+    mad_sc_feed_u64(&h, ((UINT64)a->tess_stage << 32) | a->tess_index_format);
+    mad_sc_feed_blob(&h, a->hs_bytecode, a->hs_bytecode_len);
+    mad_sc_feed_blob(&h, a->ds_bytecode, a->ds_bytecode_len);
+    mad_sc_feed_u64(&h, ((UINT64)a->gs_stage << 32) | a->gs_strip);
+    mad_sc_feed_blob(&h, a->gs_bytecode, a->gs_bytecode_len);
+    mad_sc_feed_u64(&h, ((UINT64)(a->out_air_ranges != 0) << 1) | (a->out_air_ranges2 != 0));
+    key[0] = h.a; key[1] = h.b;
+}
+
+static void mad_sc_rmtree(const WCHAR *dir) {
+    WCHAR pat[MAX_PATH], sub[MAX_PATH]; WIN32_FIND_DATAW fd; HANDLE f;
+    _snwprintf(pat, MAX_PATH, L"%ls\\*", dir);
+    f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            _snwprintf(sub, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) mad_sc_rmtree(sub); else DeleteFileW(sub);
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    RemoveDirectoryW(dir);
+}
+static DWORD WINAPI mad_sc_prune(void *arg) {   /* other builds' caches */
+    WCHAR pat[MAX_PATH], sub[MAX_PATH]; WIN32_FIND_DATAW fd; HANDLE f; unsigned n = 0;
+    (void)arg;
+    _snwprintf(pat, MAX_PATH, L"%ls\\*", g_sc_root);
+    f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..") || !wcscmp(fd.cFileName, g_sc_build)) continue;
+        _snwprintf(sub, MAX_PATH, L"%ls\\%ls", g_sc_root, fd.cFileName);
+        mad_sc_rmtree(sub); n++;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    if (n) d3d12_log("[madeira-d3d12] shader cache: removed %u older build cache(s)\n", n);
+    return 0;
+}
+static int mad_sc_init(void) {
+    static SRWLOCK lk = SRWLOCK_INIT;
+    if (g_sc_on >= 0) return g_sc_on;
+    AcquireSRWLockExclusive(&lk);
+    if (g_sc_on < 0) {
+        WCHAR base[MAX_PATH]; DWORD n; int on = mad_cfg_int_pe("shader-cache", 1) ? 1 : 0;
+        if (on) {
+            struct mad_sc_hash h = { 0xcbf29ce484222325ull, 0x84222325cbf29ce4ull };
+            mad_sc_feed(&h, g_sc_stamp, sizeof g_sc_stamp);
+            n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+            if (!n || n >= MAX_PATH - 64) on = 0;
+            else {
+                _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira", base); CreateDirectoryW(g_sc_root, NULL);
+                _snwprintf(g_sc_root, MAX_PATH, L"%ls\\Madeira\\ShaderCache", base); CreateDirectoryW(g_sc_root, NULL);
+                _snwprintf(g_sc_build, 64, L"%016llx", (unsigned long long)h.a);
+                _snwprintf(g_sc_dir, MAX_PATH, L"%ls\\%ls", g_sc_root, g_sc_build);
+                CreateDirectoryW(g_sc_dir, NULL);
+                { HANDLE t = CreateThread(NULL, 0, mad_sc_prune, NULL, 0, NULL); if (t) CloseHandle(t); }
+            }
+        }
+        if (on) d3d12_log("[madeira-d3d12] shader cache ON: %ls (madeira.cfg shader-cache = 0 turns it off)\n", g_sc_dir);
+        else d3d12_log("[madeira-d3d12] shader cache off\n");
+        g_sc_on = on;
+    }
+    ReleaseSRWLockExclusive(&lk);
+    return g_sc_on;
+}
+static void mad_sc_path(const UINT64 key[2], WCHAR *out, int mkdir) {
+    WCHAR sub[MAX_PATH];
+    _snwprintf(sub, MAX_PATH, L"%ls\\%02x", g_sc_dir, (unsigned)(key[0] >> 56));
+    if (mkdir) CreateDirectoryW(sub, NULL);
+    _snwprintf(out, MAX_PATH, L"%ls\\%016llx%016llx.msc", sub, (unsigned long long)key[0], (unsigned long long)key[1]);
+}
+static void mad_sc_stats(void) {
+    LONG t = g_sc_hit + g_sc_miss;
+    if (t == 1 || (t % 1000) == 0)
+        d3d12_log("[madeira-d3d12] shader cache: %ld hits, %ld misses, %ld stored\n", g_sc_hit, g_sc_miss, g_sc_store);
+}
+#define MAD_SC_MIN(x, y) ((x) < (y) ? (x) : (y))
+
+/* A hit fills every output as MadeiraIRConvert would; a sizing call (no
+ * out_buf) gets BUFFER_TOO_SMALL with the length. Returns 1 on a hit. */
+static int mad_sc_load(struct madeira_ir_convert_args *a, const UINT64 key[2]) {
+    WCHAR path[MAX_PATH]; HANDLE f; LARGE_INTEGER sz; unsigned char *blob, *q; DWORD got;
+    struct mad_sc_hdr h; int ok = 0;
+    mad_sc_path(key, path, 0);
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    if (!GetFileSizeEx(f, &sz) || sz.QuadPart < (LONGLONG)sizeof h || sz.QuadPart > (256ll << 20)) { CloseHandle(f); return 0; }
+    blob = malloc((SIZE_T)sz.QuadPart);
+    if (!blob) { CloseHandle(f); return 0; }
+    if (ReadFile(f, blob, (DWORD)sz.QuadPart, &got, NULL) && got == (DWORD)sz.QuadPart) {
+        memcpy(&h, blob, sizeof h);
+        if (h.magic == MAD_SC_MAGIC && h.hdr_size == sizeof h && h.key[0] == key[0] && h.key[1] == key[1] &&
+            h.ret_status == MADEIRA_IR_OK && h.entry_len <= MADEIRA_IR_ENTRY_MAX &&
+            sizeof h + h.ret_len + h.ret_len2 + h.entry_len
+              + (UINT64)h.n_vsin * sizeof(struct madeira_ir_vs_input)
+              + (UINT64)h.n_loc * sizeof(struct madeira_ir_loc)
+              + (UINT64)(h.n_air + h.n_air2) * sizeof(struct madeira_ir_air_range) == (UINT64)sz.QuadPart &&
+            (!a->out_vs_inputs || MAD_SC_MIN(h.ret_vs_input_count, a->vs_input_cap) <= h.n_vsin) &&
+            (!a->out_locs || MAD_SC_MIN(h.ret_loc_count, a->loc_cap) <= h.n_loc) &&
+            (!a->out_air_ranges || MAD_SC_MIN(h.ret_air_nranges, a->air_range_cap) <= h.n_air) &&
+            (!a->out_air_ranges2 || MAD_SC_MIN(h.ret_air_nranges2, a->air_range_cap2) <= h.n_air2) &&
+            (!a->out_buf2 || h.ret_len2 <= a->out_cap2)) {
+            q = blob + sizeof h;
+            a->ret_len = h.ret_len; a->ret_len2 = h.ret_len2;
+            a->ret_stage = h.ret_stage; a->ret_error_code = h.ret_error_code;
+            a->ret_vs_input_count = h.ret_vs_input_count; a->ret_loc_count = h.ret_loc_count;
+            memcpy(a->ret_tg_size, h.ret_tg_size, sizeof a->ret_tg_size);
+            a->ret_vs_output_size = h.ret_vs_output_size; a->ret_gs_max_prims = h.ret_gs_max_prims;
+            a->ret_gs_payload = h.ret_gs_payload; a->ret_gs_passthrough = h.ret_gs_passthrough;
+            a->ret_air_nranges = h.ret_air_nranges; a->ret_backend = h.ret_backend;
+            a->ret_cb_table_bind = h.ret_cb_table_bind; a->ret_arg_table_bind = h.ret_arg_table_bind;
+            a->ret_arg_qwords = h.ret_arg_qwords; a->ret_air_slot_mask = h.ret_air_slot_mask;
+            a->ret_threads_per_patch = h.ret_threads_per_patch; a->ret_tess_out_prim = h.ret_tess_out_prim;
+            a->ret_max_potential_factor = h.ret_max_potential_factor; a->ret_air_nranges2 = h.ret_air_nranges2;
+            a->ret_cb_table_bind2 = h.ret_cb_table_bind2; a->ret_arg_table_bind2 = h.ret_arg_table_bind2;
+            a->ret_arg_qwords2 = h.ret_arg_qwords2;
+            memcpy(a->ret_note, h.note, sizeof a->ret_note);
+            if (a->out_buf && a->out_cap >= h.ret_len) {
+                memcpy((void *)(uintptr_t)a->out_buf, q, (SIZE_T)h.ret_len);
+                a->ret_status = MADEIRA_IR_OK;
+            } else a->ret_status = MADEIRA_IR_BUFFER_TOO_SMALL;
+            q += h.ret_len;
+            if (a->out_buf2 && h.ret_len2) memcpy((void *)(uintptr_t)a->out_buf2, q, (SIZE_T)h.ret_len2);
+            q += h.ret_len2;
+            if (a->out_entry && h.entry_len) memcpy((void *)(uintptr_t)a->out_entry, q, h.entry_len);
+            q += h.entry_len;
+            if (a->out_vs_inputs)
+                memcpy((void *)(uintptr_t)a->out_vs_inputs, q, MAD_SC_MIN(h.n_vsin, a->vs_input_cap) * sizeof(struct madeira_ir_vs_input));
+            q += (SIZE_T)h.n_vsin * sizeof(struct madeira_ir_vs_input);
+            if (a->out_locs)
+                memcpy((void *)(uintptr_t)a->out_locs, q, MAD_SC_MIN(h.n_loc, a->loc_cap) * sizeof(struct madeira_ir_loc));
+            q += (SIZE_T)h.n_loc * sizeof(struct madeira_ir_loc);
+            if (a->out_air_ranges)
+                memcpy((void *)(uintptr_t)a->out_air_ranges, q, MAD_SC_MIN(h.n_air, a->air_range_cap) * sizeof(struct madeira_ir_air_range));
+            q += (SIZE_T)h.n_air * sizeof(struct madeira_ir_air_range);
+            if (a->out_air_ranges2)
+                memcpy((void *)(uintptr_t)a->out_air_ranges2, q, MAD_SC_MIN(h.n_air2, a->air_range_cap2) * sizeof(struct madeira_ir_air_range));
+            ok = 1;
+        }
+    }
+    free(blob);
+    CloseHandle(f);
+    return ok;
+}
+static void mad_sc_save(const struct madeira_ir_convert_args *a, const UINT64 key[2]) {
+    struct mad_sc_hdr h; WCHAR path[MAX_PATH], tmp[MAX_PATH]; HANDLE f; DWORD put;
+    UINT32 entry_len = 0; unsigned char *blob, *q; SIZE_T total;
+    if (a->out_entry) entry_len = (UINT32)strnlen((const char *)(uintptr_t)a->out_entry, MADEIRA_IR_ENTRY_MAX - 1) + 1;
+    memset(&h, 0, sizeof h);
+    h.magic = MAD_SC_MAGIC; h.hdr_size = sizeof h; h.key[0] = key[0]; h.key[1] = key[1];
+    h.ret_len = a->ret_len; h.ret_len2 = (a->out_buf2 && a->ret_len2 <= a->out_cap2) ? a->ret_len2 : 0;
+    h.ret_stage = a->ret_stage; h.ret_status = a->ret_status; h.ret_error_code = a->ret_error_code;
+    h.ret_vs_input_count = a->ret_vs_input_count; h.ret_loc_count = a->ret_loc_count;
+    memcpy(h.ret_tg_size, a->ret_tg_size, sizeof h.ret_tg_size);
+    h.ret_vs_output_size = a->ret_vs_output_size; h.ret_gs_max_prims = a->ret_gs_max_prims;
+    h.ret_gs_payload = a->ret_gs_payload; h.ret_gs_passthrough = a->ret_gs_passthrough;
+    h.ret_air_nranges = a->ret_air_nranges; h.ret_backend = a->ret_backend;
+    h.ret_cb_table_bind = a->ret_cb_table_bind; h.ret_arg_table_bind = a->ret_arg_table_bind;
+    h.ret_arg_qwords = a->ret_arg_qwords; h.ret_air_slot_mask = a->ret_air_slot_mask;
+    h.ret_threads_per_patch = a->ret_threads_per_patch; h.ret_tess_out_prim = a->ret_tess_out_prim;
+    h.ret_max_potential_factor = a->ret_max_potential_factor; h.ret_air_nranges2 = a->ret_air_nranges2;
+    h.ret_cb_table_bind2 = a->ret_cb_table_bind2; h.ret_arg_table_bind2 = a->ret_arg_table_bind2;
+    h.ret_arg_qwords2 = a->ret_arg_qwords2;
+    memcpy(h.note, a->ret_note, sizeof h.note);
+    h.n_vsin = a->out_vs_inputs ? MAD_SC_MIN(a->ret_vs_input_count, a->vs_input_cap) : 0;
+    h.n_loc = a->out_locs ? MAD_SC_MIN(a->ret_loc_count, a->loc_cap) : 0;
+    h.n_air = a->out_air_ranges ? MAD_SC_MIN(a->ret_air_nranges, a->air_range_cap) : 0;
+    h.n_air2 = a->out_air_ranges2 ? MAD_SC_MIN(a->ret_air_nranges2, a->air_range_cap2) : 0;
+    h.entry_len = entry_len;
+    total = sizeof h + (SIZE_T)h.ret_len + (SIZE_T)h.ret_len2 + entry_len
+          + (SIZE_T)h.n_vsin * sizeof(struct madeira_ir_vs_input) + (SIZE_T)h.n_loc * sizeof(struct madeira_ir_loc)
+          + (SIZE_T)(h.n_air + h.n_air2) * sizeof(struct madeira_ir_air_range);
+    if (!(blob = malloc(total))) return;
+    q = blob; memcpy(q, &h, sizeof h); q += sizeof h;
+    memcpy(q, (const void *)(uintptr_t)a->out_buf, (SIZE_T)h.ret_len); q += h.ret_len;
+    if (h.ret_len2) { memcpy(q, (const void *)(uintptr_t)a->out_buf2, (SIZE_T)h.ret_len2); q += h.ret_len2; }
+    if (entry_len) { memcpy(q, (const void *)(uintptr_t)a->out_entry, entry_len); q += entry_len; }
+    if (h.n_vsin) { memcpy(q, (const void *)(uintptr_t)a->out_vs_inputs, h.n_vsin * sizeof(struct madeira_ir_vs_input)); q += h.n_vsin * sizeof(struct madeira_ir_vs_input); }
+    if (h.n_loc) { memcpy(q, (const void *)(uintptr_t)a->out_locs, h.n_loc * sizeof(struct madeira_ir_loc)); q += h.n_loc * sizeof(struct madeira_ir_loc); }
+    if (h.n_air) { memcpy(q, (const void *)(uintptr_t)a->out_air_ranges, h.n_air * sizeof(struct madeira_ir_air_range)); q += h.n_air * sizeof(struct madeira_ir_air_range); }
+    if (h.n_air2) { memcpy(q, (const void *)(uintptr_t)a->out_air_ranges2, h.n_air2 * sizeof(struct madeira_ir_air_range)); }
+    mad_sc_path(key, path, 1);
+    _snwprintf(tmp, MAX_PATH, L"%ls.%lx.tmp", path, GetCurrentThreadId());
+    f = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        BOOL w = WriteFile(f, blob, (DWORD)total, &put, NULL) && put == (DWORD)total;
+        CloseHandle(f);
+        if (w && MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) InterlockedIncrement(&g_sc_store);
+        else DeleteFileW(tmp);
+    }
+    free(blob);
+}
+static void mad_ir_convert_cached(struct madeira_ir_convert_args *a) {
+    UINT64 key[2];
+    if (!mad_sc_init()) { MadeiraIRConvert(a); return; }
+    mad_sc_key(a, key);
+    if (mad_sc_load(a, key)) {
+        if (a->out_buf) { InterlockedIncrement(&g_sc_hit); mad_sc_stats(); }
+        return;
+    }
+    MadeiraIRConvert(a);
+    if (a->out_buf && a->ret_status == MADEIRA_IR_OK && a->ret_len <= a->out_cap) {
+        InterlockedIncrement(&g_sc_miss);
+        mad_sc_save(a, key);
+        mad_sc_stats();
+    }
+}
+
 /* ml1011: mad_convert_stage (the no-options wrapper) was removed -- every
  * caller now passes options, because the DXBC backend needs them. */
 static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_rootsig *rs,
@@ -8067,7 +8350,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     }
 
     /* Ask for the size, then convert into a buffer that fits. */
-    MadeiraIRConvert(&a);
+    mad_ir_convert_cached(&a);   /* madeira-bcd: persistent shader cache */
     if (a.ret_status != MADEIRA_IR_BUFFER_TOO_SMALL && a.ret_status != MADEIRA_IR_OK) {
         const unsigned char *b = (const unsigned char *)dxil;
         d3d12_log("[madeira-d3d12] %s conversion failed: %s (%s backend, code %u); %llu bytes, head "
@@ -8144,7 +8427,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     }
     a.out_entry = (uint64_t)(uintptr_t)name;
     if (buf2) { a.out_buf2 = (uint64_t)(uintptr_t)buf2; a.out_cap2 = cap2; }
-    MadeiraIRConvert(&a);
+    mad_ir_convert_cached(&a);   /* madeira-bcd: persistent shader cache */
     if (a.ret_status != MADEIRA_IR_OK) {
         d3d12_log("[madeira-d3d12] %s conversion failed: %s (converter code %u)\n",
                   tag, mad_ir_status_name(a.ret_status), a.ret_error_code);

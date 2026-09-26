@@ -154,6 +154,16 @@ already did.
   eagerly they took 5.1 GB of Metal memory and iOS killed the app at 7.8 GB
   on the loading screen. `pso-lazy = 0` in madeira.cfg restores eager
   creation.
+- Persistent shader cache (`madeira_d3d12.c` `mad_ir_convert_cached`): every
+  DXIL/DXBC -> metallib conversion is keyed by a hash of all its inputs
+  (bytecode, entry, root signature, static samplers, input layout, paired
+  stages, pixel flags, target, and the madeira_d3d12 build stamp) and stored
+  with all the converter's outputs in
+  `%LOCALAPPDATA%\Madeira\ShaderCache\<build>\`. The second launch of a game
+  skips the converter for every shader it has seen; caches of other builds are
+  deleted in the background. Ghost of Tsushima's New Game converts ~29,000
+  stages (several hundred MB on disk). `shader-cache = 0` in madeira.cfg
+  turns it off.
 - Virtual display adapter in the registry (`build/win32u-unix/sysparams_ios.c`,
   `ios_register_virtual_gpu`): this port never enumerates display devices, so
   the registry had no display adapter at all -- no `Enum\PCI` entry for
