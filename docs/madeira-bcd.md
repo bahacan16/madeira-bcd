@@ -55,7 +55,9 @@ step says so when it becomes a no-op:
   Off by default, so titles that check CPUID keep their SSE paths. The script
   first rebuilds the unpatched source and ships nothing unless it matches the
   committed DLL (sections and exports); the recipe (`MINGW_TRIPLE`,
-  `FEX_IOS_HOST_BUILD`, `-DFEX_IOS_HOST=1`, LTO off) is not in upstream's
+  `FEX_IOS_HOST_BUILD`, `-DFEX_IOS_HOST=1` for C, C++ AND the assembler, LTO off;
+  builds 138-148 missed the assembler flag, got the stock `ExitToX64` and
+  crashed every x64 DLL entry point with a misaligned sp) is not in upstream's
   `build/fex-arm64ec/build.sh`.
 - `faultrep.dll` (`build/faultrep`, `tools/build-faultrep-dll.sh`): upstream's
   Wine set has none, and games that import it fail in the loader with

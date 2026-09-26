@@ -6,11 +6,14 @@
 # (MADEIRA_FEX_AVX=1); every other game runs upstream's module.
 #
 # build/fex-arm64ec/build.sh does not record everything the committed DLL was
-# built with; the options below reproduce it (same exports and imports, and
-# the same .text/.rdata/.pdata sizes to the byte). Before shipping anything,
-# the unpatched source is built and compared against the committed DLL: if
-# the sizes differ, the recipe or the source has drifted and the committed DLL
-# is kept. Run from the repository root.
+# built with; the options below reproduce it. FEX_IOS_HOST must reach the
+# ASSEMBLER too: Module.S holds the iOS transition code (TEB from TPIDR, not
+# x18; the FFS bypass). Builds 138-148 missed CMAKE_ASM_FLAGS, got the stock
+# ExitToX64 (`str x30,[sp,#-8]!`, sp off 16-byte alignment) and every x64 DLL
+# entry point crashed -- with section sizes identical, so sizes prove nothing.
+# Before shipping, the unpatched source is built and compared with the
+# committed DLL by function list and by the instructions of the Module.S
+# transition code; any drift keeps the AVX build out. Run from the repo root.
 set -eu
 R="$(pwd)"
 MINGW="${MINGW:-$R/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin}"
@@ -29,26 +32,37 @@ git -C FEX diff --name-only | while read -r f; do git -C FEX checkout -- "$f"; d
 # needs pkg_resources; on a Linux x86 host it settles on cortex-a78, which is
 # what reproduces the committed module, and on the macOS runner it aborts the
 # configure. Name it outright.
-if [ ! -f "$B/build.ninja" ]; then
+# Always (re)configure: a cached tree from before the ASM flag would keep it.
+{
     cmake -S "$R/FEX" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE="$R/FEX/Data/CMake/toolchain_mingw.cmake" \
         -DMINGW_TRIPLE=arm64ec-w64-mingw32 -DTUNE_CPU=cortex-a78 \
         -DFEX_IOS_HOST_BUILD=ON \
         -DCMAKE_C_FLAGS=-DFEX_IOS_HOST=1 -DCMAKE_CXX_FLAGS=-DFEX_IOS_HOST=1 \
+        -DCMAKE_ASM_FLAGS=-DFEX_IOS_HOST=1 \
         -DENABLE_LTO=OFF -DENABLE_FEX_ALLOCATOR=ON -DENABLE_JEMALLOC_GLIBC_ALLOC=ON \
         -DBUILD_FEXCONFIG=OFF -DENABLE_CCACHE=OFF -DBUILD_TESTING=OFF -DBUILD_THUNKS=OFF \
         -DENABLE_ASSERTIONS=OFF > "$B.cfg.log" 2>&1 \
         || { tail -30 "$B.cfg.log"; exit 1; }
-fi
+}
 
 build() {
     cmake --build "$B" --target arm64ecfex -j"$JOBS" > "$B.build.log" 2>&1 \
         || { grep -m 20 "error" "$B.build.log"; exit 1; }
 }
 
-# Section sizes and export names: equal for the same source and recipe, even
-# though a different link order moves every function.
+# Section sizes, export names, every function name, and the Module.S
+# transition code (DispatchJump .. the end of CheckCall) instruction by
+# instruction with addresses blanked -- a different link order moves every
+# function, so raw bytes cannot be compared.
 fingerprint() {
+    "$MINGW/llvm-objdump" -d --no-show-raw-insn "$1" | grep -E '^[0-9a-f]+ <.+>:$' | sed 's/^[0-9a-f]* //' | sort
+    "$MINGW/llvm-objdump" -d --no-show-raw-insn "$1" \
+        | awk '/<DispatchJump>:/{f=1} f && /^ *[0-9a-f]+:/{l=$0; sub(/^ *[0-9a-f]+:[ \t]*/,"",l); print l} /<CheckCall>:/{c=1} c && /\tret$/{exit}' \
+        | sed -E 's/0x[0-9a-f]+//g; s/<[^>]*>//g'
+    sectionsizes "$1"
+}
+sectionsizes() {
     python3 - "$1" <<'PY'
 import struct, sys
 d = open(sys.argv[1], 'rb').read()
