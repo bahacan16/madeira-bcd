@@ -286,6 +286,7 @@ struct mad_device {
     struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
     struct { UINT32 value; obj_handle_t buf; } fillpat[8]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
+    LUID adapter_luid;   /* madeira-bcd: GetAdapterLuid, the DXGI adapter it was created on */
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
 static LONG g_resolve_locked, g_resolve_miss;   /* ml1132: address lookups that took live_lock */
@@ -10004,6 +10005,12 @@ static HRESULT STDMETHODCALLTYPE rootsig_GetDevice(ID3D12RootSignature *This, RE
 }
 
 /* ---- vtable construction ------------------------------------------------- */
+/* madeira-bcd: ID3D12Device::GetAdapterLuid (was the zero-LUID stub). */
+static LUID * STDMETHODCALLTYPE device_GetAdapterLuid(ID3D12Device10 *This, LUID *ret) {
+    *ret = ((struct mad_device *)This)->adapter_luid;
+    return ret;
+}
+
 static void build_vtables(void) {
     static LONG done;
     if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
@@ -10028,6 +10035,7 @@ static void build_vtables(void) {
     g_device_vtbl.SetBackgroundProcessingMode        = device_SetBackgroundProcessingMode;
     g_device_vtbl.SetEventOnMultipleFenceCompletion  = device_SetEventOnMultipleFenceCompletion;
     g_device_vtbl.QueryInterface = (void *)device_QI;
+    g_device_vtbl.GetAdapterLuid = device_GetAdapterLuid;   /* madeira-bcd */
     g_device_vtbl.AddRef = (void *)device_AddRef;
     g_device_vtbl.Release = (void *)device_Release;
     g_device_vtbl.GetNodeCount = (void *)device_GetNodeCount;
@@ -10241,6 +10249,16 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     if (!d) return E_OUTOFMEMORY;
     d->vtbl = &g_device_vtbl; d->refs = 1; d->iid = &IID_ID3D12Device; d->name = "Device";
     g_last_device = d;
+    {   /* madeira-bcd: the adapter's LUID, for GetAdapterLuid. Engines match the
+         * device to its DXGI adapter by it (Nixxes ports); a zero LUID matches
+         * nothing. */
+        IDXGIAdapter *a = NULL;
+        if (adapter && SUCCEEDED(IUnknown_QueryInterface(adapter, &IID_IDXGIAdapter, (void **)&a)) && a) {
+            DXGI_ADAPTER_DESC desc;
+            if (SUCCEEDED(IDXGIAdapter_GetDesc(a, &desc))) d->adapter_luid = desc.AdapterLuid;
+            IDXGIAdapter_Release(a);
+        }
+    }
 
     /* Whichever backend winemetal is configured for, local or remote. Failing
      * here is reported rather than deferred to the first draw. */
@@ -10260,6 +10278,12 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     obj_handle_t devices = WMTCopyAllDevices();
     d->mtl_device = devices ? NSArray_object(devices, 0) : 0;
     if (d->mtl_device) NSObject_retain(d->mtl_device);   /* take our own reference */
+    if (!d->adapter_luid.LowPart && !d->adapter_luid.HighPart && d->mtl_device) {
+        /* No adapter given: DXMT's DXGI derives the LUID from the Metal
+         * registry ID (dxgi_adapter.cpp GetAdapterLuid); use the same. */
+        UINT64 id = __builtin_bswap64(MTLDevice_registryID(d->mtl_device));
+        memcpy(&d->adapter_luid, &id, sizeof id);
+    }
     if (devices) NSObject_release(devices);
     InitializeCriticalSection(&d->live_lock);
     InitializeCriticalSection(&d->view_lock);   /* ml1049 */
