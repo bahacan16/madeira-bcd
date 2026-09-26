@@ -147,6 +147,13 @@ already did.
   the DXIL path (its ml923 static sampler table). Ghost of Tsushima lost one
   draw every frame to this: intro videos with sound and no picture, then a
   black screen at ~17 fps.
+- Lazy pipelines (`madeira_d3d12.c` `mad_pso_realize`, `mad_cpso_realize`):
+  plain render pipelines (no GS or tessellation) and compute pipelines keep
+  their Metal descriptors and are built by the first draw or dispatch that
+  uses them. Ghost of Tsushima creates ~14,000 pipelines at New Game; built
+  eagerly they took 5.1 GB of Metal memory and iOS killed the app at 7.8 GB
+  on the loading screen. `pso-lazy = 0` in madeira.cfg restores eager
+  creation.
 - Virtual display adapter in the registry (`build/win32u-unix/sysparams_ios.c`,
   `ios_register_virtual_gpu`): this port never enumerates display devices, so
   the registry had no display adapter at all -- no `Enum\PCI` entry for
