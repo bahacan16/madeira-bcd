@@ -1,6 +1,6 @@
 # madeira-bcd: what this fork adds to willfaust/Madeira
 
-Rebased on upstream `5a82d39` (2026-09-24) on 2026-09-24; tracks upstream main by merge. Upstream carries the
+Rebased on upstream `5a82d39` (2026-09-24) on 2026-09-24; tracks upstream main by merge, plus upstream PRs #28 (WoW64, D3D9) and #29 (controller layouts) by 125hz. Upstream carries the
 runtime (Wine, FEX, DXMT, the native D3D12 runtime); this fork carries a CI
 build and the app-side pieces below. Everything else is upstream's.
 
@@ -41,6 +41,21 @@ step says so when it becomes a no-op:
   their guards, and `rpm_cas_snapshot_take` (rpmalloc, not built with
   `ENABLE_FEX_ALLOCATOR=OFF`) gets a weak fallback; `IOS_RPM_GUARD` gets a
   no-op definition in the system-allocator branch.
+
+## WoW64 and D3D9 (125hz, upstream PR #28, not yet merged upstream)
+
+Merged from `willfaust/Madeira` pull request #28 (125hz): 32-bit programs run
+in a 4 GB guest window at a per-process base (`docs/WOW64.md`), with Wine's
+i386 set in `app/Madeira/i386-windows/`, FEX's WoW64 module
+(`aarch64-windows/xtajit.dll`) and DXMT's D3D9 frontend. The binaries are
+125hz's prebuilt farm (`docs/BINARIES-WOW64.md` lists every file with its
+SHA-256), including new 64-bit `ntdll`, `nsi`, DXMT DLLs and `xtajit64.dll`.
+That `xtajit64.dll` was built from 125hz's FEX change, which the FEX
+submodule does not pin; its ARM64EC interface is upstream's plus one
+diagnostic export, so `tools/build-xtajit64.sh` keeps building the AVX
+variant from the pinned source and checks it against upstream's pre-merge
+module (fetched by commit). The two conflicts with this fork were the same
+TEB retarget fix (125hz's version kept) and the `[xp]` `pgw` placeholder.
 
 ## Runtime
 
@@ -138,8 +153,8 @@ step says so when it becomes a no-op:
   includes `C:\users` (without AppData/Temp), skips redistributable folders,
   splits a folder that only holds other games into one card each, shows each
   card's exe folder and exe count, and a Games / Every .exe switch. 64-bit exes
-  are preferred as a title's default and 32-bit ones are refused with an
-  explanation (WoW64 needs the low 2 GB, which iOS reserves).
+  are preferred as a title's default; 32-bit ones launch through the WoW64
+  series below (the settings sheet marks them experimental).
 - `FixedBaseImage` (`GameLibrary.swift`): a 64-bit exe linked /FIXED below
   4 GB (Crysis `Bin64\Crysis64.exe`, base 0x37000000) cannot be placed on iOS
   and Wine refuses to move it (c0000018). Before launch the library rebuilds

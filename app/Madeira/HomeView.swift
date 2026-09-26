@@ -332,7 +332,6 @@ struct HomeView: View {
     @State private var enablingJIT = false
     @State private var pendingAfterJIT: LaunchRequest?
     @State private var showJITAlert = false
-    @State private var blocked32: LibraryGame?
     @State private var editing: LibraryGame?
     @State private var showSettings = false
     @State private var coverTick = 0
@@ -403,20 +402,6 @@ struct HomeView: View {
             }
             .sheet(isPresented: $showSettings) {
                 AppSettingsSheet(onDeveloper: onDeveloper)
-            }
-            .alert("32-bit program", isPresented: Binding(get: { blocked32 != nil },
-                                                          set: { if !$0 { blocked32 = nil } })) {
-                if let game = blocked32, game.executables.count > 1 {
-                    Button("Choose another exe") { editing = game; blocked32 = nil }
-                }
-                Button("OK", role: .cancel) { blocked32 = nil }
-            } message: {
-                Text((blocked32?.primary.fileName ?? "This exe")
-                     + " is a 32-bit (x86) Windows program. Madeira runs 64-bit programs only: "
-                     + "iOS reserves the low 4 GB of every app's address space, and 32-bit Windows "
-                     + "code has to live below 2 GB. Pick the game's 64-bit exe (often in a Bin64 "
-                     + "or x64 folder). Installers are usually 32-bit, so install on a PC and copy "
-                     + "the installed folder instead.")
             }
             .alert("JIT is not enabled", isPresented: $showJITAlert) {
                 Button("Enable JIT") { enableJIT() }
@@ -644,10 +629,6 @@ struct HomeView: View {
 
     private func launch(_ game: LibraryGame) {
         let exe = game.primary
-        if archs[exe.windowsPath] == "x86" {
-            blocked32 = game
-            return
-        }
         // Relocation-stripped exes based below 4 GB cannot load on iOS as they
         // are; FixedBaseImage gives them a relocation table (once, keeping the
         // original).
@@ -938,10 +919,10 @@ struct GameSettingsSheet: View {
                     }
                     LabeledContent("Architecture", value: archs[exePath] ?? "unknown")
                     if archs[exePath] == "x86" {
-                        Label("32-bit programs cannot run in Madeira. Choose a 64-bit exe.",
-                              systemImage: "exclamationmark.triangle.fill")
+                        Label("32-bit program: runs through WoW64 (experimental). If the game also has a 64-bit exe, prefer that one.",
+                              systemImage: "info.circle")
                             .font(.caption)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(.secondary)
                     }
                     Text(exePath)
                         .font(.caption.monospaced())
@@ -995,9 +976,6 @@ struct GameSettingsSheet: View {
                             .frame(maxWidth: .infinity)
                             .font(.headline)
                     }
-                    // The library's 32-bit alert cannot show while this sheet is
-                    // still animating away, so refuse here instead.
-                    .disabled(archs[exePath] == "x86")
                 }
             }
             .navigationTitle(game.title)

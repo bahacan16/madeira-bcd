@@ -25,16 +25,17 @@ if marker in src:
     print("already patched")
     sys.exit(0)
 
-anchor = """  HostFeatures.SupportsAFP = true;
-  HostFeatures.CPUMIDRs.push_back(0u);
+# The end of the iOS branch of FetchHostFeatures. Upstream's pin has the
+# feature list right above it; the WoW64 series (125hz's FEX) puts the host
+# probe and the LRCPC2 opt-in in between, so only these lines are matched.
+anchor = """  HostFeatures.CPUMIDRs.push_back(0u);
   HostFeatures.HostType = HostType;
   return HostFeatures;
 #else"""
 if src.count(anchor) != 1:
     sys.exit("patch-fex-ios-avx: iOS FetchHostFeatures anchor not found")
 
-src = src.replace(anchor, """  HostFeatures.SupportsAFP = true;
-  HostFeatures.CPUMIDRs.push_back(0u);
+src = src.replace(anchor, """  HostFeatures.CPUMIDRs.push_back(0u);
   HostFeatures.HostType = HostType;
   /* madeira-bcd: MADEIRA_FEX_AVX=1 opts this launch in to AVX/AVX2 through
    * FEX's 128-bit emulation (tools/patch-fex-ios-avx.py). */

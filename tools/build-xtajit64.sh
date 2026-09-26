@@ -28,6 +28,24 @@ JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
 # built from the pristine submodule, as the committed one was.
 git -C FEX diff --name-only | while read -r f; do git -C FEX checkout -- "$f"; done
 
+# The WoW64 series (125hz, upstream PR #28) ships an xtajit64.dll built from
+# its own FEX change, which the submodule does not pin. Its ARM64EC interface
+# is upstream's (same BTCpu64* exports; one extra, IosAliasStats, is a
+# diagnostic counter the unix side reads if present), so the AVX build stays
+# on the submodule's source and is checked against the module upstream built
+# from it -- the one that shipped before the merge, fetched by commit because
+# CI checks out one commit deep.
+WOW64_XTAJIT_SHA=2754e830663ea3f413622a1899a67ca8e33380be31d04ddfc68073ee99315c54
+UPSTREAM_XTAJIT_COMMIT=873fe25b010c43252407da79658daed0d06fa725
+REF="$SHIP"
+if [ "$( (sha256sum "$SHIP" 2>/dev/null || shasum -a 256 "$SHIP") | cut -d' ' -f1)" = "$WOW64_XTAJIT_SHA" ]; then
+    REF="$B.upstream-xtajit64.dll"
+    git cat-file -e "$UPSTREAM_XTAJIT_COMMIT^{commit}" 2>/dev/null \
+        || git fetch -q --depth=1 origin "$UPSTREAM_XTAJIT_COMMIT"
+    git show "$UPSTREAM_XTAJIT_COMMIT:app/Madeira/arm64ec-windows/xtajit64.dll" > "$REF"
+    echo "=== xtajit64.dll is the WoW64 series' build; comparing with upstream's (${UPSTREAM_XTAJIT_COMMIT:0:7}) ==="
+fi
+
 # TUNE_CPU: FEX's default "native" probes /proc/cpuinfo through a script that
 # needs pkg_resources; on a Linux x86 host it settles on cortex-a78, which is
 # what reproduces the committed module, and on the macOS runner it aborts the
@@ -80,7 +98,7 @@ PY
 
 echo "=== unpatched rebuild, compared with the committed xtajit64.dll ==="
 build
-if ! diff <(fingerprint "$SHIP") <(fingerprint "$B/Bin/libarm64ecfex.dll"); then
+if ! diff <(fingerprint "$REF") <(fingerprint "$B/Bin/libarm64ecfex.dll"); then
     echo "::warning::the rebuilt FEX module does not match the committed xtajit64.dll -- not shipping an AVX build"
     exit 1
 fi
