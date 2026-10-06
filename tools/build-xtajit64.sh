@@ -145,8 +145,8 @@ python3 "$R/tools/patch-fex-ios-avx.py" "$R/FEX/$CPUF"
 python3 "$R/tools/patch-fex-ios-alias-full-quiet.py" "$R/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp"
 python3 "$R/tools/patch-fex-ios-alias-retire-jit.py" "$R/FEX/Source/Windows/ARM64EC/IosJitAlias.cpp"
 # Keep the pinned allocator intact; only the patched ARM64EC rebuild uses
-# coherent 8 MiB spans. The unpatched fingerprint above retains its geometry.
-python3 "$R/tools/patch-fex-ios-rpmalloc-span8.py" "$R/FEX/External/rpmalloc/rpmalloc/rpmalloc.c"
+# coherent 4 MiB spans. The unpatched fingerprint above retains its geometry.
+python3 "$R/tools/patch-fex-ios-rpmalloc-span8.py" "$R/FEX/External/rpmalloc/rpmalloc/rpmalloc.c" --span-mb 4
 python3 "$R/tools/patch-fex-ios-branch-history.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-launcher-smc.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 build

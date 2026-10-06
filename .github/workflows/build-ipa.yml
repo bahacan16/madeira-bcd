@@ -360,6 +360,15 @@ jobs:
       - name: Check opt-in graphics DLL lifetime
         run: python3 tests/host/check-graphics-pin.py
 
+      - name: Check ARM64EC allocator span geometry
+        run: python3 tests/host/check-rpmalloc-span8.py
+
+      - name: Check pool failure capacity diagnostics
+        run: python3 tests/host/check-pool-failure-census.py
+
+      - name: Check per-thread trampoline capacity
+        run: python3 tests/host/check-teb-trampoline-capacity.py
+
       - name: Check read-only image patch diagnostics
         run: |
           python3 tests/host/check-image-patch-trace.py
@@ -1268,13 +1277,13 @@ jobs:
           python3 - <<'PYEOF'
           from pathlib import Path
           module = Path('app/Madeira/arm64ec-windows/xtajit64.dll').read_bytes()
-          if b'rpmalloc-span8 madeira-bcd' not in module:
-              raise SystemExit('Required ARM64EC rpmalloc span8 module was not built; refusing the fallback IPA')
+          if b'rpmalloc-span4 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC rpmalloc span4 module was not built; refusing the fallback IPA')
           if b'branch-history-v1 madeira-bcd' not in module or b'IosGuestBranchTraceLayout' not in module:
               raise SystemExit('Required ARM64EC branch-history module was not built; refusing the fallback IPA')
           if b'launcher-smc-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
-          print('ARM64EC rpmalloc: span8 build marker verified')
+          print('ARM64EC rpmalloc: span4 build marker verified')
           PYEOF
           # The opt-in source build of dxgi.dll (tools/build-dxgi-dll.sh) is not
           # required: without it env.MADEIRA_DXGI_SRC = 1 keeps upstream's.

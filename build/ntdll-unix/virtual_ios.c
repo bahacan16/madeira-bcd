@@ -3271,6 +3271,55 @@ static size_t ios_pool_low_image_range( size_t alloc_size )
     return off;
 }
 
+/* Failure-only, bounded bookkeeping snapshot. A grace-expired size fit is
+ * not a promise of executable/owner-safe reuse; the normal allocator still
+ * performs all of those checks. Never touch mappings or FEX/guest payloads. */
+static void ios_pool_failure_census( size_t want )
+{
+    static size_t requests[8];
+    static unsigned count;
+    size_t free_bytes = 0, largest = 0, aged_bytes = 0, aged_largest = 0, poisoned = 0;
+    size_t main_virgin = 0, c_used, c_virgin, c_image_virgin, hole;
+    const size_t code_reserve = 4u * 1024 * 1024;
+    unsigned raw_fit = 0, aged_fit = 0, i;
+    time_t now = time( NULL );
+
+    pthread_mutex_lock( &ios_pool_lock );
+    for (i = 0; i < count; i++) if (requests[i] == want) goto done;
+    if (count == ARRAY_SIZE(requests)) goto done;
+    requests[count++] = want;
+    for (i = 0; i < (unsigned)ios_pool_free_count; i++)
+    {
+        const struct ios_pool_free *entry = &ios_pool_freelist[i];
+        free_bytes += entry->size;
+        if (entry->size > largest) largest = entry->size;
+        if (entry->size >= want) raw_fit++;
+        if (entry->advised & 2) poisoned += entry->size;
+        if (now - entry->freed_at < IOS_POOL_REUSE_GRACE_SEC) continue;
+        aged_bytes += entry->size;
+        if (entry->size > aged_largest) aged_largest = entry->size;
+        if (entry->size >= want) aged_fit++;
+    }
+    hole = ios_pool_hole_between( ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved,
+                                  ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+    if (jit_pool_offset <= ios_jit_pool_size_global && ios_jit_tail_reserved <= ios_jit_pool_size_global - jit_pool_offset &&
+        hole <= ios_jit_pool_size_global - jit_pool_offset - ios_jit_tail_reserved)
+        main_virgin = ios_jit_pool_size_global - jit_pool_offset - ios_jit_tail_reserved - hole;
+    c_used = ios_jit_low_reserved;
+    c_virgin = c_used < ios_jit_low_size_global ? ios_jit_low_size_global - c_used : 0;
+    c_image_virgin = c_virgin > code_reserve ? c_virgin - code_reserve : 0;
+    dprintf( 2, "[pool-capacity] failed_want=0x%lx entries=%u free_bytes=0x%lx largest=0x%lx "
+                "aged_bytes=0x%lx aged_largest=0x%lx raw_size_fit=%u aged_size_fit=%u "
+                "poison_marked_bytes=0x%lx main_virgin=0x%lx c_virgin=0x%lx c_image_virgin=0x%lx "
+                "(bookkeeping only; reuse guards unchanged)\n",
+             (unsigned long)want, (unsigned)ios_pool_free_count, (unsigned long)free_bytes,
+             (unsigned long)largest, (unsigned long)aged_bytes, (unsigned long)aged_largest,
+             raw_fit, aged_fit, (unsigned long)poisoned, (unsigned long)main_virgin,
+             (unsigned long)c_virgin, (unsigned long)c_image_virgin );
+done:
+    pthread_mutex_unlock( &ios_pool_lock );
+}
+
 /* ml1039: hand a RECLAIMED head range to the code-buffer tail.
  *
  * The pool is two allocators facing each other: PE-image copies bump up from
@@ -3623,14 +3672,18 @@ int ios_fast_footprint = 0;                    /* ml670: set when d3d11 loads */
  *
  * Each Wine "process" thread gets its own slot with its own TEB address.
  * Slot 0 is the default (backward compatible with ios_jit_teb_trampoline).
- * Max 256 slots in one 16KB page (256 * 16 = 4096, well within 0x4000).
+ * Use all 1024 slots in the reserved 16KB page (1024 * 16 = 0x4000).
  *
  * Usage: SEGV/Mach handler sets x17 = target_PC, PC = thread's trampoline.
  * Trampoline runs: loads x18 = thread's TEB, jumps to x17 = target PC.
  */
 void *ios_jit_teb_trampoline = NULL;  /* RX address of slot 0 trampoline (offset 8) */
 #define IOS_JIT_TRAMPOLINE_SIZE 16    /* Bytes per trampoline slot */
-#define IOS_JIT_MAX_SLOTS 256         /* Max threads with trampolines */
+/* Each fallback to slot 0 overwrites another thread's saved TEB. The page
+ * is already reserved in full; slots above 255 require no new mapping or
+ * pool budget. Keep lifetime-monotonic allocation; never recycle a slot
+ * whose trampoline may still be referenced. */
+#define IOS_JIT_MAX_SLOTS (0x4000 / IOS_JIT_TRAMPOLINE_SIZE)
 static volatile int32_t ios_jit_next_slot = 0;  /* Next slot to allocate */
 
 /* Allocate a per-thread trampoline slot. Returns slot index (0-based). */
@@ -16120,6 +16173,7 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 
             if (offset == (size_t)-1)
             {
+                ios_pool_failure_census( alloc_size );
                 ERR("iOS JIT: pool exhausted\n");
                 /* Task #25: FAIL the protect instead of silently leaving the
                  * image R-only — the old path returned success and the first

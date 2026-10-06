@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Use coherent 8 MiB rpmalloc spans in the fork's ARM64EC build copy.
+"""Use coherent 4 or 8 MiB rpmalloc spans in the ARM64EC build copy.
 
 The span mask, large page size and size-class ceiling must change together.
-An 8 MiB block cannot fit beside the header in an 8 MiB large page; route
-sizes above 7 MiB through the existing exact-size huge path. Leave the
+Blocks at the page size cannot fit beside its header. Route sizes above
+3.5 or 7 MiB through the existing exact-size huge path. Leave the
 non-FEX_IOS_HOST configuration, ownership, locks and band limits unchanged.
 This is a Madeira build overlay, not a contribution to the pinned submodule.
 """
 from pathlib import Path
+import argparse
 import sys
 
 
@@ -49,26 +50,54 @@ EDITS = (
 )
 
 
-def patch(source):
-    if MARKER in source:
-        if all(source.count(after) == 1 for _, after in EDITS):
+def edits_for(span_mb):
+    if span_mb == 8:
+        return MARKER, EDITS
+    if span_mb != 4:
+        raise ValueError("supported span sizes are 4 and 8 MiB")
+    marker = "madeira-bcd: coherent 4 MiB spans"
+    edits = list(EDITS)
+    edits[0] = (edits[0][0], edits[0][1].replace('(7 * 1024 * 1024)', '(7 * 512 * 1024)').replace('8 MiB', '4 MiB'))
+    edits[1] = (edits[1][0], edits[1][1].replace('LARGE_SIZE_CLASS_COUNT 19', 'LARGE_SIZE_CLASS_COUNT 15'))
+    edits[2] = (edits[2][0], edits[2][1].replace('8 MiB', '4 MiB').replace('7 MiB', '3.5 MiB').replace('SHIFT 23', 'SHIFT 22'))
+    edits[3] = (edits[3][0], edits[3][1].replace(MARKER, marker).replace('halve both', 'reduce both').replace('span8', 'span4').replace('8 * 1024', '4 * 1024'))
+    edits[4] = (
+        "LCLASS(81920),  LCLASS(98304),  LCLASS(114688), LCLASS(131072), LCLASS(163840), LCLASS(196608), LCLASS(229376),\n"
+        "    LCLASS(262144), LCLASS(327680), LCLASS(393216), LCLASS(458752), LCLASS(524288)};",
+        "LCLASS(81920),  LCLASS(98304),  LCLASS(114688), LCLASS(131072), LCLASS(163840), LCLASS(196608), LCLASS(229376)\n"
+        "#ifndef FEX_IOS_HOST\n"
+        "    , LCLASS(262144), LCLASS(327680), LCLASS(393216), LCLASS(458752), LCLASS(524288)\n"
+        "#endif\n};",
+    )
+    return marker, tuple(edits)
+
+
+def patch(source, span_mb=8):
+    marker, edits = edits_for(span_mb)
+    if "madeira-bcd: coherent " in source:
+        if marker in source and all(source.count(after) == 1 for _, after in edits):
             return source
-        raise ValueError("partial or changed span8 overlay")
-    for before, _ in EDITS:
+        raise ValueError("partial, changed or different span overlay")
+    for before, _ in edits:
         if source.count(before) != 1:
             raise ValueError("rpmalloc anchor changed: " + before[:100])
-    for before, after in EDITS:
+    for before, after in edits:
         source = source.replace(before, after, 1)
     return source
 
 
 if __name__ == "__main__":
-    path = Path(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path)
+    parser.add_argument("--span-mb", type=int, choices=(4, 8), default=8)
+    args = parser.parse_args()
+    path = args.source
     source = path.read_text()
     try:
-        result = patch(source)
+        result = patch(source, args.span_mb)
     except ValueError as error:
         sys.exit("patch-fex-ios-rpmalloc-span8: " + str(error))
     if result != source:
         path.write_text(result)
-    print("rpmalloc iOS: span/alignment/large page=8MiB, classes<=7MiB; larger requests use the huge path")
+    print(f"rpmalloc iOS: span/alignment/large page={args.span_mb}MiB, "
+          f"classes<={args.span_mb * 7 / 8:g}MiB; larger requests use the huge path")
