@@ -188,14 +188,15 @@ OVERLAY = {
                         "placement misses. On by default; 0 turns it off. Read at launch, the game's own file wins."},
     "pool-low": {"category": "Memory & JIT pool", "title": "JIT code buffers below the executable window",
                 "kind": "bool", "default": "0",
-                "note": "1: the largest free run below the 0x140000000 executable window (less pool-low-margin) "
+                "note": "1: a free run below the 0x140000000 executable window (less pool-low-margin) "
                         "becomes a third debugger region for the emulator's code buffers, so the whole JIT pool is "
                         "left to DLL copies (GTA V: about 300 MB more). Needs the pool above the window; costs the "
                         "region's size in memory. Off by default; read at launch, the game's own file wins."},
     "pool-low-margin": {"category": "Memory & JIT pool", "title": "Code-buffer region: MB left free below the window",
                 "kind": "int", "default": "128",
                 "note": "With pool-low on: how much of the free run below the executable window stays free for "
-                        "programs that load there (child processes' main executables). 128 by default."},
+                        "programs that load there (child processes' main executables). A run with a free run at "
+                        "least this large below it keeps none. 128 by default."},
     "env.MADEIRA_SC_CEF": {"category": "Wine core (ntdll)", "title": "Social Club's Chromium in one process",
                 "kind": "bool", "default": "1",
                 "note": "On by default; 0 turns it off. SocialClubHelper.exe runs --single-process with "

@@ -1222,13 +1222,17 @@ enum StikJITHelper {
         return (b, size)
     }
 
-    /// madeira-bcd pool-low: region C, the third debugger region. It is the largest free
-    /// run in [0x119000000, the executable window) less `pool-low-margin` MB (128 by
-    /// default) left free at the run's bottom, where Wine maps the children's
-    /// relocatable main exes (PlayGTAV.exe 0x122c20000, Launcher.exe 0x129340000,
-    /// RockstarService.exe 0x12ac20000 in the GTA V logs), in 16MB steps by default
-    /// or 16KB with page-fit, and at least 64MB; it takes the run's TOP, next to the
-    /// window. The debugger allocates
+    /// madeira-bcd pool-low: region C, the third debugger region. It is a free run in
+    /// [0x119000000, the executable window) less `pool-low-margin` MB (128 by default)
+    /// left free at the run's bottom, where Wine maps the children's relocatable main
+    /// exes (PlayGTAV.exe 0x122c20000, Launcher.exe 0x129340000, RockstarService.exe
+    /// 0x12ac20000 in the GTA V logs), in 16MB steps by default or 16KB with page-fit,
+    /// and at least 64MB; it takes the run's TOP, next to the window. A run with a
+    /// free run of the margin's size below it keeps no margin of its own: the children
+    /// load bottom-up and find that run first (build 437: 134 + 184 MB, Launcher.exe at
+    /// the bottom of the 134 MB run; with the margin counted inside each run neither
+    /// qualified, the code buffers went to the pool tail and the image copies ran out).
+    /// Of the runs, the one that leaves the largest C is taken. The debugger allocates
     /// first-fit, so the margin and every lower run that could take C are plugged for
     /// the request, as takeSecondRegion does. Only when the pool lies above the
     /// window: C must never be inside the pool's span. Returns nil, holding nothing,
@@ -1249,9 +1253,18 @@ enum StikJITHelper {
         }
         let runs = freeRuns(lowFloor, exeWindow.base, minSize: 64 << 20)
         let desc = runs.map { String(format: "0x%lx+%luMB", Int($0.base), Int($0.size >> 20)) }.joined(separator: " ")
-        let best = runs.max(by: { $0.size < $1.size })
-        let available = best.map { $0.size > margin ? $0.size - margin : 0 } ?? 0
-        let size = poolRunSize(available: available, wanted: available, pageFit: pageFit)
+        // The margin a run keeps at its bottom: none when a lower run alone holds it.
+        let ownMargin = { (r: (base: vm_address_t, size: vm_address_t)) -> vm_address_t in
+            runs.contains(where: { $0.base < r.base && $0.size >= margin }) ? 0 : margin
+        }
+        let fits = runs.map { r -> (run: (base: vm_address_t, size: vm_address_t), keep: vm_address_t, size: vm_address_t) in
+            let keep = ownMargin(r)
+            let available = r.size > keep ? r.size - keep : 0
+            return (r, keep, poolRunSize(available: available, wanted: available, pageFit: pageFit))
+        }
+        let pick = fits.max(by: { $0.size < $1.size })
+        let best = pick?.run
+        let size = pick?.size ?? 0
         guard let best = best, size >= 64 << 20 else {
             LogStore.shared.log("[pool-low] free runs below the window: \(desc.isEmpty ? "none of 64MB" : desc) -- none "
                 + "leaves 64MB after the \(marginMB)MB margin (pool-low-margin); no region C", level: .error)
@@ -1282,8 +1295,9 @@ enum StikJITHelper {
             return nil
         }
         LogStore.shared.log(String(format: "[pool-low] region C 0x%lx+%luMB (free runs below the window: %@; %luMB of the "
-            + "run left free for the low images, pool-low-margin = %ld)%@",
+            + "run left free for the low images, pool-low-margin = %ld%@)%@",
             Int(c), Int(size >> 20), desc, Int((best.size - size) >> 20), marginMB,
+            (pick?.keep == 0 && margin > 0 ? ", held by a lower run" : "") as String,
             c == target ? "" : String(format: " -- not at the run's top 0x%lx, a plug failed", Int(target))))
         if pageFit {
             LogStore.shared.log("[pool-low] page-fit C=\(size >> 10)KB; run remainder=\((best.size - size) >> 10)KB, pool-low-margin=\(margin >> 10)KB")

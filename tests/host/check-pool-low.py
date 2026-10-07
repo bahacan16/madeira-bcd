@@ -131,8 +131,11 @@ assert 'MadeiraConfig.gameValue("pool-low-margin") ?? MadeiraConfig.get("pool-lo
 take = function(swift, 'private static func takeLowRegion(')
 assert 'Int(marginText) ?? 128' in take, 'the margin defaults to 128 MB'
 assert 'guard poolRx >= exeWindow.base + exeWindow.size else {' in take, 'C only with the pool above the window'
-assert 'let available = best.map { $0.size > margin ? $0.size - margin : 0 } ?? 0' in take
-assert 'let size = poolRunSize(available: available, wanted: available, pageFit: pageFit)' in take
+assert 'runs.contains(where: { $0.base < r.base && $0.size >= margin }) ? 0 : margin' in take, \
+    'a run keeps the margin unless a lower run alone holds it'
+assert 'let available = r.size > keep ? r.size - keep : 0' in take
+assert 'let pick = fits.max(by: { $0.size < $1.size })' in take, 'the run that leaves the largest C'
+assert 'poolRunSize(available: available, wanted: available, pageFit: pageFit)' in take
 assert 'let target = best.base + best.size - size' in take
 assert 'freeRuns(0x100000000, best.base, minSize: size)' in take and 'plugs.append(' in take
 assert 'if c < lowFloor || c + size > exeWindow.base || c + size > poolRx {' in take, 'a stray placement is released'
