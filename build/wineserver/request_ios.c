@@ -359,6 +359,28 @@ static void call_req_handler( struct thread *thread )
     current = NULL;
 }
 
+/* madeira-bcd doorbell (fd_ios.c ios_srv_bell): read the request fd of thread
+ * `tid` the way a POLLIN on it would; 1 when a request is still partly unread */
+int ios_doorbell_poll_thread( unsigned int tid )
+{
+    extern void ios_fd_poll_in( struct fd *fd );
+    struct thread *thread = get_thread_from_id( tid );
+    int again = 0;
+
+    if (!thread)
+    {
+        clear_error();
+        return 0;
+    }
+    if (thread->request_fd)
+    {
+        ios_fd_poll_in( thread->request_fd );
+        again = thread->request_fd && thread->req_toread;
+    }
+    release_object( thread );
+    return again;
+}
+
 /* read a request from a thread */
 void read_request( struct thread *thread )
 {

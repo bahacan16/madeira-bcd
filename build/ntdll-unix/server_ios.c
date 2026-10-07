@@ -2225,8 +2225,10 @@ unsigned int server_call_unlocked( void *req_ptr )
      * tick sleep so the request is picked up in ~50us instead of waiting
      * for the next 1ms iteration (fd_ios.c ios_srv_wake_sem). */
     {
-        extern void ios_wineserver_wake(void);
-        ios_wineserver_wake();
+        /* madeira-bcd doorbell: name the thread, so the loop reads only its
+         * request fd (fd_ios.c ios_srv_bell); a ring also wakes the loop */
+        extern void ios_wineserver_ring( unsigned int tid );
+        ios_wineserver_ring( HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ) );
     }
     return wait_reply( req );
 }

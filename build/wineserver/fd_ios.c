@@ -56,8 +56,35 @@ static int ios_srv_wake_coalesce = -1;
 void ios_wineserver_wake(void)
 {
     if (!ios_srv_wake_sem) return;
-    if (ios_srv_wake_coalesce && __atomic_exchange_n( &ios_srv_wake_pending, 1, __ATOMIC_ACQ_REL )) return;
+    if (ios_srv_wake_coalesce && __atomic_exchange_n( &ios_srv_wake_pending, 1, __ATOMIC_SEQ_CST )) return;
     semaphore_signal( ios_srv_wake_sem );
+}
+
+/* madeira-bcd: request doorbell. Coalescing the wake (above) did not cut the
+ * server's CPU (build 436: still ~267 ms per ~300 ms sample): the cost is the
+ * pass itself, a read() on every client fd (~1,500 poll users with the
+ * launcher, Chromium, Steam and the game alive), so the loop managed under
+ * ~280 passes/s against ~15,000 requests/s and a request waited ~1.5 ms just to
+ * be read. Now a client sets its thread id's bit here after writing a request
+ * and before it wakes the loop; each pass reads the request fds of the rung
+ * threads only, and the read() of every client fd (thread exits, process
+ * sockets, anything without a bell) runs every MADEIRA_SRV_FULLSCAN_MS (10 by
+ * default) or at once when a ring carried no usable thread id. Nothing is
+ * lost: a bit set after the loop took the words is seen on the next pass,
+ * which the wake guarantees, and a request still partly unread is rung again
+ * by the loop. MADEIRA_SRV_DOORBELL=0 restores the read() of every client fd
+ * on every pass. Wine thread ids are multiples of 4: 65536 / 4 bits. */
+#define IOS_SRV_BELL_WORDS 256
+static volatile unsigned long long ios_srv_bell[IOS_SRV_BELL_WORDS];
+static volatile int ios_srv_bell_full;
+void ios_wineserver_ring( unsigned int tid )
+{
+    unsigned int bit = tid >> 2;
+    if (tid && !(tid & 3) && bit < IOS_SRV_BELL_WORDS * 64)
+        __atomic_fetch_or( &ios_srv_bell[bit >> 6], 1ull << (bit & 63), __ATOMIC_SEQ_CST );
+    else
+        __atomic_store_n( &ios_srv_bell_full, 1, __ATOMIC_SEQ_CST );
+    ios_wineserver_wake();
 }
 
 /* __WINESRC__ must be defined via -D flag so unicode_fix.h can see it */
@@ -1198,6 +1225,46 @@ static int get_next_timeout( struct timespec *ts )
     return ret;
 }
 
+#ifdef WINE_IOS
+/* madeira-bcd doorbell: deliver POLLIN to one client fd if it is still a live
+ * poll user that wants it (called through ios_doorbell_poll_thread). */
+void ios_fd_poll_in( struct fd *fd )
+{
+    int user = fd->poll_index;
+    if (user <= 0 || user >= nb_users || poll_users[user] != fd) return;
+    if (pollfd[user].fd < 0 || !(pollfd[user].events & POLLIN)) return;
+    fd_poll_event( fd, POLLIN );
+}
+
+/* the rung threads: take every word, read each thread's request fd; a request
+ * left partly unread is rung again for the next pass */
+static unsigned long long ios_bell_threads, ios_bell_again;
+static void ios_doorbell_service(void)
+{
+    extern int ios_doorbell_poll_thread( unsigned int tid );
+    unsigned int w;
+
+    for (w = 0; w < IOS_SRV_BELL_WORDS; w++)
+    {
+        unsigned long long bits;
+        if (!ios_srv_bell[w]) continue;
+        bits = __atomic_exchange_n( &ios_srv_bell[w], 0ull, __ATOMIC_SEQ_CST );
+        while (bits)
+        {
+            unsigned int b = __builtin_ctzll( bits );
+            unsigned int tid = ((w << 6) | b) << 2;
+            bits &= bits - 1;
+            ios_bell_threads++;
+            if (ios_doorbell_poll_thread( tid ))
+            {
+                ios_bell_again++;
+                __atomic_fetch_or( &ios_srv_bell[w], 1ull << b, __ATOMIC_SEQ_CST );
+            }
+        }
+    }
+}
+#endif
+
 /* server main poll() loop */
 /* iOS-Madeira 2026-07-05 (Steam S0): the sandbox poll() limitation is
  * specific to the AF_UNIX master socketpair — real INET sockets (TCP/
@@ -1299,7 +1366,12 @@ void main_loop(void)
         static unsigned ios_syn_per_user[64];        /* rolling, low 6 bits of user */
         static int ios_post_inject = 0;  /* trace first N iters after injection */
         static int ios_client_fd_start = -1;  /* first poll index added by injection */
+        static int ios_doorbell = 0;                     /* madeira-bcd: see ios_srv_bell */
+        static unsigned long long ios_fullscan_ns = 10000000ull;
+        unsigned long long ios_last_full = 0, ios_full_n = 0, ios_pass_n = 0;
+        unsigned long long ios_db_report = 0;
         unsigned long long ios_next_timer_ns = ~0ull;  /* ns until next timer (deadline-aware sleep) */
+        int ios_full_scan = 1;                           /* madeira-bcd: read every client fd this pass */
 
         /* iOS socketpair bypass: check for injected client fd from app bridge */
         extern volatile int g_injected_client_fd;
@@ -1315,6 +1387,18 @@ void main_loop(void)
             ios_srv_wake_coalesce = !(wc && wc[0] == '0' && !wc[1]);
             ws_log("[wineserver-fd] coalesced request wake: %s (MADEIRA_SRV_WAKE_COALESCE=0 disables)",
                    ios_srv_wake_coalesce ? "on" : "off");
+            {
+                const char *db = getenv( "MADEIRA_SRV_DOORBELL" );  /* 0: read every client fd on every pass, as before */
+                const char *fs = getenv( "MADEIRA_SRV_FULLSCAN_MS" );  /* ms between reads of every client fd with the doorbell on (default 10) */
+                long ms = fs && *fs ? strtol( fs, NULL, 10 ) : 10;
+                if (ms < 1) ms = 1;
+                if (ms > 1000) ms = 1000;
+                ios_doorbell = !(db && db[0] == '0' && !db[1]);
+                ios_fullscan_ns = (unsigned long long)ms * 1000000ull;
+                ws_log("[wineserver-fd] request doorbell: %s, read of every client fd every %ld ms "
+                       "(MADEIRA_SRV_DOORBELL=0 disables, MADEIRA_SRV_FULLSCAN_MS)",
+                       ios_doorbell ? "on" : "off", ms);
+            }
             skr = semaphore_create( mach_task_self(), &ios_srv_wake_sem, SYNC_POLICY_FIFO, 0 );
             ws_log("[wineserver-fd] request-wake semaphore: kr=%d sem=0x%x", skr, ios_srv_wake_sem);
             if (skr != KERN_SUCCESS) ios_srv_wake_sem = 0;
@@ -1460,7 +1544,7 @@ void main_loop(void)
                         if (wkr == KERN_OPERATION_TIMED_OUT) ios_c_semto++;
                         else ios_c_semret++;
                         /* coalesced wake: cleared before the scan below */
-                        if (ios_srv_wake_coalesce) __atomic_store_n( &ios_srv_wake_pending, 0, __ATOMIC_RELEASE );
+                        if (ios_srv_wake_coalesce) __atomic_store_n( &ios_srv_wake_pending, 0, __ATOMIC_SEQ_CST );
                     }
                     else if (ios_srv_wake_sem && nosem)
                     {
@@ -1493,6 +1577,31 @@ void main_loop(void)
                 }
             }
             set_current_time();
+
+            /* madeira-bcd doorbell: the rung threads first; the read() of every
+             * client fd only when it is due or a ring had no thread id */
+            {
+                unsigned long long now_ns = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+                ios_pass_n++;
+                if (ios_doorbell)
+                {
+                    ios_doorbell_service();
+                    ios_full_scan = __atomic_exchange_n( &ios_srv_bell_full, 0, __ATOMIC_SEQ_CST )
+                                    || now_ns - ios_last_full >= ios_fullscan_ns;
+                }
+                else ios_full_scan = 1;
+                if (ios_full_scan) { ios_last_full = now_ns; ios_full_n++; }
+                if (!ios_db_report) ios_db_report = now_ns;
+                else if (now_ns - ios_db_report >= 10000000000ull)
+                {
+                    double s = (now_ns - ios_db_report) / 1e9;
+                    ws_log("[srv-doorbell] %.0f passes/s, %.0f full scans/s, %.0f rung threads/s "
+                           "(%.0f rung again), %d poll users",
+                           ios_pass_n / s, ios_full_n / s, ios_bell_threads / s, ios_bell_again / s, nb_users);
+                    ios_pass_n = ios_full_n = ios_bell_threads = ios_bell_again = 0;
+                    ios_db_report = now_ns;
+                }
+            }
 
             /* Real sockets first: zero-timeout poll() gives true INET
              * event semantics (connect completion, errors, data). See
@@ -1584,9 +1693,14 @@ void main_loop(void)
                         if (ios_client_fd_start >= 0 && i >= ios_client_fd_start)
                         {
                             /* Client fd (socketpair/pipe from injection) —
-                             * always try, ioctl broken for AF_UNIX on iOS */
-                            revents |= POLLIN;
-                            ios_c_synin++;
+                             * always try, ioctl broken for AF_UNIX on iOS.
+                             * madeira-bcd: only on a full-scan pass; rung
+                             * request fds were read above */
+                            if (ios_full_scan)
+                            {
+                                revents |= POLLIN;
+                                ios_c_synin++;
+                            }
                         }
                         else
                         {
