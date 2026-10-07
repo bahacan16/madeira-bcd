@@ -1,1 +1,44 @@
-.github/workflows/merge-official.yml
+name: Merge official (dry run)
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push the merged branch (true or false)"
+        default: "false"
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Try the merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add official https://github.com/willfaust/Madeira.git
+          git fetch official main
+          echo "--- ahead/behind (ours vs official) ---"
+          git rev-list --left-right --count HEAD...official/main
+          echo "--- official submodule pins ---"
+          git ls-tree official/main FEX wine dxmt madeira-dock
+          echo "--- our submodule pins ---"
+          git ls-tree HEAD FEX wine dxmt madeira-dock
+          git checkout -b merge-official
+          git merge --no-ff --no-commit official/main || true
+          echo "--- conflicts ---"
+          git diff --name-only --diff-filter=U
+          echo "--- files changed by the merge ---"
+          git diff --cached --name-only | wc -l
+      - name: Commit and push
+        if: github.event.inputs.push == 'true'
+        run: |
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::conflicts remain, not pushing"
+            exit 1
+          fi
+          git commit -m "Merge willfaust/Madeira main"
+          git push origin merge-official
