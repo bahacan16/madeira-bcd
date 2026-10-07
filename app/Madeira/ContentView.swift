@@ -88,10 +88,19 @@ final class MetalHostView: UIView {
 /// sent while the landscape overlay shows at least one controller mapping,
 /// unless touch is set to work as a trackpad. A hardware mouse or trackpad is
 /// not affected.
+///
+/// madeira-bcd: the game's own file (Game details › This game's config) is
+/// read first, as for the pad mode, so a per-game line applies. And by
+/// default a desktop (Dock) session keeps touches as the mouse: there the
+/// pointer is how windows are used. Build 433, Grand Theft Auto V through the
+/// Rockstar Games Launcher: with the Xbox layout shown every tap on the game
+/// was dropped, so its window never got the click that would also have
+/// brought it to the front (log 2026-10-07 19:27).
 @MainActor enum TouchMouseGate {
     enum Mode: String { case auto, on, off }
     static let mode: Mode = {
-        let v = MadeiraConfig.get("env.MADEIRA_TOUCH_MOUSE")  // 1: touches always reach the program as a mouse, 0: never; default: not while touch controller mappings are shown
+        let v = MadeiraConfig.gameValue("env.MADEIRA_TOUCH_MOUSE")
+            ?? MadeiraConfig.get("env.MADEIRA_TOUCH_MOUSE")  // 1: touches always reach the program as a mouse, 0: never; default: not while touch controller mappings are shown
             ?? ProcessInfo.processInfo.environment["MADEIRA_TOUCH_MOUSE"]
         let m: Mode = v == "1" ? .on : (v == "0" ? .off : .auto)
         LogStore.shared.log("[touch-mouse] mode=\(m.rawValue)")
@@ -100,11 +109,11 @@ final class MetalHostView: UIView {
     /// Set by TouchControlsOverlay.configureGamepad: the landscape overlay is
     /// visible, not editing, and has at least one controller mapping.
     static var padOverlay = false
-    static func suppressing(touchpad: Bool) -> Bool {
+    static func suppressing(touchpad: Bool, desktop: Bool) -> Bool {
         switch mode {
         case .on: return false
         case .off: return true
-        case .auto: return padOverlay && !touchpad
+        case .auto: return padOverlay && !touchpad && !desktop
         }
     }
 }
@@ -562,7 +571,7 @@ final class MetalBackedView: UIView {
     private func tmgFilter(_ touches: Set<UITouch>, _ phase: UITouch.Phase) -> Set<UITouch>? {
         if phase == .began {
             _ = TouchMouseGate.mode   // logs the mode once
-            guard TouchMouseGate.suppressing(touchpad: touchPointerMode) else { return touches }
+            guard TouchMouseGate.suppressing(touchpad: touchPointerMode, desktop: desktopMode) else { return touches }
             let direct = touches.filter { $0.type == .direct }
             guard !direct.isEmpty else { return touches }
             for t in direct { tmgSwallowed.insert(ObjectIdentifier(t)) }

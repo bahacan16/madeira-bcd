@@ -246,6 +246,12 @@ void winios_dump_window_tree(void)
         return;
     }
     dprintf( 2, "[winios-tree] ---- %u top-level windows ----\n", (unsigned)(size ? size - 1 : 0) );
+    /* who takes the keyboard and, for a game that pauses without focus, the pad */
+    {
+        HWND fg = NtUserGetForegroundWindow();
+        DWORD fg_pid = 0, fg_tid = fg ? get_window_thread( fg, &fg_pid ) : 0;
+        dprintf( 2, "[winios-tree] foreground=%p pid=%04x tid=%04x\n", fg, (unsigned)fg_pid, (unsigned)fg_tid );
+    }
     for (i = 0; i + 1 < size && i < ARRAY_SIZE(list); i++)
     {
         HWND hwnd = list[i];
@@ -589,6 +595,84 @@ static void winios_note_dialog_thread( HWND hwnd, const RECT *visible )
                  (int)visible->left, (int)visible->top, (int)visible->right, (int)visible->bottom );
 }
 
+/* Activation of a full-screen window when it is shown. iOS has no window
+ * manager, and the wineserver keeps Windows' foreground lock (queue_ios.c,
+ * set_foreground_window): a process that has had neither input nor the
+ * foreground may not take it from another process unless its parent holds
+ * it. A game started by a launcher whose windows belong to other processes
+ * is refused: Grand Theft Auto V Enhanced, started by Launcher.exe in a Dock
+ * session (log 2026-10-07 19:27, build 433), asked four times to activate
+ * its 1920x1080 window after the launcher's windows (SocialClubHelper.exe's
+ * UI, the console conhost.exe opened for it) had held the foreground, and
+ * sat at its first screen with no keyboard, mouse or pad; a copy of the game
+ * started on its own plays with a pad on the same build. A window manager
+ * gives a newly shown full-screen window the activation it asks for, so: a
+ * visible top-level window covering the whole virtual screen that is shown
+ * without SWP_NOACTIVATE is made foreground by its own thread at its next
+ * message poll, unless a window of its process already is (the internal path
+ * ios_foreground_check uses). Once per show; smaller windows (launchers,
+ * dialogs) are left to the lock. MADEIRA_FULLSCREEN_FOREGROUND=0 turns this
+ * off. Logs [fg-show] (16 lines at most). */
+static __thread HWND ios_show_foreground;
+
+static int ios_fullscreen_foreground_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *env = getenv( "MADEIRA_FULLSCREEN_FOREGROUND" );  /* 0: a full-screen window shown with activation is left to the foreground lock */
+        on = !(env && env[0] == '0' && !env[1]);
+    }
+    return on;
+}
+
+/* From winios_drv_window_pos_changed, on the window's own thread. */
+static void ios_note_fullscreen_show( HWND hwnd, UINT swp_flags, const RECT *visible )
+{
+    DWORD style;
+    RECT screen;
+
+    if (!(swp_flags & SWP_SHOWWINDOW) || (swp_flags & (SWP_NOACTIVATE | SWP_HIDEWINDOW))) return;
+    if (!ios_fullscreen_foreground_enabled()) return;
+    style = get_window_long( hwnd, GWL_STYLE );
+    if ((style & (WS_CHILD | WS_MINIMIZE | WS_DISABLED)) || !(style & WS_VISIBLE)) return;
+    if (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_NOACTIVATE) return;
+    if (NtUserGetAncestor( hwnd, GA_PARENT ) != get_desktop_window()) return;
+    if (get_window_thread( hwnd, NULL ) != GetCurrentThreadId()) return;
+    screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+    if (visible->left > screen.left || visible->top > screen.top ||
+        visible->right < screen.right || visible->bottom < screen.bottom) return;
+    ios_show_foreground = hwnd;
+}
+
+static void ios_apply_fullscreen_foreground(void)
+{
+    static unsigned int said;
+    HWND hwnd = ios_show_foreground, fg;
+    DWORD pid = GetCurrentProcessId(), fg_pid = 0;
+    BOOL ok;
+
+    ios_show_foreground = 0;
+    if (!is_window( hwnd ) || !is_window_visible( hwnd )) return;
+    if ((fg = NtUserGetForegroundWindow()) && get_window_thread( fg, &fg_pid ) && fg_pid == pid) return;
+    ok = set_foreground_window( hwnd, FALSE, TRUE );
+    if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 16)
+        dprintf( 2, "[fg-show] full-screen window %p of pid %04x was shown with activation while %p "
+                 "(pid %04x) held the foreground: made it foreground ok=%d "
+                 "(MADEIRA_FULLSCREEN_FOREGROUND=0 disables)\n",
+                 hwnd, (unsigned)pid, fg, (unsigned)fg_pid, ok );
+}
+
+/* pProcessEvents: runs on every message poll of a wine thread (message_ios.c
+ * process_driver_events), so a window's own thread gets here right after it
+ * was shown. */
+static BOOL winios_drv_process_events( DWORD mask )
+{
+    if (ios_show_foreground) ios_apply_fullscreen_foreground();
+    return winios_pProcessEvents ? winios_pProcessEvents( mask ) : FALSE;
+}
+
 /* ml505 probe. This hook was a pure stub: wine hands the driver the
  * surface's VISIBLE REGION here — the rects left after sibling and child
  * occlusion — and we discarded all of it.
@@ -804,6 +888,8 @@ static void winios_drv_refresh_children( HWND hwnd, BOOL geometry )
 static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                            const struct window_rects *new_rects, struct window_surface *surface )
 {
+    ios_note_fullscreen_show( hwnd, swp_flags, &new_rects->visible );
+
     /* desktop mode, or a top-level window in game mode (Winios.m draws it
      * in its transparent game-mode overlay, never the desktop backdrop that
      * would cover the DXMT Metal layer) */
@@ -1951,7 +2037,7 @@ static void load_display_driver(void)
          * in app/Madeira/Winios/Winios.m and link in via Madeira.app. */
         if (winios_pCreateWindow)        winios_user_driver.pCreateWindow        = winios_pCreateWindow;
         if (winios_pDestroyWindow)       winios_user_driver.pDestroyWindow       = winios_pDestroyWindow;
-        if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_pProcessEvents;
+        if (winios_pProcessEvents)       winios_user_driver.pProcessEvents       = winios_drv_process_events;
         if (winios_desktop_mode())       winios_user_driver.pSetCursor           = winios_drv_set_cursor;
         /* direct mode: inert (like winios_pSetCursor) until the app enables it */
         else if (winios_direct_cursor_set) winios_user_driver.pSetCursor         = winios_drv_set_cursor;
@@ -2499,6 +2585,10 @@ static HWND ios_main_window( DWORD pid )
         if (!get_window_thread( list[i], &wpid ) || wpid != pid) continue;
         style = get_window_long( list[i], GWL_STYLE );
         if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) continue;
+        /* madeira-bcd: never a hidden window -- its keys would go nowhere, and
+         * a launcher that polls XInput with only hidden windows left (behind
+         * the game it started) must not take the game's foreground. */
+        if (!(style & WS_VISIBLE)) continue;
         if (!get_window_rect( list[i], &r, dpi )) continue;
         if (r.right - r.left < 320 || r.bottom - r.top < 200) continue;
         area = (LONGLONG)(r.right - r.left) * (r.bottom - r.top);
