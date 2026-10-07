@@ -12200,6 +12200,78 @@ static void ios_fex_arena_census( void *start, void *end, size_t request, size_t
         dprintf( 2, "[fex-va] other_sizes views=%u reserved=0x%llx committed=0x%llx\n",
                  other_views, (unsigned long long)other_bytes, (unsigned long long)other_committed );
 }
+
+/* madeira-bcd: how close the FEX arena is to full while things still work.
+ * Grand Theft Auto V Enhanced through the Rockstar Games Launcher (build 434,
+ * log 2026-10-07 20:51) stopped in FEXAlloc with the arena 95% covered
+ * (11.4 of 12 GB, 262 threads) and 593 MB free in 1052 holes, none with a
+ * 4 MB-aligned 4 MB gap; the next start of the same build played. Without a
+ * failure nothing said how close a run came. Called with virtual_mutex held
+ * after a successful placement inside the arena: a line every 30 s and when
+ * free space first drops below 3, 2, 1 and 0.5 GB (200 lines at most),
+ * measured at most once a second. Views only, no page scan.
+ * MADEIRA_FEX_HEADROOM_LOG=0 turns it off. */
+static void ios_fex_arena_headroom( void *start, void *end )
+{
+    static const size_t marks[] = { 3ull << 30, 2ull << 30, 1ull << 30, 512ull << 20 };
+    static unsigned next_mark, lines;
+    static long long next_ns, next_walk_ns;
+    static int on = -1;
+    const ULONG_PTR align_mask = 0x3fffff;  /* rpmalloc's 4 MB medium pages, what failed */
+    struct file_view *view;
+    ULONG_PTR lo = ios_fex_arena_base_unix, hi = ios_fex_arena_end_unix, cursor;
+    size_t covered = 0, biggest = 0, aligned_biggest = 0, free_bytes;
+    unsigned nviews = 0, holes = 0, crossed = 0;
+    struct timespec ts;
+    long long now;
+
+    if (on < 0) { const char *e = getenv( "MADEIRA_FEX_HEADROOM_LOG" ); on = !(e && e[0] == '0'); }  /* 0: no [fex-headroom] lines */
+    if (!on || lines >= 200 || !lo || hi <= lo) return;
+    if ((ULONG_PTR)start < lo || (ULONG_PTR)end > hi) return;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (now < next_walk_ns) return;   /* the walk costs every view: once a second at most */
+    next_walk_ns = now + 1000000000LL;
+
+    cursor = lo;
+    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+    {
+        ULONG_PTR b = (ULONG_PTR)view->base, e;
+
+        if (b >= hi) break;
+        e = view->size > ~(ULONG_PTR)0 - b ? ~(ULONG_PTR)0 : b + view->size;
+        if (e <= lo || e <= b) continue;
+        if (b < lo) b = lo;
+        if (e > hi) e = hi;
+        nviews++;
+        if (b > cursor)
+        {
+            ULONG_PTR aligned = (cursor + align_mask) & ~align_mask;
+            holes++;
+            if (b - cursor > biggest) biggest = b - cursor;
+            if (aligned < b && b - aligned > aligned_biggest) aligned_biggest = b - aligned;
+        }
+        if (e > cursor) { covered += e - (b > cursor ? b : cursor); cursor = e; }
+    }
+    if (cursor < hi)
+    {
+        ULONG_PTR aligned = (cursor + align_mask) & ~align_mask;
+        holes++;
+        if (hi - cursor > biggest) biggest = hi - cursor;
+        if (aligned < hi && hi - aligned > aligned_biggest) aligned_biggest = hi - aligned;
+    }
+    free_bytes = hi - lo - covered;
+    while (next_mark < ARRAY_SIZE(marks) && free_bytes < marks[next_mark]) { next_mark++; crossed = 1; }
+    if (!crossed && now < next_ns) return;
+    next_ns = now + 30000000000LL;
+    lines++;
+    dprintf( 2, "[fex-headroom] arena=%p..%p used=%lluMB free=%lluMB (%u%% used) holes=%u maxgap=%lluKB "
+                "max_4mb_aligned_gap=%lluKB views=%u%s (MADEIRA_FEX_HEADROOM_LOG=0 disables)\n",
+             (void *)lo, (void *)hi, (unsigned long long)(covered >> 20), (unsigned long long)(free_bytes >> 20),
+             (unsigned)((unsigned long long)covered * 100 / (hi - lo)), holes,
+             (unsigned long long)(biggest >> 10), (unsigned long long)(aligned_biggest >> 10), nviews,
+             crossed ? " (threshold crossed)" : "" );
+}
 #endif
 
 static void dump_view( struct file_view *view )
@@ -18456,6 +18528,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if ((ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask )))
         {
             TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
+#ifdef WINE_IOS
+            ios_fex_arena_headroom( start, end );
+#endif
             goto done;
         }
 
@@ -18526,6 +18601,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             }
 #ifdef WINE_IOS
             if (!ptr) ios_fex_arena_census( start, end, size, align_mask );
+            else ios_fex_arena_headroom( start, end );
 #endif
             if (ptr)
             {
