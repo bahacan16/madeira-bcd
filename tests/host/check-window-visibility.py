@@ -122,6 +122,7 @@ static void capture_visibility(HWND hwnd, int visible) {
 }
 static void (*winios_window_visibility)(HWND,int) = capture_visibility;
 static void (*winios_window_geometry)(HWND,int,int,int,int,int,int,int,int);
+static void ios_note_fullscreen_show(HWND hwnd, UINT swp_flags, const RECT *v) { (void)hwnd; (void)swp_flags; (void)v; }
 static void winios_note_dialog_thread(HWND hwnd, const RECT *v) { (void)hwnd; (void)v; dialog_calls++; }
 /* PRODUCTION */
 static struct window_rects rects = {

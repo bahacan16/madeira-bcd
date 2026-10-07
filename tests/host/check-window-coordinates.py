@@ -173,6 +173,7 @@ static void capture_visibility(HWND hwnd, int visible) {
 static void (*winios_window_frame)(HWND,int,int,int,int,int,int,int,int,int)=capture;
 static void (*winios_window_geometry)(HWND,int,int,int,int,int,int,int,int)=capture_geometry;
 static void (*winios_window_visibility)(HWND,int)=capture_visibility;
+static void ios_note_fullscreen_show(HWND hwnd, UINT swp_flags, const RECT *v) { (void)hwnd; (void)swp_flags; (void)v; }
 static void winios_note_dialog_thread(HWND hwnd, const RECT *v) { (void)hwnd; (void)v; }
 /* DRIVER */
 static void set_node(HWND w, HWND parent, RECT window, RECT client, RECT visible) {

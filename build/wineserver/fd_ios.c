@@ -40,9 +40,24 @@
  * right after writing a request; the loop sleeps in semaphore_timedwait
  * and wakes instantly. Extra signals just cause cheap extra scans. */
 semaphore_t ios_srv_wake_sem = 0;
+/* madeira-bcd: coalesced wake. A semaphore count per request never drained:
+ * past the loop's own rate every wait returned at once and the loop ran
+ * pass after pass, each one a read() on every client thread's request fd.
+ * Licensed GTA V Enhanced with the Rockstar launcher, Chromium and Steam
+ * alive (352 Wine threads, log 2026-10-07 22:06, build 435) kept the
+ * wineserver thread ~90% busy at ~10k requests/s, ~90 us of server CPU a
+ * request, while the game alone (122 threads) needed ~22 us. Now a client
+ * signals only when no wake is pending, and the loop clears the flag before
+ * it scans, so a request written after the clear signals again and none is
+ * missed (the 1 ms tick stays as the floor). MADEIRA_SRV_WAKE_COALESCE=0
+ * restores one signal per request. */
+static volatile int ios_srv_wake_pending;
+static int ios_srv_wake_coalesce = -1;
 void ios_wineserver_wake(void)
 {
-    if (ios_srv_wake_sem) semaphore_signal( ios_srv_wake_sem );
+    if (!ios_srv_wake_sem) return;
+    if (ios_srv_wake_coalesce && __atomic_exchange_n( &ios_srv_wake_pending, 1, __ATOMIC_ACQ_REL )) return;
+    semaphore_signal( ios_srv_wake_sem );
 }
 
 /* __WINESRC__ must be defined via -D flag so unicode_fix.h can see it */
@@ -1295,8 +1310,12 @@ void main_loop(void)
 
         ws_log("[wineserver-fd] iOS poll loop: master_fd=%d nb_users=%d active=%d", pollfd[0].fd, nb_users, active_users);
         {
-            kern_return_t skr = semaphore_create( mach_task_self(), &ios_srv_wake_sem,
-                                                  SYNC_POLICY_FIFO, 0 );
+            kern_return_t skr;
+            const char *wc = getenv( "MADEIRA_SRV_WAKE_COALESCE" );  /* 0: one wake signal per request, as before */
+            ios_srv_wake_coalesce = !(wc && wc[0] == '0' && !wc[1]);
+            ws_log("[wineserver-fd] coalesced request wake: %s (MADEIRA_SRV_WAKE_COALESCE=0 disables)",
+                   ios_srv_wake_coalesce ? "on" : "off");
+            skr = semaphore_create( mach_task_self(), &ios_srv_wake_sem, SYNC_POLICY_FIFO, 0 );
             ws_log("[wineserver-fd] request-wake semaphore: kr=%d sem=0x%x", skr, ios_srv_wake_sem);
             if (skr != KERN_SUCCESS) ios_srv_wake_sem = 0;
         }
@@ -1440,6 +1459,8 @@ void main_loop(void)
                         wkr = semaphore_timedwait( ios_srv_wake_sem, wts );
                         if (wkr == KERN_OPERATION_TIMED_OUT) ios_c_semto++;
                         else ios_c_semret++;
+                        /* coalesced wake: cleared before the scan below */
+                        if (ios_srv_wake_coalesce) __atomic_store_n( &ios_srv_wake_pending, 0, __ATOMIC_RELEASE );
                     }
                     else if (ios_srv_wake_sem && nosem)
                     {
