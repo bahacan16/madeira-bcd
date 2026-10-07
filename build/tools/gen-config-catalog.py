@@ -64,9 +64,17 @@ OVERLAY = {
                         "copy. Set it in the game's own file; restart the session after changing it."},
     "env.MADEIRA_EC_HOOK_TRACE": {"category": "Debugging / logs", "title": "Log code patches the emulated copy misses",
                 "kind": "bool", "default": "1",
-                "note": "Default on, logging only. [ec-hook] lines report a program writing over the code of an "
-                        "image that runs from its JIT-pool copy (an overlay hooking DXGI Present, for example): "
-                        "where, the bytes written, the copy's bytes and where a jump leads. 0 turns the lines off."},
+                "note": "Default on, logging only. Compare executable PE sections and their pool copies before "
+                        "sync, including x64 entry thunks. Separate budgets preserve later graphics-jump records "
+                        "after native startup rewrites. A difference alone does not prove an inline hook. 0 disables it."},
+    "env.MADEIRA_X64_GRAPHICS_ENTRY": {"category": "Direct3D 12 (Madeira)", "title": "Patchable x64 graphics method entries",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1 exposes typed x64 ARM64EC entries for swapchain Present/Present1, "
+                        "ResizeBuffers/ResizeBuffers1 and queue ExecuteCommandLists/GetTimestampFrequency/GetClockCalibration/GetDesc/Signal/Wait. "
+                        "With MADEIRA_DXGI_SRC=1, "
+                        "also selects the factory's patchable MakeWindowAssociation and swapchain-creation entries. "
+                        "The x64 entries use the loader's PE addresses so code patches and nearby allocations agree. "
+                        "Existing native implementations remain behind the entries. Restart the game session."},
     "env.MADEIRA_POOL_LOW_IMAGES": {"category": "Memory & JIT pool", "title": "Small images in spare code-buffer space",
                 "kind": "bool", "default": "0",
                 "note": "Default off. If the normal JIT image allocation fails, copies up to 16 MB may use "

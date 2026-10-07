@@ -93,6 +93,8 @@ if [ -n "$MISSING" ]; then
 fi
 echo "  all $(wc -l < "$OUT/tracked.exports" | tr -d ' ') tracked exports present"
 
+python3 "$R/tests/host/check-x64-graphics-entry.py" --d3d12 "$OUT/madeira_d3d12.dll"
+
 cp "$OUT/madeira_d3d12.dll" "$SHIP/madeira_d3d12.dll"
 cp "$OUT/madeira_d3d12.dll" "$SHIP/d3d12.dll"
 echo "::notice::madeira_d3d12.dll and d3d12.dll rebuilt from madeira-d3d12 and shipped"

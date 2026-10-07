@@ -59,13 +59,8 @@ fail() {
 [ -f "$G/dxgi_factory.cpp" ] || fail "dxmt/src/dxgi is not checked out"
 [ -f "$SHIP/dxgi.dll" ] && [ -f "$SHIP/winemetal.dll" ] || fail "the committed arm64ec dxgi.dll / winemetal.dll are missing"
 
-# dxmt db546ee carries both patches itself (willfaust/dxmt#12 and #13) and
-# upstream's committed dxgi.dll is built from that source, so the opt-in copy
-# would only duplicate it.
-if grep -q "MTLDXGIObject<IDXGIFactory7>" "$G/dxgi_factory.cpp" && grep -q "GetUmdDriverVersion()" "$G/dxgi_adapter.cpp"; then
-    echo "::notice::dxgi-src.dll not built: dxmt $(git -C "$D" rev-parse --short HEAD 2>/dev/null) has IDXGIFactory7, EnumAdapterByLuid and the D3DKMT UMD version itself, as does upstream's dxgi.dll; env.MADEIRA_DXGI_SRC = 1 has no effect"
-    exit 0
-fi
+# The current pin already has Factory7 and the UMD version. The separate copy
+# now also supplies opt-in x64 COM entry points, which the tracked DLL lacks.
 
 rm -rf "$OUT"
 mkdir -p "$OUT/obj" "$OUT/src" "$OUT/plain"
@@ -79,6 +74,7 @@ REV="$(git -C "$D" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # The factory with IDXGIFactory7, on a copy (the submodule stays untouched).
 cp "$G/dxgi_factory.cpp" "$OUT/src/dxgi_factory.cpp"
 python3 "$R/tools/patch-dxgi-factory7.py" "$OUT/src/dxgi_factory.cpp" || fail "tools/patch-dxgi-factory7.py did not apply"
+python3 "$R/tools/patch-dxgi-x64-entry.py" "$OUT/src/dxgi_factory.cpp" || fail "tools/patch-dxgi-x64-entry.py did not apply"
 # The adapter with the D3DKMT UMD version (run-time switch MADEIRA_KMT_ADAPTER), also on a copy.
 cp "$G/dxgi_adapter.cpp" "$OUT/src/dxgi_adapter.cpp"
 python3 "$R/tools/patch-dxgi-umd-version.py" "$OUT/src/dxgi_adapter.cpp" || fail "tools/patch-dxgi-umd-version.py did not apply"
@@ -94,6 +90,7 @@ COMMON=(
     -DNOMINMAX -D_WIN32_WINNT=0xa00 -DDXMT_PAGE_SIZE=4096 -DDXMT_IOS=1
     -I"$G" -I"$D/src/dxmt" -I"$U" -I"$D/src/winemetal" -I"$D/src/airconv"
     -I"$D/include" -I"$D/libs"
+    -I"$R/madeira-d3d12/src/pe"
 )
 CXXFLAGS=(-std=c++20 "${COMMON[@]}")
 CFLAGS=("${COMMON[@]}")
@@ -158,9 +155,14 @@ exports "$OUT/dxgi.dll" > "$OUT/exports.built"
 diff "$OUT/exports.upstream" "$OUT/exports.built" > "$OUT/exports.diff" \
     || { cat "$OUT/exports.diff"; fail "its exports differ from the committed dxgi.dll"; }
 "$READOBJ" --file-headers "$OUT/dxgi.dll" | grep -q "IMAGE_FILE_MACHINE_ARM64EC" || fail "the result is not an ARM64EC image"
-LC_ALL=C grep -aq "madeira-bcd dxgi.dll from DXMT source" "$OUT/dxgi.dll" || fail "the Factory7 patch is not in the result"
-LC_ALL=C grep -aq "CheckInterfaceSupport: UMD version" "$OUT/dxgi.dll" || fail "the UMD version patch is not in the result"
+if ! grep -q "MTLDXGIObject<IDXGIFactory7>" "$G/dxgi_factory.cpp"; then
+    LC_ALL=C grep -aq "madeira-bcd dxgi.dll from DXMT source" "$OUT/dxgi.dll" || fail "the Factory7 patch is not in the result"
+fi
+if ! grep -q "GetUmdDriverVersion()" "$G/dxgi_adapter.cpp"; then
+    LC_ALL=C grep -aq "CheckInterfaceSupport: UMD version" "$OUT/dxgi.dll" || fail "the UMD version patch is not in the result"
+fi
 "$NM" --defined-only "$OUT/dxgi.dll" | grep -q "RegisterAdaptersChangedEvent" || fail "RegisterAdaptersChangedEvent is not in the result"
+python3 "$R/tests/host/check-x64-graphics-entry.py" --factory "$OUT/dxgi.dll" || fail "the x64 factory entries failed validation"
 
 # The recipe check: the unpatched link against upstream's binary. Same
 # symbols at the same addresses = same code and layout (only the toolchain's

@@ -44,12 +44,15 @@ else:
         t = Path(t)
         cpp = t / "dxgi_factory.cpp"
         shutil.copy(factory, cpp)
+        original = cpp.read_text()
+        upstream = "MTLDXGIObject<IDXGIFactory7>" in original and "GetAdapterLuid(device)" in original
         rc, out = run(cpp)
         check("patch applies", rc == 0 and "IDXGIFactory7" in out)
         src = cpp.read_text()
         once = src
         rc, out = run(cpp)
-        check("second run: already patched, file unchanged", rc == 0 and "already patched" in out and cpp.read_text() == once)
+        check("second run: idempotent, file unchanged", rc == 0 and cpp.read_text() == once
+              and ("already patched" in out or (upstream and "nothing to do" in out and once == original)))
 
         check("factory derives from IDXGIFactory7", "class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory7> {" in src
               and "MTLDXGIObject<IDXGIFactory6>" not in src)
@@ -59,7 +62,8 @@ else:
               and qi.index("riid == __uuidof(IDXGIFactory7)") < qi.index("*ppvObject = ref(this);"))
         check("RegisterAdaptersChangedEvent: S_OK and a nonzero cookie",
               re.search(r"RegisterAdaptersChangedEvent\(HANDLE hEvent,\s+DWORD \*pdwCookie\) override", src) is not None
-              and "*pdwCookie = cookie;" in src and "if (cookie == 0)" in src)
+              and "*pdwCookie = cookie;" in src
+              and ("if (cookie == 0)" in src or re.search(r"do\s*\{[^}]*\+\+next_cookie;\s*\}\s*while \(cookie == 0\)", src)))
         check("UnregisterAdaptersChangedEvent present", "UnregisterAdaptersChangedEvent(DWORD dwCookie) override" in src)
         # The two IDXGIFactory7 methods are the last virtual functions declared, after
         # IDXGIFactory6's, so they take the vtable slots the interface defines.
@@ -73,9 +77,12 @@ else:
               "GetAdapterLuid(device)" in lu and "CreateAdapter(device, this" in lu and "QueryInterface(iid, adapter)" in lu
               and "not implemented" not in lu)
         cf = src[src.index('extern "C" HRESULT __stdcall CreateDXGIFactory2'):]
-        check("CreateDXGIFactory2 logs the [dxgi-src] line once",
-              "madeira_dxgi_src_note(riid);" in cf[:300] and "[dxgi-src] madeira-bcd dxgi.dll from DXMT source" in src
-              and "noted.exchange(true)" in src)
+        if upstream:
+            check("upstream Factory7 implementation is left byte-for-byte unchanged", src == original)
+        else:
+            check("CreateDXGIFactory2 logs the [dxgi-src] line once",
+                  "madeira_dxgi_src_note(riid);" in cf[:300] and "[dxgi-src] madeira-bcd dxgi.dll from DXMT source" in src
+                  and "noted.exchange(true)" in src)
 
         bad = t / "moved.cpp"
         bad.write_text(once.replace("madeira-bcd: IDXGIFactory7", "x")
@@ -119,14 +126,16 @@ wf = (root / ".github/workflows/build-ipa.yml").read_text()
 steps = re.findall(r"\n      - name: (.+)", wf)
 idx = {n: i for i, n in enumerate(steps)}
 b = next((i for i, n in enumerate(steps) if n.startswith("Build dxgi-src.dll")), None)
+package = next((i for i, n in enumerate(steps) if n.startswith("Package ") and "unsigned IPA" in n), None)
 check("workflow has the dxgi-src.dll step", b is not None)
+check("workflow has an unsigned IPA packaging step", package is not None)
 if b is not None:
     first_dxmt_patch = min(i for i, n in enumerate(steps) if n.startswith("Patch DXMT") or n.startswith("Patch winemetal")
                            or n.startswith("Patch airconv"))
     check("it runs after llvm-mingw and before every DXMT patch step",
           idx["Install ninja/meson and fetch llvm-mingw"] < b < first_dxmt_patch)
     check("it runs before nvapi64 derives its import lib and before the IPA is packaged",
-          b < idx["Build DXMT nvapi64.dll"] and b < idx["Verify committed PE DLLs"] < idx["Package unsigned IPA"])
+          package is not None and b < idx["Build DXMT nvapi64.dll"] and b < idx["Verify committed PE DLLs"] < package)
     block = wf[wf.index("- name: " + steps[b]):]
     block = block[:block.index("\n      - name:", 10)]
     check("its failure does not fail the run", "continue-on-error: true" in block and "bash tools/build-dxgi-dll.sh" in block)

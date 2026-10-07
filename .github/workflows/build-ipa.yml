@@ -390,6 +390,7 @@ jobs:
           python3 tests/host/check-pool-low-images.py
           python3 tests/host/check-x64-image-nocopy.py
           python3 tests/host/check-ec-hook.py
+          python3 tests/host/check-x64-graphics-entry.py
           python3 tests/host/check-pool-startup-budget.py --require-swift
           python3 tests/host/check-pool-placement.py
           python3 tests/host/check-pool-split.py
@@ -1223,13 +1224,11 @@ jobs:
               raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
           print('ARM64EC rpmalloc: span4 build marker verified')
           PYEOF
-          # The opt-in source build of dxgi.dll (tools/build-dxgi-dll.sh) is not
-          # required: without it env.MADEIRA_DXGI_SRC = 1 keeps upstream's.
-          if [ -f app/Madeira/arm64ec-windows/dxgi-src.dll ]; then
-            echo "::notice::dxgi-src.dll present ($(wc -c < app/Madeira/arm64ec-windows/dxgi-src.dll | tr -d ' ') bytes): env.MADEIRA_DXGI_SRC = 1 selects it"
-          else
-            echo "::warning::dxgi-src.dll missing: this IPA has only upstream's dxgi.dll (no IDXGIFactory7); env.MADEIRA_DXGI_SRC = 1 does nothing"
-          fi
+          # Verify the linked x64 entries; never silently ship a fallback DLL
+          # that accepts the option but lacks the required interop ABI.
+          python3 tests/host/check-x64-graphics-entry.py \
+            --factory app/Madeira/arm64ec-windows/dxgi-src.dll \
+            --d3d12 app/Madeira/arm64ec-windows/madeira_d3d12.dll
           # Likewise tools/build-d3d11-dll.sh (env.MADEIRA_D3D11_SRC).
           if [ -f app/Madeira/arm64ec-windows/d3d11-src.dll ]; then
             echo "::notice::d3d11-src.dll present ($(wc -c < app/Madeira/arm64ec-windows/d3d11-src.dll | tr -d ' ') bytes): env.MADEIRA_D3D11_SRC = 1 selects it"

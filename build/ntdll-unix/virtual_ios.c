@@ -28731,17 +28731,46 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 #ifdef WINE_IOS
 /* madeira-bcd: [ec-hook] -- a program's inline patch of a pool-copied image's code.
  *
- * An overlay (GTA V Enhanced's SocialClubD3D12Renderer.dll) hooks IDXGISwapChain::Present
- * by writing a jump over the function's first bytes (VirtualProtect RWX, write, restore).
- * For an image with a JIT-pool copy (dxgi.dll is ARM64EC) the write lands in the PE view,
- * while the code runs from the copy, and the restore's sync below skips .text on purpose:
- * the patch never reaches the code that runs, so the hook is never called. This reports
- * each such patch when the protection is restored: where it is, the bytes the program
- * wrote and the copy's bytes, and where a jump in it leads. Logging only, nothing changes;
- * first 32 per session, regions up to 1 MB. MADEIRA_EC_HOOK_TRACE=0 turns it off. */
+ * A difference does not prove a guest hook: native x18 rewrites and loader
+ * patches also differ from the PE view. Give ordinary differences, other x64
+ * jumps and graphics x64 jumps separate budgets, so startup cannot hide a
+ * later graphics patch. Inspect both views: a caller can write through a pool
+ * function pointer, leaving the PE view unchanged. Include a shared opcode
+ * prefix when only its operands differ. Called BEFORE synchronization on every
+ * executable section, including .hexpthk. No code/protection changes. Regions up to 1 MB;
+ * MADEIRA_EC_HOOK_TRACE=0 turns it off. */
+static size_t ios_ec_hook_jump_target( const unsigned char *at, size_t len, uintptr_t va,
+                                      unsigned long long *target )
+{
+    if (len >= 5 && at[0] == 0xe9)
+    {
+        int32_t rel;
+        memcpy( &rel, at + 1, sizeof(rel) );
+        *target = va + 5 + rel;
+        return 5;
+    }
+    if (len >= 6 && at[0] == 0xff && at[1] == 0x25)
+    {
+        int32_t rel;
+        const unsigned char *slot;
+        memcpy( &rel, at + 2, sizeof(rel) );
+        slot = (const unsigned char *)(va + 6 + rel);
+        if (virtual_check_buffer_for_read( slot, 8 )) memcpy( target, slot, 8 );
+        return !rel && len >= 14 ? 14 : 6;
+    }
+    if (len >= 12 && at[0] == 0x48 && at[1] == 0xb8 && at[10] == 0xff && at[11] == 0xe0)
+    {
+        memcpy( target, at + 2, 8 );
+        return 12;
+    }
+    return 0;
+}
+
 static void ios_ec_hook_report( int idx, const unsigned char *pe, const unsigned char *copy, size_t len )
 {
-    static int lines, on = -1;
+    static unsigned counts[3];   /* differences: 8, other jumps: 16, graphics jumps: 32 */
+    static const unsigned caps[3] = { 8, 16, 32 };
+    static int on = -1;
     size_t i = 0;
     int runs = 0;
 
@@ -28751,11 +28780,14 @@ static void ios_ec_hook_report( int idx, const unsigned char *pe, const unsigned
         on = !(e && e[0] == '0');
     }
     if (!on || len > 0x100000) return;
-    while (i < len && lines < 32 && runs < 4)
+    while (i < len && runs < 4)
     {
         size_t start, end, k;
         const unsigned char *at;
         unsigned long long target = 0;
+        int jump = 0, bucket, pool_patch = 0, pass;
+        unsigned serial;
+        const char *module;
         char sec[160], tsec[160], pb[3 * 16 + 1], cb[3 * 16 + 1], tb[3 * 16 + 1];
 
         if (pe[i] == copy[i]) { i++; continue; }
@@ -28764,8 +28796,30 @@ static void ios_ec_hook_report( int idx, const unsigned char *pe, const unsigned
         while (end < len && end - start < 64 && (pe[end] != copy[end] || (end + 1 < len && pe[end + 1] != copy[end + 1])))
             end++;
         i = end;
-        runs++;
-        lines++;
+        /* Try the pool first: x18/relocation rewrites also live there, so the
+         * byte pattern is diagnostic evidence, not proof of a guest hook.
+         * The address used for a relative jump is the RX VA, never its RW alias. */
+        for (pass = 0; pass < 2 && !jump; pass++)
+        {
+            const unsigned char *view = pass ? pe : copy;
+            uintptr_t va = pass ? (uintptr_t)pe : (uintptr_t)ios_jit_mappings[idx].jit_base +
+                ((uintptr_t)pe - (uintptr_t)ios_jit_mappings[idx].pe_base);
+            size_t back;
+            for (back = 0; back <= start && back < 14; back++)
+            {
+                size_t candidate = start - back, n;
+                unsigned long long dest = 0;
+                n = ios_ec_hook_jump_target( view + candidate, len - candidate, va + candidate, &dest );
+                if (!n || candidate + n <= start || !memcmp( pe + candidate, copy + candidate, n )) continue;
+                start = candidate;
+                if (end < start + n) end = start + n;
+                target = dest;
+                pool_patch = !pass;
+                jump = 1;
+                break;
+            }
+        }
+        i = end;
         at = pe + start;
         for (k = 0; k < 16 && start + k < len; k++)
         {
@@ -28773,16 +28827,14 @@ static void ios_ec_hook_report( int idx, const unsigned char *pe, const unsigned
             snprintf( cb + 3 * k, 4, "%02x ", copy[start + k] );
         }
         pb[3 * k] = cb[3 * k] = 0;
-        /* jmp rel32 / jmp [rip+disp32] / mov rax, imm64 + jmp rax */
-        if (at[0] == 0xe9 && start + 5 <= len)
-            target = (uintptr_t)at + 5 + *(const int32_t *)(at + 1);
-        else if (at[0] == 0xff && at[1] == 0x25 && start + 6 <= len)
-        {
-            const unsigned char *slot = at + 6 + *(const int32_t *)(at + 2);
-            if (virtual_check_buffer_for_read( slot, 8 )) target = *(const unsigned long long *)slot;
-        }
-        else if (at[0] == 0x48 && at[1] == 0xb8 && start + 12 <= len && at[10] == 0xff && at[11] == 0xe0)
-            target = *(const unsigned long long *)(at + 2);
+        bucket = jump ? 1 : 0;
+        module = ios_pe_module_name( ios_jit_mappings[idx].pe_base, ios_jit_mappings[idx].size );
+        if (jump && module && (!strcasecmp( module, "dxgi.dll" ) || !strcasecmp( module, "d3d12.dll" ) ||
+                               !strcasecmp( module, "madeira_d3d12.dll" ))) bucket = 2;
+        if (__atomic_load_n( &counts[bucket], __ATOMIC_RELAXED ) >= caps[bucket]) continue;
+        serial = __atomic_fetch_add( &counts[bucket], 1, __ATOMIC_RELAXED );
+        if (serial >= caps[bucket]) continue;
+        runs++;
         if (!ios_image_section_describe( (uintptr_t)at, sec, sizeof(sec), NULL ))
             snprintf( sec, sizeof(sec), "?" );
         tb[0] = 0;
@@ -28797,9 +28849,11 @@ static void ios_ec_hook_report( int idx, const unsigned char *pe, const unsigned
                 for (k = 0; k < 16; k++) snprintf( tb + 3 * k, 4, "%02x ", t[k] );
             }
         }
-        dprintf( 2, "[ec-hook] #%d tid=%04x image %p (pool copy %p) %p+%#lx: %s | wrote: %s| copy runs: %s| "
+        dprintf( 2, "[ec-hook] #%u scope=%s view=%s tid=%04x image %p (pool copy %p) %p+%#lx: %s | PE bytes: %s| pool before sync: %s| "
                     "jump -> %#llx (%s) bytes there: %s\n",
-                 lines, (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
+                 serial + 1, bucket == 2 ? "graphics-jump" : bucket == 1 ? "other-jump" : "difference",
+                 jump ? pool_patch ? "pool" : "PE" : "difference",
+                 (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread,
                  ios_jit_mappings[idx].pe_base, ios_jit_mappings[idx].jit_base, (const void *)at,
                  (unsigned long)(end - start), sec, pb, cb, target, target ? tsec : "-", tb[0] ? tb : "-" );
     }
@@ -29196,6 +29250,34 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         keep_ok = 1;
                     }
 
+                    /* Compare code before any copy overwrites .hexpthk changes.
+                     * Prefer the caller's byte range over the rounded host page. */
+                    {
+                        unsigned r, count = __atomic_load_n( &ios_jit_mappings[idx].code_range_count, __ATOMIC_ACQUIRE );
+                        size_t trace_lo = off, trace_hi = off + size;
+                        uintptr_t requested = (uintptr_t)ios_patch_requested;
+                        if (requested >= rgn_start && requested <= rgn_end &&
+                            ios_patch_length <= rgn_end - requested)
+                        {
+                            trace_lo = requested - pe_start;
+                            trace_hi = trace_lo + ios_patch_length;
+                        }
+                        if (count > IOS_JIT_MAX_CODE_RANGES) count = 0;
+                        for (r = 0; r < (count ? count : 1); r++)
+                        {
+                            size_t lo = count ? ios_jit_mappings[idx].code_ranges[r].offset : ios_jit_mappings[idx].text_offset;
+                            size_t n = count ? ios_jit_mappings[idx].code_ranges[r].size : ios_jit_mappings[idx].text_size;
+                            size_t hi;
+                            if (lo > ios_jit_mappings[idx].size || n > ios_jit_mappings[idx].size - lo) continue;
+                            hi = lo + n;
+                            if (lo < trace_lo) lo = trace_lo;
+                            if (hi > trace_hi) hi = trace_hi;
+                            if (hi > lo)
+                                ios_ec_hook_report( idx, (const unsigned char *)pe_start + lo,
+                                    (const unsigned char *)ios_jit_rw_base_global + pool_offset + lo, hi - lo );
+                        }
+                    }
+
                     /* Determine .text section bounds within THIS region */
                     size_t text_off = ios_jit_mappings[idx].text_offset;
                     size_t text_sz  = ios_jit_mappings[idx].text_size;
@@ -29225,11 +29307,6 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
                         ERR("iOS JIT IAT sync: partial copy %p+0x%lx → JIT (skipping text [0x%lx-0x%lx])\n",
                             base, (unsigned long)size,
                             (unsigned long)overlap_start, (unsigned long)overlap_end);
-                        /* madeira-bcd: [ec-hook] -- did the program patch the code it skips? */
-                        if (overlap_end > overlap_start)
-                            ios_ec_hook_report( idx, (const unsigned char *)base + overlap_start,
-                                                (const unsigned char *)jit_rw_dest + overlap_start,
-                                                overlap_end - overlap_start );
                     }
 
                     /* Re-apply DIR64 relocations within the synced region.
