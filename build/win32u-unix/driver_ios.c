@@ -525,16 +525,14 @@ static int winios_desktop_mode(void)
     return mode;
 }
 
-/* madeira-bcd: game-mode windows. Outside desktop mode a window got win32u's
- * offscreen surface and its position never reached the app, so a launcher or
- * a message box a game opens before (or instead of) its 3D window was drawn
- * nowhere: Ghost of Tsushima's Play / Options launcher and its "No installed
- * graphics card" box (logs 2026-10-01). This fork had a game-mode overlay for
- * them until the switch to upstream (build 222). Both gates open again for a
- * game; the app side (Winios.m) draws only top-level windows that do not cover
- * the whole guest desktop and do not present through Metal, so a game's own
- * window never covers its picture. MADEIRA_GAME_WINDOWS=0 restores the old
- * behaviour. */
+/* Game-mode windows. Outside desktop mode a window got win32u's offscreen
+ * surface and its position never reached the app, so a launcher or a message
+ * box a game opens before (or instead of) its 3D window was drawn nowhere:
+ * Ghost of Tsushima's Play / Options launcher and its "No installed graphics
+ * card" box. Both gates open for a game session too; the app side (Winios.m)
+ * draws only top-level windows that do not cover the whole guest desktop and
+ * do not present through Metal, so a game's own window never covers its
+ * picture. MADEIRA_GAME_WINDOWS=0 restores the old behaviour. */
 static int winios_game_windows(void)
 {
     static int on = -1;
@@ -546,18 +544,16 @@ static int winios_game_windows(void)
     return on;
 }
 
-/* madeira-bcd: game mode, a thread that shows a launcher / message box. Taps
- * and keys wait in the app's ring (Winios.m) until a wine thread runs
- * pProcessEvents. A game's own loop polls PeekMessage and drains it every
- * frame, but a modal loop (MessageBox, a launcher's GetMessage) sleeps in
- * wait_message with no timeout and the wineserver does not watch the ring:
- * Ghost of Tsushima's "No installed graphics card" box took no tap, Enter or
- * Space (build 296, log 2026-10-01 20:08:38: 18 touches and 36 keys posted, no
- * "[winios] drain" line). Desktop mode wakes such waits every 16 ms to drain
- * the ring (message_ios.c wait_message); a thread that shows a visible
- * top-level window smaller than the guest desktop now does the same. A
- * full-screen game window never marks its thread. MADEIRA_GAME_INPUT_WAKE=0
- * turns this off. Logs [game-input] once per thread (8 at most). */
+/* Game mode, a thread that shows a launcher / message box. Taps and keys wait
+ * in the app's ring (Winios.m) until a wine thread runs pProcessEvents. A
+ * game's own loop polls PeekMessage and drains it every frame, but a modal
+ * loop (MessageBox, a launcher's GetMessage) sleeps in wait_message with no
+ * timeout and the wineserver does not watch the ring, so the box took no tap
+ * or key. Desktop mode wakes such waits every 16 ms to drain the ring
+ * (message_ios.c wait_message); a thread that shows a visible top-level
+ * window smaller than the guest desktop now does the same. A full-screen game
+ * window never marks its thread. MADEIRA_GAME_INPUT_WAKE=0 turns this off.
+ * Logs [game-input] once per thread (8 at most). */
 static __thread int winios_thread_shows_dialog;
 
 int winios_input_wake_thread(void)
@@ -587,8 +583,8 @@ static void winios_note_dialog_thread( HWND hwnd, const RECT *visible )
         visible->right >= screen.right && visible->bottom >= screen.bottom) return;
     winios_thread_shows_dialog = 1;
     if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 8)
-        dprintf( 2, "[game-input] madeira-bcd tid=%04x hwnd=%p vis={%d,%d,%d,%d}: this thread shows a "
-                 "window over the game; its message waits now wake every 16 ms to take taps and keys "
+        dprintf( 2, "[game-input] tid=%04x hwnd=%p vis={%d,%d,%d,%d}: this thread shows a window over "
+                 "the game; its message waits now wake every 16 ms to take taps and keys "
                  "(MADEIRA_GAME_INPUT_WAKE=0 disables)\n", (int)GetCurrentThreadId(), hwnd,
                  (int)visible->left, (int)visible->top, (int)visible->right, (int)visible->bottom );
 }
@@ -680,6 +676,18 @@ static BOOL winios_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *sur
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *info = (BITMAPINFO *)buffer;
     struct window_surface *previous;
+
+    /* Game mode: a window as large as the guest desktop is the game's own. It
+     * presents through Metal and Winios.m never draws it, so it keeps win32u's
+     * offscreen surface, as before game-mode windows, instead of having its whole
+     * surface copied to the app at every flush (about 8 MB at 1080p). */
+    if (!winios_desktop_mode())
+    {
+        RECT screen = get_virtual_screen_rect( 0, MDT_DEFAULT );
+        if (surface_rect->right - surface_rect->left >= screen.right - screen.left &&
+            surface_rect->bottom - surface_rect->top >= screen.bottom - screen.top)
+            return FALSE;
+    }
 
     if ((previous = *window_surface) && previous->funcs == &winios_surface_funcs
         && EqualRect( &previous->rect, surface_rect )) return TRUE;
@@ -796,8 +804,9 @@ static void winios_drv_refresh_children( HWND hwnd, BOOL geometry )
 static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                            const struct window_rects *new_rects, struct window_surface *surface )
 {
-    /* desktop mode only — game windows must never wake the compositor
-     * (it would draw its backdrop OVER the DXMT Metal layer) */
+    /* desktop mode, or a top-level window in game mode (Winios.m draws it
+     * in its transparent game-mode overlay, never the desktop backdrop that
+     * would cover the DXMT Metal layer) */
     if (winios_window_frame && (winios_desktop_mode()
         || (winios_game_windows() && !(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD)
             && NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())))
@@ -882,18 +891,16 @@ static void winios_drv_window_pos_changed( HWND hwnd, HWND insert_after, HWND ow
         }
     }
 
-    /* madeira-bcd: game-mode windows need the expose-equivalent repaint the
-     * fork's earlier overlay sent. A real windowing system answers a window
-     * becoming visible, or getting a new backing surface, with an expose /
-     * damage event, and the driver turns it into NtUserRedrawWindow -- the only
-     * thing that queues WM_PAINT. winios has no such event, so Ghost of
-     * Tsushima's message box (build 291, log 2026-10-01 18:38:48) painted once
-     * into its first surface, got a new one ("[surf-create] ... RECREATED --
-     * old content dropped") and never painted or flushed again: a layer with no
-     * bits. Same condition as the old driver: a surface-backed window that is
-     * visible and was just shown or had its surface changed (apply_window_pos
-     * forces SWP_FRAMECHANGED when the surface pointer changes). Game mode only;
-     * desktop mode is unchanged. */
+    /* Game-mode windows need an expose-equivalent repaint. A real windowing
+     * system answers a window becoming visible, or getting a new backing
+     * surface, with an expose / damage event, and the driver turns it into
+     * NtUserRedrawWindow -- the only thing that queues WM_PAINT. winios has no
+     * such event, so a game's message box painted once into its first
+     * surface, got a new one ("[surf-create] ... RECREATED") and never
+     * painted or flushed again: a layer with no bits. Condition: a
+     * surface-backed window that is visible and was just shown or had its
+     * surface changed (apply_window_pos forces SWP_FRAMECHANGED when the
+     * surface pointer changes). Game mode only; desktop mode is unchanged. */
     if (winios_game_windows() && surface && !IsRectEmpty( &new_rects->visible ) &&
         !(swp_flags & SWP_HIDEWINDOW) && (swp_flags & (SWP_SHOWWINDOW | SWP_FRAMECHANGED)) &&
         (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
@@ -1957,13 +1964,14 @@ static void load_display_driver(void)
          * forwards plain ints to Winios.m's layer compositor */
         if (winios_pWindowPosChanged || winios_window_frame)
             winios_user_driver.pWindowPosChanged = winios_drv_window_pos_changed;
-        /* S2 desktop mode only: GDI window surfaces → app compositor.
-         * Games keep the offscreen (invisible) surface path. */
+        /* S2 desktop mode: GDI window surfaces → app compositor. */
         if (winios_desktop_mode())
         {
             winios_user_driver.pCreateWindowSurface = winios_CreateWindowSurface;
             dprintf( 2, "[winios] desktop mode: window-surface compositing ENABLED\n" );
         }
+        /* Game mode: launcher / dialog windows get real surfaces too; only
+         * top-level windows reach Winios.m's overlay (window_pos_changed). */
         else if (winios_game_windows())
         {
             winios_user_driver.pCreateWindowSurface = winios_CreateWindowSurface;
@@ -2461,15 +2469,92 @@ C_ASSERT( sizeof(struct ios_xinput_state) == 16 );
 C_ASSERT( sizeof(struct ios_xinput_caps) == 20 );
 C_ASSERT( sizeof(struct winios_gamepad) == 20 );
 
+/* There is no window manager on iOS, so nothing ever activates a window: a
+ * game's ShowWindow/SetWindowPos calls typically carry SWP_NOACTIVATE, and
+ * GetForegroundWindow() is then not the game's window. A game that ignores
+ * its input unless it is in the foreground (Dark Souls Remastered compares
+ * GetForegroundWindow() with its own window every frame) reads the pad and
+ * drops it.
+ *
+ * Standing in for the window manager: while a process polls XInput and the
+ * foreground window is not one of its own, make its main window (the largest
+ * top-level, non-child window of at least 320x200) foreground and active.
+ * A window of the same process already in front, such as one of its dialogs,
+ * is left alone. Checked at most once a second.
+ * MADEIRA_FOREGROUND_FIX=0 turns this off. */
+static HWND ios_main_window( DWORD pid )
+{
+    HWND *list, best = 0;
+    LONGLONG best_area = 0;
+    UINT dpi = get_thread_dpi();
+    int i;
+
+    if (!(list = list_window_children( 0 ))) return 0;
+    for (i = 0; list[i]; i++)
+    {
+        DWORD wpid = 0, style;
+        LONGLONG area;
+        RECT r;
+
+        if (!get_window_thread( list[i], &wpid ) || wpid != pid) continue;
+        style = get_window_long( list[i], GWL_STYLE );
+        if ((style & (WS_POPUP | WS_CHILD)) == WS_CHILD) continue;
+        if (!get_window_rect( list[i], &r, dpi )) continue;
+        if (r.right - r.left < 320 || r.bottom - r.top < 200) continue;
+        area = (LONGLONG)(r.right - r.left) * (r.bottom - r.top);
+        if (area > best_area) { best = list[i]; best_area = area; }
+    }
+    free( list );
+    return best;
+}
+
+static void ios_foreground_check(void)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static long long next_ns;
+    static int enabled = -1, logged;
+    DWORD pid = GetCurrentProcessId(), fg_pid = 0;
+    HWND fg, main_hwnd;
+    struct timespec ts;
+    long long now;
+    BOOL ok;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_FOREGROUND_FIX" );  /* 0: never make the game's main window foreground */
+        enabled = !(e && e[0] == '0' && !e[1]);
+    }
+    if (!enabled) return;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (pthread_mutex_trylock( &lock )) return;
+    if (now < next_ns) { pthread_mutex_unlock( &lock ); return; }
+    next_ns = now + 1000000000LL;
+    pthread_mutex_unlock( &lock );
+
+    if ((fg = NtUserGetForegroundWindow()) && get_window_thread( fg, &fg_pid ) && fg_pid == pid) return;
+    if (!(main_hwnd = ios_main_window( pid ))) return;
+
+    ok = set_foreground_window( main_hwnd, FALSE, TRUE );
+    if (logged < 16)
+    {
+        logged++;
+        dprintf( 2, "[fg] activated main window %p of pid %04x (foreground was %p) ok=%d\n",
+                 main_hwnd, (unsigned)pid, fg, ok );
+    }
+}
+
 /***********************************************************************
  *           ios_gamepad_query
  *
  * The body of NtUserCallTwoParam_GetGamepadState. `index` is the XInput user
  * index (0-3) and `op` selects the payload; see NtUserGamepadOp_* in
- * wine/include/ntuser.h. Op 2 (ml2106) is this fork's: xinput's XInputSetState
- * passes the game's XINPUT_VIBRATION in (tools/patch-wine-xinput-vibration.py);
- * an xinput without that patch never sends it. Returns 1 when a pad is
- * connected in that slot and `buffer` was filled (or read), 0 otherwise — which is also what an upstream,
+ * wine/include/ntuser.h. Op 2 (ml2106, NtUserGamepadOp_SetVibration) passes
+ * the game's XINPUT_VIBRATION in from XInputSetState (the wine pin's xinput,
+ * or tools/patch-wine-xinput-vibration.py on an older one); an xinput that
+ * predates it never sends it. Returns 1 when a pad is connected in that slot
+ * and `buffer` was filled (or read), 0 otherwise — which is also what an upstream,
  * non-Madeira win32u returns for a code it does not know, so xinput1_3's
  * runtime probe falls back to the existing HID path.
  */
@@ -2478,6 +2563,7 @@ ULONG_PTR ios_gamepad_query( UINT index, UINT op, void *buffer )
     struct winios_gamepad pad;
 
     if (!buffer || index >= 4) return 0;
+    if (op == 0 && index == 0) ios_foreground_check();
     if (!winios_gamepad_get_state( index, &pad )) return 0;
 
     switch (op)

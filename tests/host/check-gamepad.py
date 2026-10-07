@@ -11,6 +11,10 @@ import tempfile
 root = Path(__file__).resolve().parents[2]
 driver = (root / 'build/win32u-unix/driver_ios.c').read_text()
 query = driver[driver.index('/* ml1920: same-task controller snapshots'):]
+# The foreground fix (#149) calls into win32u's windows; this check has none of it.
+foreground = query.index('/* There is no window manager on iOS')
+foreground_end = query.index('\n}\n', query.index('static void ios_foreground_check(void)')) + 3
+query = query[:foreground] + 'static void ios_foreground_check(void) {}\n' + query[foreground_end:]
 types = r'''
 #include <stdint.h>
 #include <assert.h>

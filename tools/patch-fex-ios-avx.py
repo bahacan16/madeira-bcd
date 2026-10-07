@@ -24,6 +24,11 @@ marker = "madeira-bcd: MADEIRA_FEX_AVX"
 if marker in src:
     print("already patched")
     sys.exit(0)
+# willfaust/FEX#9 (c9199f7 + c58f936, FEX 3bec2ac): the same opt-in upstream
+# (ARM64EC only; WOW64 keeps AVX off) with an [fex-avx] log line.
+if 'getenv("MADEIRA_FEX_AVX")' in src and "HostFeatures.SupportsAVX = true;" in src:
+    print("CPUFeatures.cpp: MADEIRA_FEX_AVX is upstream (willfaust/FEX#9); nothing to do")
+    sys.exit(0)
 
 # The end of the iOS branch of FetchHostFeatures. Upstream's pin has the
 # feature list right above it; the WoW64 series (125hz's FEX) puts the host

@@ -33,6 +33,13 @@ import sys
 d = sys.argv[1]
 marker = "madeira-bcd: IntervalsLock re-entry"
 
+# willfaust/FEX#8 (1992e74, FEX 3bec2ac): the same change upstream, as
+# InvalidationTracker::OwnedSharedMutex. Nothing to do on such a pin.
+_h = open(os.path.join(d, "InvalidationTracker.h")).read()
+if marker not in _h and "class OwnedSharedMutex" in _h and "HeldByThisThread()" in _h:
+    print("InvalidationTracker: IntervalsLock re-entry is upstream (willfaust/FEX#8); nothing to do")
+    sys.exit(0)
+
 
 def patch(name, edits):
     path = os.path.join(d, name)

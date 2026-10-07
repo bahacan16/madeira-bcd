@@ -62,20 +62,27 @@ struct TouchGamepadState {
     private struct Hold { var control: UUID; var value: GamepadSample }
     private var allowed = Set<UUID>()
     private var holds: [UUID: Hold] = [:]
+    private var suspendedConnection = false
+    private(set) var acceptingInput = true
     /// Player 1 stays connected at rest for the whole session, even with no
     /// visible touch control (GamepadInput.reserveSessionSlot). Layout changes
     /// and lifecycle clearing release holds but keep the reservation.
     var reserved = false
-    var connected: Bool { reserved || !allowed.isEmpty }
+    var connected: Bool { reserved || (!allowed.isEmpty && (acceptingInput || suspendedConnection)) }
 
-    mutating func configure(_ controls: Set<UUID>) {
+    mutating func configure(_ controls: Set<UUID>, acceptingInput: Bool = true) {
+        // Menus temporarily suppress controls, not the controller identity.
+        // Preserve an already exposed pad, without connecting one early while
+        // the session is still launching. Hiding/removing all controls disconnects.
+        suspendedConnection = connected && !controls.isEmpty && !acceptingInput
+        self.acceptingInput = acceptingInput
         allowed = controls
         // Layout changes invalidate all in-flight gestures, including remaps
         // which preserve the control's ID.
         clear()
     }
     mutating func update(owner: UUID, control: UUID, value: GamepadSample?) {
-        guard allowed.contains(control), let value else { holds[owner] = nil; return }
+        guard acceptingInput, allowed.contains(control), let value else { holds[owner] = nil; return }
         holds[owner] = Hold(control: control, value: value)
     }
     mutating func clear() { holds.removeAll() }

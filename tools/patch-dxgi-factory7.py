@@ -38,6 +38,11 @@ def main(path):
     if MARKER in src:
         print("patch-dxgi-factory7: already patched")
         return 0
+    if "MTLDXGIObject<IDXGIFactory7>" in src and "GetAdapterLuid(device)" in src:
+        # willfaust/dxmt#12 (a18c93a, dxmt db546ee); upstream's committed
+        # arm64ec dxgi.dll is built from it, so dxgi-src.dll adds nothing.
+        print("patch-dxgi-factory7: IDXGIFactory7 and EnumAdapterByLuid are upstream (willfaust/dxmt#12); nothing to do")
+        return 0
 
     edits = [
         ("includes",

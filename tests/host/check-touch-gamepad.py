@@ -82,6 +82,29 @@ session.update(owner: owner1, control: a, value: TouchPadAction.sample("A"))
 assert(session.sample == GamepadSample())
 session.clear()
 assert(session.connected)
+// Opening the session menu to show the keyboard must not hot-unplug the pad.
+var keyboardMenu = TouchGamepadState()
+keyboardMenu.configure([a], acceptingInput: false) // game still launching
+assert(!keyboardMenu.connected) // do not change the opt-in early-slot policy
+keyboardMenu.configure([a])
+keyboardMenu.update(owner: owner1, control: a, value: TouchPadAction.sample("A"))
+assert(keyboardMenu.connected && keyboardMenu.sample.buttons == 0x1000)
+for _ in 0..<3 {
+    keyboardMenu.configure([a], acceptingInput: false) // menu / control editor
+    assert(keyboardMenu.connected && keyboardMenu.sample == GamepadSample())
+    keyboardMenu.update(owner: owner2, control: a, value: TouchPadAction.sample("B"))
+    assert(keyboardMenu.sample == GamepadSample()) // delayed touches stay blocked
+    keyboardMenu.clear() // lifecycle interruption retains the suspended identity
+    assert(keyboardMenu.connected)
+    keyboardMenu.configure([a]) // menu closed, keyboard shown then dismissed
+    assert(keyboardMenu.connected && keyboardMenu.sample == GamepadSample())
+    keyboardMenu.update(owner: owner1, control: a, value: TouchPadAction.sample("LS", x: 1))
+    assert(keyboardMenu.sample.lx == 32767) // fresh input reaches the same pad
+}
+keyboardMenu.configure([], acceptingInput: false) // user actually hides/removes controls
+assert(!keyboardMenu.connected && keyboardMenu.sample == GamepadSample())
+keyboardMenu.configure([a], acceptingInput: false)
+assert(!keyboardMenu.connected) // hidden source cannot resurrect during a menu
 print("PASS: touch mappings, independent holds, lifecycle clearing, analogue ranges, physical merge and session slot")
 '''
 with tempfile.TemporaryDirectory(prefix='madeira-touch-pad-') as tmp:

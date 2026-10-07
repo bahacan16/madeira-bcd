@@ -2017,7 +2017,9 @@ final class PadStickMouse: ObservableObject {
     }
 
     @objc private func tick(_ l: CADisplayLink) {
-        guard let p = profile, HardwareInput.shared.baseFocused else { return }
+        // Keyboard-and-mouse controller mode (PadKeyboardMouse) owns the stick:
+        // moving the mouse here as well would double it.
+        guard let p = profile, HardwareInput.shared.baseFocused, !GamepadInput.shared.keyboardMouseOn else { return }
         let f = StickVelocity.frame(x: Double(p.rightThumbstick.xAxis.value),
                                     y: Double(p.rightThumbstick.yAxis.value),
                                     gain: InputSettings.shared.sensRel,

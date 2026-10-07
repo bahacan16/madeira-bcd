@@ -1,6 +1,6 @@
 // ml2106: a game's controller output applied to the physical pad.
 // GPL-3.0-or-later WITH the Madeira Converter Exception, version 1; see
-// LICENSE-EXCEPTION.md. docs/dualsense-output.md has the whole picture.
+// LICENSE-EXCEPTION.md. docs/CONTROLLERS.md has the user-facing picture.
 //
 // Two sources, both in WiniosGamepad.c, both written outside the app:
 //  - the virtual DualSense's output reports (env.MADEIRA_PAD_MODE = hid /
@@ -8,7 +8,8 @@
 //    hidpad_dualsense_output) into struct winios_hidpad_output: the rumble
 //    pair, both adaptive trigger effects, lightbar colour, player LEDs, mic LED;
 //  - XInputSetState's two motor speeds per XInput slot (win32u op 2,
-//    build/win32u-unix/driver_ios.c, with tools/patch-wine-xinput-vibration.py).
+//    NtUserGamepadOp_SetVibration, build/win32u-unix/driver_ios.c; needs the
+//    paired Wine xinput change, tools/patch-wine-xinput-vibration.py in this fork).
 // The writers call winios_pad_output_set_notify's hook when something changed;
 // the hook schedules one main-thread pass (never more than one in flight),
 // which reads the newest state and applies what differs from what it applied
@@ -78,7 +79,7 @@ static void on_main(dispatch_block_t block)
     float _want[2];             // per engine: 0 left/low (or the only one), 1 right/high
     float _sent[2];
     unsigned int _failures;     // failed engine/player set-ups in a row; 0 again once one works
-    unsigned int _logged, _losses;
+    unsigned int _logged, _losses, _strikes;
     CFAbsoluteTime _retryAt;    // no new set-up before this (back-off after a failure)
 }
 
@@ -152,7 +153,11 @@ static void on_main(dispatch_block_t block)
     _player[i] = nil;
     _playing[i] = NO;
     _sent[i] = -1;
-    if (_losses > 20) _failures = RUMBLE_GIVE_UP;   // a pad that keeps dropping its engine: leave it alone
+    /* A pad that keeps dropping its engine: leave it alone. iOS stops the engines
+     * when the app goes to the background or audio is interrupted; those do not count. */
+    if (reason != CHHapticEngineStoppedReasonApplicationSuspended
+        && reason != CHHapticEngineStoppedReasonAudioSessionInterrupt && ++_strikes > 20)
+        _failures = RUMBLE_GIVE_UP;
     if (g_active) [self push];
 }
 
@@ -200,16 +205,15 @@ static void on_main(dispatch_block_t block)
                                                        relativeTime:0
                                                            duration:30.0];
     CHHapticPattern *pattern = [[CHHapticPattern alloc] initWithEvents:@[event] parameters:@[] error:&error];
-    // madeira-bcd: a PLAIN player only, on this fresh engine. Game controllers
-    // refuse the advanced one with "Couldn't communicate with a helper
-    // application" (Apple developer forums thread 773615: the engine's
-    // connection to com.apple.GameController.gamecontrollerd.haptics breaks,
-    // a plain CHHapticPatternPlayer works). Asking for the advanced player
-    // first broke the engine for the plain one too: GoW log 2026-10-02
-    // 16:38:12 (build 335) has the plain player failing with the same error
-    // right after the advanced one on the same engine, both handles, three
-    // times, after which the pad never rumbled. The plain player takes the
-    // same intensity control; push restarts it before the 30 s event ends.
+    // A PLAIN player only, on this fresh engine. Game controllers refuse the
+    // advanced one with "Couldn't communicate with a helper application"
+    // (Apple developer forums thread 773615: the engine's connection to
+    // com.apple.GameController.gamecontrollerd.haptics breaks, a plain
+    // CHHapticPatternPlayer works). Asking for the advanced player first broke
+    // the engine for the plain one too: on a DualSense in God of War the plain
+    // player then failed with the same error on both handles and the pad never
+    // rumbled. The plain player takes the same intensity control; push
+    // restarts it before the 30 s event ends.
     id<CHHapticPatternPlayer> player = pattern ? [engine createPlayerWithPattern:pattern error:&error] : nil;
     if (!player) {
         [engine stopWithCompletionHandler:nil];

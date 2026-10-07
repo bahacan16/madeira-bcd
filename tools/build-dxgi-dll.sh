@@ -59,6 +59,14 @@ fail() {
 [ -f "$G/dxgi_factory.cpp" ] || fail "dxmt/src/dxgi is not checked out"
 [ -f "$SHIP/dxgi.dll" ] && [ -f "$SHIP/winemetal.dll" ] || fail "the committed arm64ec dxgi.dll / winemetal.dll are missing"
 
+# dxmt db546ee carries both patches itself (willfaust/dxmt#12 and #13) and
+# upstream's committed dxgi.dll is built from that source, so the opt-in copy
+# would only duplicate it.
+if grep -q "MTLDXGIObject<IDXGIFactory7>" "$G/dxgi_factory.cpp" && grep -q "GetUmdDriverVersion()" "$G/dxgi_adapter.cpp"; then
+    echo "::notice::dxgi-src.dll not built: dxmt $(git -C "$D" rev-parse --short HEAD 2>/dev/null) has IDXGIFactory7, EnumAdapterByLuid and the D3DKMT UMD version itself, as does upstream's dxgi.dll; env.MADEIRA_DXGI_SRC = 1 has no effect"
+    exit 0
+fi
+
 rm -rf "$OUT"
 mkdir -p "$OUT/obj" "$OUT/src" "$OUT/plain"
 REV="$(git -C "$D" rev-parse --short HEAD 2>/dev/null || echo unknown)"

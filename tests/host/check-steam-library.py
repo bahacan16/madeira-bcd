@@ -145,8 +145,9 @@ require('MadeiraConfig' not in sources['SteamOwnedLibrary.swift'] and 'SteamSign
         'one switch, MADEIRA_STEAM_LIBRARY, on by default')
 info = (app / 'Info.plist').read_text()
 permitted = re.findall(r'<key>BGTaskSchedulerPermittedIdentifiers</key>\s*<array>(.*?)</array>', info, re.S)
-require(len(permitted) == 1 and re.findall(r'<string>([^<]*)</string>', permitted[0]) == ['$(PRODUCT_BUNDLE_IDENTIFIER).download.*'],
-        "Info.plist permits one task identifier family, the bundle's own .download.* (background downloads)")
+require(len(permitted) == 1 and re.findall(r'<string>([^<]*)</string>', permitted[0])
+        == ['$(PRODUCT_BUNDLE_IDENTIFIER).download.*', '$(PRODUCT_BUNDLE_IDENTIFIER).pairing.*'],
+        "Info.plist permits only the bundle's own .download.* (background downloads) and .pairing.* (JIT pairing) tasks")
 require('UIBackgroundModes' not in info, 'Info.plist asks for no background mode')
 background = sources['SteamDownloadBackground.swift']
 require('hasSuffix(".download.*")' in background and '+ "queue"' in background and 'BGContinuedProcessingTaskRequest(identifier: identifier' in background,
@@ -1040,7 +1041,11 @@ try:
 
     (work / 'stubs.swift').write_text(STUBS.replace('RELATIVE_ROOT', relative_root).replace('REASON', reason))
     (work / 'checks.swift').write_text(CHECKS)
-    (work / 'dock.swift').write_text('import Foundation\nimport Glibc\n' + dock_head + dock_body)
+    (work / 'dock.swift').write_text(('import Foundation\n#if canImport(Glibc)\nimport Glibc\n#else\nimport Darwin\n#endif\n'
+        '#if canImport(Network)\nimport Network\n#else\n'
+        '/* Linux: no Network framework; DockOffline only needs these names. */\n'
+        'final class NWPathMonitor { struct Path { enum Status { case satisfied, unsatisfied, requiresConnection }; '
+        'var status = Status.satisfied }; var currentPath = Path(); func start(queue: DispatchQueue) {} }\n#endif\n') + dock_head + dock_body)
     (work / 'owned.swift').write_text('import Foundation\n' + owned_game + playtime_source)
     (work / 'downloader.swift').write_text(downloader_host)
     production = [steam / 'Proto/SteamProtoMessages.swift', steam / 'Core/SteamError.swift', steam / 'Core/SteamProtocol.swift',

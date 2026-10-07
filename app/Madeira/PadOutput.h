@@ -1,7 +1,7 @@
 // ml2106: a game's controller output (rumble, DualSense adaptive triggers,
 // lightbar, player LEDs) applied to the physical pad through GameController
 // and CoreHaptics. GPL-3.0-or-later WITH the Madeira Converter Exception,
-// version 1; see LICENSE-EXCEPTION.md. docs/dualsense-output.md.
+// version 1; see LICENSE-EXCEPTION.md.
 //
 // Plain C entry points so Swift calls them with no name translation. Each may
 // be called on any thread; the work happens on the main thread.

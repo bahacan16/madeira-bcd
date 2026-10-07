@@ -292,10 +292,10 @@ struct madeira_ir_convert_args {
     uint32_t gs_stage;              /* in: 0 none, 1 object (VS for a GS), 2 mesh (GS) */
     uint32_t gs_strip;              /* in: 1 = the draw's topology is a strip */
     uint64_t gs_bytecode, gs_bytecode_len;   /* in: the other shader of the pair */
-    /* madeira-bcd: DXIL TESSELLATION through the Metal Shader Converter's own
-     * emulation (IRRuntimeNewGeometryTessellationEmulationPipeline). A DXIL
-     * hull or domain shader converted with gs_emulation = 1 reports what the
-     * pipeline (IRRuntimeTessellationPipelineConfig) and the draws need, from
+    /* DXIL TESSELLATION through the Metal Shader Converter's own emulation
+     * (IRRuntimeNewGeometryTessellationEmulationPipeline). A DXIL hull or
+     * domain shader converted with gs_emulation = 1 reports what the pipeline
+     * (IRRuntimeTessellationPipelineConfig) and the draws need, from
      * IRShaderReflectionCopyHullInfo / CopyDomainInfo. 0 = not reported. */
     uint32_t ret_hs_patches_per_tg;     /* out (hull): max_patches_per_object_threadgroup */
     uint32_t ret_hs_threads_per_patch;  /* out (hull): max_object_threads_per_patch */

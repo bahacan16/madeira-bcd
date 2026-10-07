@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // The guest's virtual monitor and how it is laid out on the device's screen.
 //
@@ -142,5 +145,124 @@ enum GuestDisplay {
         setenv("MADEIRA_SCREEN_SRC", source, 1)
         winios_display_mode_changed(Int32(mode.w), Int32(mode.h))
         return (mode.w, mode.h, source)
+    }
+}
+
+/// ml1172: the Resolution choices, built from this device's screen.
+///
+/// Upstream's library offered one fixed list whose default, 1408x648, is a
+/// 19.5:9 phone's landscape shape: on an iPad, Fit leaves a third of the
+/// screen black. The fork's ml1157 list (0.8x to 2x the screen in points)
+/// was device-shaped but far too small on a phone, whose points are few.
+/// Here the sizes that fill the screen have its shape at fixed pixel counts,
+/// so a choice costs the GPU the same on every device, followed by the usual
+/// PC sizes (16:9, 4:3) with a note on how each fits this screen. The
+/// library's Resolution picker (games and the Desktop entry) and the
+/// developer interface's Resolution menu both show this list; its first
+/// choice is the default.
+enum ResolutionChoices {
+    struct Choice: Hashable {
+        let w: Int, h: Int
+        let label: String
+        var value: String { "\(w)x\(h)" }
+    }
+
+    struct Group {
+        let title: String
+        let choices: [Choice]
+    }
+
+    /// The screen in landscape: `points` give its shape, `pixels` its native size.
+    struct Screen {
+        var points: CGSize
+        var pixels: CGSize
+    }
+
+    /// Read once. MadeiraApp.init touches it first, on the main thread;
+    /// library entries (whose default comes from it) are also made off it.
+    static var screen: Screen = {
+        #if canImport(UIKit)
+        let b = UIScreen.main.bounds, n = UIScreen.main.nativeBounds
+        return Screen(points: CGSize(width: max(b.width, b.height), height: min(b.width, b.height)),
+                      pixels: CGSize(width: max(n.width, n.height), height: min(n.width, n.height)))
+        #else
+        // Hosts without UIKit (the host tests): an 11-inch iPad.
+        return Screen(points: CGSize(width: 1180, height: 820), pixels: CGSize(width: 2360, height: 1640))
+        #endif
+    }()
+
+    /// Pixel counts of the screen-shaped choices: a light one (944x656's, 0.8x
+    /// an 11-inch iPad's points), the default (1280x720's: 1408x648 on a 19.5:9
+    /// iPhone, the size every entry had before these choices, so a game's mode
+    /// list is unchanged), then 1920x1080's.
+    static let budgets: [(pixels: Int, name: String)] = [
+        (944 * 656, "light"), (1280 * 720, "default"), (1920 * 1080, "≈1080p"),
+    ]
+    static let defaultBudget = 1
+    static let widescreen = [(960, 540), (1280, 720), (1600, 900), (1920, 1080), (2560, 1440)]
+    static let classic = [(640, 480), (800, 600), (1024, 768), (1280, 960)]
+
+    static func aspect(_ s: Screen) -> Double {
+        s.points.height > 0 ? Double(s.points.width / s.points.height) : 16.0 / 9
+    }
+
+    /// The screen's shape at about `pixels`, both sides multiples of 8.
+    static func shape(_ s: Screen, pixels: Int) -> (w: Int, h: Int) {
+        let a = aspect(s)
+        let h = Int(((Double(pixels) / a).squareRoot() / 8).rounded()) * 8
+        return (Int((Double(h) * a / 8).rounded()) * 8, h)
+    }
+
+    /// Whether a w x h monitor has this screen's shape: within 1.5%, where
+    /// Fit fills both axes (GameSurfaceLayout.rect).
+    static func fills(_ w: Int, _ h: Int, screen s: Screen = screen) -> Bool {
+        h > 0 && abs(Double(w) / Double(h) / aspect(s) - 1) < 0.015
+    }
+
+    static func defaultSize(for s: Screen = screen) -> (w: Int, h: Int) { shape(s, pixels: budgets[defaultBudget].pixels) }
+    static var defaultValue: String { let d = defaultSize(); return "\(d.w)x\(d.h)" }
+
+    static func groups(for s: Screen = screen) -> [Group] {
+        let native = (w: Int(s.pixels.width), h: Int(s.pixels.height))
+        var own: [Choice] = []
+        for (i, b) in budgets.enumerated() {
+            let (w, h) = shape(s, pixels: b.pixels)
+            // More pixels than the screen has only cost more (never the light or default size).
+            if i > defaultBudget && w * h >= native.w * native.h { break }
+            own.append(Choice(w: w, h: h, label: "\(w)×\(h) · \(b.name)"))
+        }
+        if native.w <= 3840, native.h <= 2160, !own.contains(where: { $0.w == native.w && $0.h == native.h }) {
+            own.append(Choice(w: native.w, h: native.h, label: "\(native.w)×\(native.h) · native"))
+        }
+        var out = [Group(title: "This screen's shape", choices: own)]
+        for (name, sizes) in [("16:9 widescreen", widescreen), ("4:3 classic", classic)] {
+            let (w0, h0) = sizes[0]
+            let r = Double(w0) / Double(h0) / aspect(s)
+            let note = fills(w0, h0, screen: s) ? "fills this screen" : (r > 1 ? "bars above and below" : "bars at the sides")
+            // A size already offered in this screen's shape (1280x720 on a 16:9 phone) is listed once.
+            let rest = sizes.filter { size in !own.contains(where: { $0.w == size.0 && $0.h == size.1 }) }
+            if !rest.isEmpty {
+                out.append(Group(title: "\(name) · \(note)", choices: rest.map { Choice(w: $0.0, h: $0.1, label: "\($0.0)×\($0.1)") }))
+            }
+        }
+        return out
+    }
+
+    /// The screen's shape at 480 lines, which MetalFX 1.5× brings to 720 (the
+    /// library offers it while a game uses MetalFX 1.5×); nil when `groups`
+    /// already have that size (640x480 on a 4:3 iPad).
+    static func metalFX(for s: Screen = screen, in groups: [Group]) -> Choice? {
+        let w = Int((480 * aspect(s) / 8).rounded()) * 8
+        guard (640...4096).contains(w), !groups.contains(where: { $0.choices.contains { $0.w == w && $0.h == 480 } }) else { return nil }
+        return Choice(w: w, h: 480, label: "\(w)×480 · for MetalFX 1.5×")
+    }
+
+    /// A stored "WxH" that none of `groups` offers (a size chosen on another
+    /// device, or typed into madeira.cfg), so a picker never shows a blank
+    /// choice; nil when it is offered or does not parse.
+    static func extra(_ value: String, in groups: [Group], note: String) -> Choice? {
+        let p = value.lowercased().split(separator: "x").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard p.count == 2, !groups.contains(where: { $0.choices.contains { $0.w == p[0] && $0.h == p[1] } }) else { return nil }
+        return Choice(w: p[0], h: p[1], label: "\(p[0])×\(p[1]) · \(note)")
     }
 }

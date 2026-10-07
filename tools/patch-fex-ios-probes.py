@@ -22,11 +22,15 @@ Run from the repository root.
 """
 import pathlib, sys
 
-def patch(path, start, end, guard, label):
+def patch(path, start, end, guard, label, upstream=None):
     p = pathlib.Path(path)
     s = p.read_text()
     if guard + "\n" + start in s:
         print(f"{label}: already patched"); return
+    if upstream and upstream in s:
+        # FEX 2ed5555 (willfaust/FEX#13, "native iOS libraries build again")
+        # guards these probes itself; a second guard would only nest.
+        print(f"{label}: guarded upstream (FEX 2ed5555); nothing to do"); return
     if s.count(start) != 1 or s.count(end) != 1:
         print(f"::error::{label}: patch anchors not unique -- upstream changed, review needed")
         sys.exit(1)
@@ -38,17 +42,21 @@ def patch(path, start, end, guard, label):
 patch("FEX/FEXCore/Source/Interface/Core/Core.cpp",
       "  {\n    static uint64_t FfsLastCount = 0;",
       "IosCbEntryLog[4], IosCbEntryLog[5], IosCbEntryLog[7]);\n    }\n  }\n",
-      "#ifdef FEX_IOS_HOST", "Core.cpp")
+      "#ifdef FEX_IOS_HOST", "Core.cpp",
+      upstream="#ifdef FEX_IOS_HOST\n  /* The capture buffers reported below exist only in the FEX_IOS_HOST")
 patch("FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp",
       "  MEMORY_BASIC_INFORMATION mbi {};",
       "                    mbi.Protect, type, mbi.State);",
-      "#ifndef __APPLE__", "Arm64.cpp")
+      "#ifndef __APPLE__", "Arm64.cpp",
+      upstream="#ifdef FEX_IOS_HOST\n  MEMORY_BASIC_INFORMATION mbi {};")
 
-def replace_once(path, old, new, label):
+def replace_once(path, old, new, label, upstream=None):
     p = pathlib.Path(path)
     s = p.read_text()
     if new in s:
         print(f"{label}: already patched"); return
+    if upstream and upstream in s:
+        print(f"{label}: call guarded upstream (FEX 2ed5555); nothing to do"); return
     if s.count(old) != 1:
         print(f"::error::{label}: anchor not unique -- upstream changed, review needed")
         sys.exit(1)
@@ -58,4 +66,5 @@ def replace_once(path, old, new, label):
 replace_once("FEX/FEXCore/Source/Interface/Core/Core.cpp",
              "int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);",
              "__attribute__((weak)) int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out) { (void)out; return 0; }",
-             "Core.cpp rpm_cas_snapshot_take")
+             "Core.cpp rpm_cas_snapshot_take",
+             upstream="#ifdef FEX_IOS_HOST\n      {\n        rpm_cas_snapshot Snap;")

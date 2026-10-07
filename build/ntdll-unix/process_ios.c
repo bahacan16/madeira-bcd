@@ -64,6 +64,7 @@
 #include <pthread.h>
 #include <setjmp.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #endif
 
 #include "ntstatus.h"
@@ -423,18 +424,17 @@ struct ios_child_args {
     char **argv;
     int argc;
     struct pe_image_info pe_info;
-    int slot;   /* madeira-bcd: ios_child_slots index, -1 = none */
+    int slot;   /* ios_child_slots index, -1 = none */
 };
 
-/* madeira-bcd: pseudo-process children that are still running. A launcher
- * stub that starts the game and exits at once (GTA V Enhanced: PlayGTAV.exe
- * starts GTA5_Enhanced.exe and exits ~1 s later, logs 2026-10-01 17:30-17:31)
- * ended the whole session: the main process's exit stops the wineserver, and
- * the game died loading (exit 0xC0000005). WineProcessBridge asks
- * madeira_live_game_children() after the main process exits and keeps the
- * session while such a child runs. Crash reporters and helpers (crs-handler,
- * crashpad, *helper*, *report*) do not count: they live as long as the game
- * and used to end with it. */
+/* Pseudo-process children that are still running. A launcher stub that
+ * starts the game and exits at once (GTA V Enhanced: PlayGTAV.exe starts
+ * GTA5_Enhanced.exe and exits ~1 s later) ended the whole session: the main
+ * process's exit stops the wineserver, and the game died loading.
+ * WineProcessBridge asks madeira_live_game_children() after the main process
+ * exits and keeps the session while such a child runs. Crash reporters and
+ * helpers (crs-handler, crashpad, *helper*, *report*) do not count: they live
+ * as long as the game and used to end with it. */
 #define IOS_CHILD_SLOTS 32
 static pthread_mutex_t ios_child_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { char name[64]; double started; int used; } ios_child_slots[IOS_CHILD_SLOTS];
@@ -533,7 +533,12 @@ static void *ios_child_thread_entry( void *arg )
 {
     struct ios_child_args *args = arg;
 
-    ios_child_main_machine = args->pe_info.machine;
+    /* An IL-only .NET image without 32BITREQUIRED runs as a native process: the
+     * server and exec_wineloader both promote it, so it must not get a guest
+     * window either.  With one, the process is 64-bit to everyone but lives in
+     * 32-bit furniture, and wow64.dll faults on the PEB32 nobody built. */
+    ios_child_main_machine = (args->pe_info.image_flags & IMAGE_FLAGS_ComPlusNativeReady)
+                             ? native_machine : args->pe_info.machine;
 
     /* Use dprintf for early logging — ERR requires TEB which isn't set up yet */
     dprintf(STDERR_FILENO, "[Wine child thread] ENTRY: fd=%d, argc=%d, exe=%s\n",
@@ -580,6 +585,10 @@ static void *ios_child_thread_entry( void *arg )
     } else {
         dprintf(STDERR_FILENO, "[Wine child thread] child exited with code %d\n", wine_ios_exit_code);
     }
+    {   /* ml1213: never leave the child-boot lock held by a dead boot */
+        extern void ios_child_boot_unlock( void );
+        ios_child_boot_unlock();
+    }
 
     dprintf(STDERR_FILENO, "[Wine child thread] thread exiting cleanly\n");
     /* the pseudo-process is over — give its guest window
@@ -594,7 +603,7 @@ static void *ios_child_thread_entry( void *arg )
      * back to the slot is the owner-thread match in ios_wow_slot_current().
      * It is a no-op once the window has been released. */
     ios_wow_window_release_current();
-    ios_child_slot_release( args->slot );   /* madeira-bcd */
+    ios_child_slot_release( args->slot );
     free( args->argv );
     free( args );
 
@@ -641,7 +650,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     args->argv = argv;
     args->argc = argc;
     args->pe_info = *pe_info;
-    args->slot = ios_child_slot_take( &params->ImagePathName );   /* madeira-bcd */
+    args->slot = ios_child_slot_take( &params->ImagePathName );
 
     if (winedebug) putenv( winedebug );
 
@@ -950,24 +959,55 @@ static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_
 }
 
 #ifdef WINE_IOS
-#include <sys/stat.h>
+/* Is the file name of `image` (any directory) `name`, a lower-case ASCII name? */
+static int ios_image_name_is( const WCHAR *image, int image_len, const char *name )
+{
+    int n = (int)strlen( name ), base = 0, k;
 
-/* madeira-bcd: a Steam game's session log under its own name.
+    if (!image || image_len <= 0) return 0;
+    for (k = 0; k < image_len; k++) if (image[k] == '\\' || image[k] == '/') base = k + 1;
+    if (image_len - base != n) return 0;
+    for (k = 0; k < n; k++)
+    {
+        WCHAR c = image[base + k];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c != (WCHAR)name[k]) return 0;
+    }
+    return 1;
+}
+
+/* conhost.exe in an ARM64EC session. Wine's conhost.exe is a native aarch64
+ * image, but the session's ARM64EC ntdll loads the emulator into it all the
+ * same, while its threads get no CHPE CPU area (init_thread_stack: "NOT
+ * setting cpu_area"). The emulator's memory notifications read through that
+ * area, so conhost's first executable allocation faults at 0x38, and its
+ * exception path faults again forever, taking the whole app down. GTA V
+ * Enhanced: SocialClubHelper.exe's AllocConsole (Chromium routing stdio to a
+ * console) killed the app 33 s in. Refused, AllocConsole just fails and the
+ * caller goes on without a console. aarch64 sessions are not affected.
+ * MADEIRA_EC_CONHOST=1 starts it anyway. */
+static int ec_conhost_refuse( int arm64ec_session, const char *env, const WCHAR *image, int image_len )
+{
+    return arm64ec_session && !(env && env[0] == '1') && ios_image_name_is( image, image_len, "conhost.exe" );
+}
+
+/* A Steam game's session log under its own name.
  *
  * The app keeps each run's log as Documents/logs/<exe>-<yyyy-MM-dd_HH-mm-ss>.txt
  * (LogStore.startSessionLog, a hard link to madeira-log.txt), but only knows
  * the exe when it starts the program itself. A Steam game started through
- * Madeira Dock runs explorer.exe first and Valve's client picks the game's
- * program later, so its runs had no such file (owner, 2026-09-30, Crysis
- * Remastered). When a process whose image lies under steamapps\common\ starts,
- * link the log under that exe's name too, once per exe name per session. */
+ * Madeira Dock runs explorer.exe first and Valve's client starts the game's
+ * program later, so its runs had no such file. When a process whose image lies
+ * under steamapps\common\ starts, link the log under that exe's name too, once
+ * per exe name. */
 static void madeira_steam_session_log( const UNICODE_STRING *image )
 {
     static const char marker[] = "\\steamapps\\common\\";
+    static pthread_mutex_t done_lock = PTHREAD_MUTEX_INITIALIZER;
     static char done[8][64];
     static unsigned ndone;
     const WCHAR *ip = image->Buffer;
-    int len = image->Length / sizeof(WCHAR), ml = sizeof(marker) - 1, k, j, base = 0, found = 0;
+    int len = image->Length / sizeof(WCHAR), ml = sizeof(marker) - 1, k, j, base = 0, found = 0, seen = 0;
     const char *docs = getenv( "MADEIRA_DOCS_DIR" );
     char name[64], src[1024], dir[1024], dst[1200], stamp[32];
     unsigned n = 0, i;
@@ -994,15 +1034,20 @@ static void madeira_steam_session_log( const UNICODE_STRING *image )
     }
     name[n] = 0;
     if (!n) return;
-    /* Helpers a game spawns (Crysis Remastered runs fxc.exe for shaders) are not the game. */
+    /* Helpers a game spawns (a shader compiler such as fxc.exe, installers,
+     * crash reporters) are not the game. */
     {
         static const char * const helpers[] = { "fxc", "redist", "dxsetup", "crash", "setup", "install" };
         char lower[64];
         for (i = 0; i <= n; i++) lower[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
         for (i = 0; i < sizeof(helpers) / sizeof(helpers[0]); i++) if (strstr( lower, helpers[i] )) return;
     }
-    for (i = 0; i < ndone; i++) if (!strcmp( done[i], name )) return;
-    if (ndone < sizeof(done) / sizeof(done[0])) strcpy( done[ndone++], name );
+    pthread_mutex_lock( &done_lock );
+    for (i = 0; i < ndone && !seen; i++) if (!strcmp( done[i], name )) seen = 1;
+    /* A full table counts as seen: otherwise every later spawn would link again. */
+    if (!seen) { if (ndone < sizeof(done) / sizeof(done[0])) strcpy( done[ndone++], name ); else seen = 1; }
+    pthread_mutex_unlock( &done_lock );
+    if (seen) return;
 
     now = time( NULL );
     localtime_r( &now, &tmv );
@@ -1012,9 +1057,9 @@ static void madeira_steam_session_log( const UNICODE_STRING *image )
     mkdir( dir, 0755 );
     snprintf( dst, sizeof(dst), "%s/%s-%s.txt", dir, name, stamp );
     if (link( src, dst ) == 0)
-        dprintf( 2, "[session-log] madeira-bcd Steam game %s: logs/%s-%s.txt\n", name, name, stamp );
+        dprintf( 2, "[session-log] Steam game %s: logs/%s-%s.txt\n", name, name, stamp );
     else
-        dprintf( 2, "[session-log] madeira-bcd Steam game %s: could not link logs/%s-%s.txt (errno %d)\n",
+        dprintf( 2, "[session-log] Steam game %s: could not link logs/%s-%s.txt (errno %d)\n",
                  name, name, stamp, errno );
 }
 
@@ -1065,44 +1110,11 @@ static int sc_switch_end( const WCHAR *cl, int cl_len, const char *sw )
     return last;
 }
 
-/* Is the file name of `image` (any directory) `name`, a lower-case ASCII name? */
-static int sc_image_is( const WCHAR *image, int image_len, const char *name )
-{
-    int n = (int)strlen( name ), base = 0, k;
-
-    if (!image || image_len <= 0) return 0;
-    for (k = 0; k < image_len; k++) if (image[k] == '\\' || image[k] == '/') base = k + 1;
-    if (image_len - base != n) return 0;
-    for (k = 0; k < n; k++)
-    {
-        WCHAR c = image[base + k];
-        if (c >= 'A' && c <= 'Z') c += 32;
-        if (c != (WCHAR)name[k]) return 0;
-    }
-    return 1;
-}
-
 /* What kind of Social Club process `image` with command line `cl` is. */
 static int sc_helper_kind( const WCHAR *image, int image_len, const WCHAR *cl, int cl_len )
 {
-    if (!sc_image_is( image, image_len, "socialclubhelper.exe" )) return SC_NOT_HELPER;
+    if (!ios_image_name_is( image, image_len, "socialclubhelper.exe" )) return SC_NOT_HELPER;
     return sc_switch_end( cl, cl_len, "--type=" ) >= 0 ? SC_CHILD : SC_BROWSER;
-}
-
-/* madeira-bcd: conhost.exe in an ARM64EC session. Wine's conhost.exe is a
- * native aarch64 image, but the session's ARM64EC ntdll loads the emulator
- * into it all the same, while its threads get no CHPE CPU area (thread_ios.c
- * init_thread_stack: "NOT setting cpu_area"). The emulator's memory
- * notifications read through that area, so conhost's first executable
- * allocation faults at 0x38, and its exception path faults again forever --
- * GTA log 2026-10-02 21:54: SocialClubHelper.exe's AllocConsole (Chromium's
- * --enable-logging routes stdio to a console) took the whole app down 33 s in.
- * Refused, AllocConsole just fails and the caller goes on without a console.
- * aarch64 sessions (Crysis' conhost) are not affected. env.MADEIRA_EC_CONHOST=1
- * starts it anyway. */
-static int ec_conhost_refuse( int arm64ec_session, const char *env, const WCHAR *image, int image_len )
-{
-    return arm64ec_session && !(env && env[0] == '1') && sc_image_is( image, image_len, "conhost.exe" );
 }
 
 /* madeira-bcd: env.MADEIRA_CHILD_ARGS = "<exe name> <arguments>" appends the
@@ -1128,7 +1140,7 @@ static const char *child_extra_args( const char *spec, const WCHAR *image, int i
     name[n] = 0;
     spec += n;
     while (*spec == ' ') spec++;
-    if (!*spec || !sc_image_is( image, image_len, name )) return NULL;
+    if (!*spec || !ios_image_name_is( image, image_len, name )) return NULL;
     return spec;
 }
 
@@ -1776,16 +1788,17 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         }
     }
 
-    /* madeira-bcd: no conhost.exe in an ARM64EC session -- see ec_conhost_refuse. */
+    /* conhost.exe is refused in an ARM64EC session, where it would crash the app (see
+     * ec_conhost_refuse); MADEIRA_EC_CONHOST=1 starts it anyway. madeira-bcd: after
+     * MADEIRA_CHILD_ARGS, before the Social Club gate. */
     if (ec_conhost_refuse( is_arm64ec(), getenv( "MADEIRA_EC_CONHOST" ), params->ImagePathName.Buffer,
                            params->ImagePathName.Length / sizeof(WCHAR) ))
     {
         static int ec_conhost_n;
         if (ec_conhost_n++ < 8)
             dprintf( 2, "[ec-conhost] REFUSING conhost.exe in an ARM64EC session: it is aarch64 and its "
-                        "threads have no CPU area for the emulator loaded into it, so it would fault on its "
-                        "first executable allocation and take the app down; the caller gets no console "
-                        "(env.MADEIRA_EC_CONHOST=1 starts it)\n" );
+                        "threads have no CPU area for the emulator loaded into it (it would take the app "
+                        "down); the caller gets no console (env.MADEIRA_EC_CONHOST=1 starts it)\n" );
         return STATUS_ACCESS_DENIED;
     }
 
@@ -1877,7 +1890,8 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
 #ifdef WINE_IOS
     /* a 32-bit child is about to need a guest window (see ios_wow_session_arm) */
-    if (machine == IMAGE_FILE_MACHINE_I386) ios_wow_session_arm();
+    if (machine == IMAGE_FILE_MACHINE_I386 && !(pe_info.image_flags & IMAGE_FLAGS_ComPlusNativeReady))
+        ios_wow_session_arm();
 #endif
     if (!(startup_info = create_startup_info( attr.ObjectName, process_flags, params, &pe_info, &startup_info_size )))
         goto done;

@@ -3499,8 +3499,8 @@ static DWORD wait_message( DWORD count, const HANDLE *handles, DWORD timeout, DW
             const char *d = getenv( "MADEIRA_DESKTOP" );
             ios_slice = (d && *d == '1');
         }
-        /* madeira-bcd: in game mode, the thread that shows a launcher / message
-         * box over the game too (driver_ios.c winios_input_wake_thread). */
+        /* game mode: the thread that shows a launcher / message box over
+         * the game slices too (driver_ios.c winios_input_wake_thread) */
         if (!ios_slice && !winios_input_wake_thread())
         {
             do ret = NtWaitForMultipleObjects( count, handles, type, !!(flags & MWMO_ALERTABLE), abs );

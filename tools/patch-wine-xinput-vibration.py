@@ -28,6 +28,10 @@ path = sys.argv[1]
 src = open(path).read()
 if "madeira_host_vibration" in src:
     print("already patched"); sys.exit(0)
+# willfaust/wine#20 (67b8c8b, wine 257f271): the same host rumble upstream,
+# with op 2 named NtUserGamepadOp_SetVibration in include/ntuser.h.
+if "NtUserGamepadOp_SetVibration" in src and "host_vibration[XUSER_MAX_COUNT]" in src:
+    print("xinput host rumble is upstream (willfaust/wine#20); nothing to do"); sys.exit(0)
 
 helper = r'''
 /* madeira-bcd ml2106: see tools/patch-wine-xinput-vibration.py. */

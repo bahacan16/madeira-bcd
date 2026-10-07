@@ -3160,6 +3160,15 @@ int wine_server_receive_fd( obj_handle_t *handle )
         server_protocol_perror("recvmsg");
     }
     /* the server closed the connection; time to die... */
+#ifdef WINE_IOS
+    /* iOS-Madeira ml1183: a killed thread whose fd socket died between get_handle_fd's
+     * reply and this read is inside server_get_unix_fd's fd_cache_mutex section: exiting
+     * here leaves that mutex, shared by every process of the task, locked (the hang
+     * ios_defer_section_abort fixes for the request pipes). Fail the read instead; the
+     * caller maps -1 to an error and the thread exits when it leaves the section.
+     * Outside a section (process init): unchanged. */
+    if (ios_defer_section_abort()) return -1;
+#endif
     abort_thread(0);
 }
 
@@ -3980,6 +3989,10 @@ void process_exit_wrapper( int status )
         {
             extern void ios_fd_cache_release( void *peb );
             ios_fd_cache_release( dead_peb );
+        }
+        {   /* ml1205: its ml938 sub-floor windows go with it */
+            extern void ios_subfloor_release_owner( void *owner );
+            ios_subfloor_release_owner( dead_peb );
         }
         /* Task #25: release this pseudo-process's JIT pool allocations
          * (module copies, trampolines, FEX CodeBuffers). Children only —
@@ -5264,7 +5277,12 @@ void server_init_process_done(void)
          * exe's entry — main_image_info is restored to the session's exe
          * right after child startup-info init (see wine_ios_child_main). */
         extern const SECTION_IMAGE_INFORMATION *ios_cur_image_info(void);
-        signal_start_thread( ios_cur_image_info()->TransferAddress, peb, suspend, NtCurrentTeb() );
+        extern void *ios_subfloor_low_entry( void *entry, ULONG image_charact );
+        extern void ios_child_boot_unlock( void );
+        ios_child_boot_unlock();   /* ml1213: the child's unix boot is done */
+        signal_start_thread( ios_subfloor_low_entry( ios_cur_image_info()->TransferAddress,
+                                                     ios_cur_image_info()->ImageCharacteristics ),
+                             peb, suspend, NtCurrentTeb() );
     }
 }
 

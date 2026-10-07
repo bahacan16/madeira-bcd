@@ -105,7 +105,7 @@ require('let items = SteamGamesRules.items(installed: model.games, owned: owned,
 card = between(games, 'struct SteamSignInCard: View {', '// MARK: - Artwork')
 require('"Sign in to Steam"' in card and '"See your Steam games here and install them without leaving Madeira."' in card,
         'the sign-in card')
-cell = between(games, 'private struct SteamGameCell: View {', '/// Progress, speed and the state of one download.')
+cell = between(games, 'struct SteamGameCell: View {', '/// Progress, speed and the state of one download.')
 require('if list && dense {' in cell and '} else if list {' in cell, "Steam cards: the library's list and compact list rows")
 require('SteamGamesSection.shown' in view and '[library-sections] native-steam=' in view, 'log line [library-sections]')
 require(re.search(r'\[library-sections\][^"]*\\\((?!SteamOwnedLibrary\.enabled|SteamGamesSection\.)', view) is None,

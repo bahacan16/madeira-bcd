@@ -35,7 +35,8 @@ test = r'''
 
 static int near(float a, float b) { return fabsf(a - b) < 1e-4f; }
 
-/* Nielk1's TriggerEffectGenerator, transcribed (gist 6d54cc2c...). */
+/* Nielk1's TriggerEffectGenerator, transcribed (gist 6d54cc2c...; MIT License,
+ * John "Nielk1" Klein). Test-only: none of it ships in the app. */
 static void gen_off(uint8_t *d) { memset(d, 0, 11); d[0] = 0x05; }
 static void gen_zones(uint8_t *d, uint8_t mode, const uint8_t *level /* 10 x 0-8 */)
 {
@@ -353,15 +354,25 @@ if xi.exists():
         script = str(root / 'tools/patch-wine-xinput-vibration.py')
         subprocess.run([sys.executable, script, str(copy)], check=True, capture_output=True)
         again = subprocess.run([sys.executable, script, str(copy)], check=True, capture_output=True, text=True)
-        need('already patched' in again.stdout, 'the xinput patch must be idempotent')
+        need('already patched' in again.stdout or 'is upstream (willfaust/wine#20)' in again.stdout,
+             'the xinput patch must be idempotent')
         patched = copy.read_text()
-        need(patched.count('madeira_host_vibrate(index)') == 2, 'XInputSetState and XInputEnable must forward')
-        need('NtUserGetGamepadState(index, 2' in patched, 'the patch must use win32u op 2')
-        need('case DLL_PROCESS_DETACH:' in patched and 'NtUserGetGamepadState(i, 2' in patched,
-             'motors must stop when the game process ends')
+        if 'NtUserGamepadOp_SetVibration' in patched:
+            # willfaust/wine#20 (wine 257f271): the same behaviour in upstream's names.
+            vib, op = 'host_pad_vibrate(index)', 'NtUserGamepadOp_SetVibration'
+            need(patched.count(vib) == 2, 'XInputSetState and XInputEnable must forward')
+            need('NtUserGetGamepadState(index, ' + op in patched, 'the host path must use the win32u vibration op')
+            need('case DLL_PROCESS_DETACH:' in patched and 'NtUserGetGamepadState(i, ' + op in patched,
+                 'motors must stop when the game process ends')
+        else:
+            vib = 'madeira_host_vibrate'
+            need(patched.count('madeira_host_vibrate(index)') == 2, 'XInputSetState and XInputEnable must forward')
+            need('NtUserGetGamepadState(index, 2' in patched, 'the patch must use win32u op 2')
+            need('case DLL_PROCESS_DETACH:' in patched and 'NtUserGetGamepadState(i, 2' in patched,
+                 'motors must stop when the game process ends')
         set_state = patched[patched.index('XInputSetState(DWORD index'):]
         set_state = set_state[:set_state.index('\n}\n')]
-        need(set_state.index('madeira_host_vibrate') < set_state.index('start_update_thread'),
+        need(set_state.index(vib.split('(')[0]) < set_state.index('start_update_thread'),
              'the host pad path must return before the HID path starts')
     wine_note = 'xinput patch applies to ' + str(xi.relative_to(wine.parent) if wine.parent in xi.parents else xi)
 

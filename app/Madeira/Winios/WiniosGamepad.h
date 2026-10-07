@@ -65,7 +65,7 @@ struct winios_hidpad_output {
     uint8_t mute_led_valid, mute_led;
     uint8_t trigger_valid[2];     /* [0] left (L2), [1] right (R2) */
     uint8_t trigger[2][11];       /* the effect block as written: mode, then parameters */
-    uint8_t power_valid;          /* ml2106: the game set the motor power reduction */
+    uint8_t power_valid;          /* the game set the motor power reduction */
     uint8_t power_reduction;      /* low nibble triggers, high nibble rumble, 0-7 = 0-87.5 % less */
     uint8_t reserved[3];          /* 44 bytes, no padding */
 };
@@ -79,9 +79,9 @@ void winios_hidpad_set_output(const struct winios_hidpad_output *output);
 int winios_hidpad_get_output(uint32_t seen, struct winios_hidpad_output *out);
 
 /* ml2106: the other direction for XInput. XInputSetState on a host pad reaches
- * win32u's ios_gamepad_query (op 2, build/win32u-unix/driver_ios.c), which
- * stores the two motor speeds here; `serial` advances on every change. Slots
- * 0-3, as above. */
+ * win32u's ios_gamepad_query (op 2, NtUserGamepadOp_SetVibration, in
+ * build/win32u-unix/driver_ios.c), which stores the two motor speeds here;
+ * `serial` advances on every change. Slots 0-3, as above. */
 struct winios_gamepad_vibration {
     uint32_t serial;
     uint16_t left;                /* XINPUT_VIBRATION.wLeftMotorSpeed: the large, low-frequency motor */

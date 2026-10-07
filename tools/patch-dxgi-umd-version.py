@@ -35,6 +35,11 @@ def main(path):
     if MARKER in src:
         print("patch-dxgi-umd-version: already patched")
         return 0
+    if "GetUmdDriverVersion()" in src and "KMTQAITYPE_UMD_DRIVER_VERSION" in src:
+        # willfaust/dxmt#13 (75e3bb4): always asks D3DKMT (no MADEIRA_KMT_ADAPTER
+        # gate here; win32u's D3DKMTQueryAdapterInfo still answers only with it).
+        print("patch-dxgi-umd-version: the D3DKMT UMD version is upstream (willfaust/dxmt#13); nothing to do")
+        return 0
 
     edits = [
         ("includes",

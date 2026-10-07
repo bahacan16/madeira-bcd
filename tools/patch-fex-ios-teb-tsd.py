@@ -23,6 +23,12 @@ marker = "madeira-bcd: GetCurrentTEB without x18"
 if marker in src:
     print("already patched")
     sys.exit(0)
+# willfaust/FEX#6 (89d0407, FEX 3bec2ac): GetCurrentTEB reads the TSD slot
+# upstream (IosTebTsdOffset + TPIDRRO_EL0), for both Windows modules.
+_body = src[src.find("static inline __TEB* GetCurrentTEB()"):][:1200]
+if "IosTebTsdOffset" in _body and "TPIDRRO_EL0" in _body:
+    print("Priv.h: GetCurrentTEB already takes the TEB from the TSD slot upstream (willfaust/FEX#6); nothing to do")
+    sys.exit(0)
 
 old = """static inline __TEB* GetCurrentTEB() {
   return reinterpret_cast<__TEB*>(NtCurrentTeb());

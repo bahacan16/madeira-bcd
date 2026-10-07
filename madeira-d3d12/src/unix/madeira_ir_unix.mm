@@ -74,9 +74,9 @@
     X(IRShaderReflectionReleaseGeometryInfo) \
     X(IRErrorGetCode) \
     X(IRErrorDestroy)
-/* madeira-bcd: optional. A converter without them still converts everything
- * else; a DXIL hull/domain shader then reports no tessellation numbers and its
- * pipeline stays a placeholder. */
+/* Optional. A converter without them still converts everything else; a DXIL
+ * hull/domain shader then reports no tessellation numbers and its pipeline
+ * stays a placeholder. */
 #define IR_OPT_FUNC_LIST(X) \
     X(IRShaderReflectionCopyHullInfo) \
     X(IRShaderReflectionReleaseHullInfo) \
@@ -363,12 +363,26 @@ static void mad_sc_hash_add(uint64_t *h, const void *p, size_t n)
     for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ull; }
 }
 
-/* madeira-bcd: the key binds every entry to THIS BUILD (ml1020), so each new
- * build wrote a fresh set and the earlier ones were never read again -- nor
- * deleted. The first cache access of a process compares
- * Documents/shadercache/.build with this build's stamp; when it differs, a
- * background thread removes the entries (and torn .tmp files) written before
- * the process started, then records the stamp. */
+/* The build every cache entry (DXBC and DXIL) is bound to. A rebuild of this
+ * archive used to change __DATE__/__TIME__ and so start the device's cache from
+ * nothing: Ghost of Tsushima then converted its ~29,000 stages again behind
+ * "Compiling shaders" after every update. build/dxmt-ios/build.sh passes
+ * MADEIRA_IR_CONVERTER_ID, a hash of everything that shapes a conversion (this
+ * service and the IR ABI, the build script's flags, DXMT's airconv and DXBC
+ * parser, LLVM's configuration, the converter's headers and library); a build
+ * that changes none of them keeps the cache. Without it, every build gets a
+ * cache of its own, as before. */
+#ifdef MADEIRA_IR_CONVERTER_ID
+#define MAD_SC_BUILD "converter " MADEIRA_IR_CONVERTER_ID
+#else
+#define MAD_SC_BUILD __DATE__ " " __TIME__
+#endif
+
+/* Entries of an earlier build are never read again, and the DXBC ones (unlike
+ * the size-bounded DXIL ones) were never deleted either. The first cache access
+ * of a process compares shadercache/.mdsc-build with MAD_SC_BUILD; when it
+ * differs, a background thread removes the .mdsc entries (and torn .tmp files)
+ * written before the process started, then records the build. */
 static time_t g_sc_prune_before;
 static void *mad_sc_prune_thread(void *arg)
 {
@@ -386,29 +400,29 @@ static void *mad_sc_prune_thread(void *arg)
             if (!unlink(path)) n++;
         }
         closedir(d);
-        if (snprintf(path, sizeof path, "%s/.build", dir) < (int)sizeof path) {
+        if (snprintf(path, sizeof path, "%s/.mdsc-build", dir) < (int)sizeof path) {
             int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd >= 0) { const char *stamp = __DATE__ " " __TIME__; ssize_t w = write(fd, stamp, strlen(stamp)); (void)w; close(fd); }
+            if (fd >= 0) { ssize_t w = write(fd, MAD_SC_BUILD, strlen(MAD_SC_BUILD)); (void)w; close(fd); }
         }
     }
-    if (n) fprintf(stderr, "[madeira-ir] DXBC shader cache: removed %u entries of earlier builds\n", n);
+    if (n) dprintf(2, "[madeira-ir] DXBC shader cache: removed %u entries of earlier builds\n", n);
     free(dir);
     return NULL;
 }
 static void mad_sc_prune_start(void)
 {
-    const char *docs = getenv("MADEIRA_DOCS_DIR"), *stamp = __DATE__ " " __TIME__;
-    char dir[1100], marker[1200], old[64];
+    const char *docs = getenv("MADEIRA_DOCS_DIR");
+    char dir[1100], marker[1200], old[128];
     ssize_t n = -1;
     int fd;
     pthread_t t;
     if (!docs || !*docs) return;
     if (snprintf(dir, sizeof dir, "%s/shadercache", docs) >= (int)sizeof dir) return;
-    if (snprintf(marker, sizeof marker, "%s/.build", dir) >= (int)sizeof marker) return;
+    if (snprintf(marker, sizeof marker, "%s/.mdsc-build", dir) >= (int)sizeof marker) return;
     fd = open(marker, O_RDONLY);
     if (fd >= 0) { n = read(fd, old, sizeof old - 1); close(fd); }
     old[n > 0 ? n : 0] = 0;
-    if (!strcmp(old, stamp)) return;
+    if (!strcmp(old, MAD_SC_BUILD)) return;
     g_sc_prune_before = time(NULL) - 2;
     char *arg = strdup(dir);
     if (arg && !pthread_create(&t, NULL, mad_sc_prune_thread, arg)) pthread_detach(t);
@@ -424,7 +438,7 @@ static int mad_sc_path_ext(uint64_t key, const char *ext, char *out, size_t cap)
     if (!docs || !*docs) return 0;
     if (snprintf(out, cap, "%s/shadercache", docs) >= (int)cap) return 0;
     mkdir(out, 0755);   /* harmless if it exists */
-    pthread_once(&prune_once, mad_sc_prune_start);   /* madeira-bcd */
+    pthread_once(&prune_once, mad_sc_prune_start);
     if (snprintf(out, cap, "%s/shadercache/%016llx.%s", docs,
                  (unsigned long long)key, ext) >= (int)cap) return 0;
     return 1;
@@ -688,7 +702,7 @@ static int mad_airconv_convert_tess(struct madeira_ir_convert_args *a,
     {   /* cache identity: every input that shapes the output */
         uint64_t key = 1469598103934665603ull;
         uint32_t mv = SM50_SHADER_METAL_320, ver = MAD_SC_VERSION, st[2] = { a->tess_stage, a->tess_index_format };
-        const char *stamp = __DATE__ __TIME__;
+        const char *stamp = MAD_SC_BUILD;
         mad_sc_hash_add(&key, "tess", 4);
         mad_sc_hash_add(&key, bc, bclen);
         mad_sc_hash_add(&key, hs, hslen);
@@ -865,7 +879,7 @@ static int mad_airconv_convert_gs(struct madeira_ir_convert_args *a,
     {   /* cache identity: every input that shapes the output */
         uint64_t key = 1469598103934665603ull;
         uint32_t mv = SM50_SHADER_METAL_320, ver = MAD_SC_VERSION, st[3] = { a->gs_stage, a->tess_index_format, a->gs_strip ? 1u : 0u };
-        const char *stamp = __DATE__ __TIME__;
+        const char *stamp = MAD_SC_BUILD;
         mad_sc_hash_add(&key, "geom", 4);
         mad_sc_hash_add(&key, bc, bclen);
         mad_sc_hash_add(&key, other, olen);
@@ -1128,9 +1142,9 @@ static int mad_airconv_convert(struct madeira_ir_convert_args *a,
             /* ml1020: bind the key to THIS BUILD. A cache entry produced by an
              * older compiler is not safe to reuse -- the airconv changes in this
              * session alone would have invalidated it -- and a silently stale
-             * shader is far worse than recompiling. Rebuilding the archive
-             * changes this stamp and orphans the old entries. */
-            { const char *stamp = __DATE__ __TIME__;
+             * shader is far worse than recompiling. A build with another
+             * converter identity (MAD_SC_BUILD) orphans the old entries. */
+            { const char *stamp = MAD_SC_BUILD;
               mad_sc_hash_add(&key, stamp, strlen(stamp)); }
             if (ia_nel) mad_sc_hash_add(&key, ia_el, (size_t)ia_nel * sizeof ia_el[0]);
             /* ml1031: the emitted pixel shader now depends on WHICH vertex stage
@@ -1348,6 +1362,72 @@ static int mad_ags_enabled(void)
     return enabled;
 }
 
+/* The converter's compatibility flags: D3D12 guarantees the Metal Shader
+ * Converter gives only on request. Each is on by default and can be turned off
+ * in madeira.cfg for an A/B run; the DXIL cache keys on the result, so a
+ * change re-converts once.
+ * - ml932, always: IRCompatibilityFlagForceTextureArray (see the comment at
+ *   IRCompilerSetCompatibilityFlags below).
+ * - msc-bounds-check: D3D12 robust buffer access -- an out-of-range read
+ *   returns 0, an out-of-range write is dropped. Without it a read past a
+ *   buffer returns whatever memory follows. Ghost of Tsushima dispatches a
+ *   normal-recompute kernel rounded up to its group size (221 x 64 threads);
+ *   the threads past the last vertex read their [first, last) adjacency range
+ *   from beyond the buffer, got garbage instead of 0,0 and looped until Metal
+ *   timed the command buffer out (MTLCommandBufferError 2), every run.
+ * - msc-position-invariance: the same vertex shader in two pipelines gives
+ *   bit-identical positions. Metal compiles a vertex function per pipeline and
+ *   may optimise the position math differently in each, so a pass that redraws
+ *   geometry with depth test EQUAL after a depth pre-pass loses pixels at
+ *   random (~350 such draws a frame in Ghost of Tsushima: cloth, hair). DXVK
+ *   and vkd3d-proton declare position invariant by default for the same reason.
+ * - msc-strict-nan: MSC 4.0 compiles with Metal's assumption that no operand
+ *   is NaN or Inf, so isnan() can fold to false and min/max lose their NaN
+ *   rules. D3D12 keeps IEEE semantics (Ghost of Tsushima clears a velocity
+ *   target to NaN as a "not written" marker).
+ * - msc-sampler-lod-bias: apply D3D12_SAMPLER_DESC::MipLODBias. Metal samplers
+ *   have no LOD bias; the runtime already writes it into every sampler
+ *   descriptor's metadata, but the converted shader reads it only with this flag.
+ * - msc-sample-nan-zero: a texture sample that comes back NaN reads 0. A
+ *   filtered read across NaN texels is NaN on Metal, and a NaN that reaches a
+ *   temporal resolve stays in its history and spreads as dark specks.
+ * - msc-position-inf-nan: a vertex position of +-Inf becomes NaN, which Metal
+ *   discards like D3D does. Particle systems kill particles by writing an
+ *   infinite position; kept as Inf, Metal can rasterise a sliver instead. */
+static uint32_t mad_ir_compat_flags(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        /* madeira-bcd: env MADEIRA_IR_NO_BOUNDS_CHECK=1 (the fork's switch, also
+         * read by the PE side for the cache key) turns the bounds check off too. */
+        const char *no_bc = getenv("MADEIRA_IR_NO_BOUNDS_CHECK");
+        int bc = (madeira_cfg_int("msc-bounds-check", 1) && !(no_bc && no_bc[0] == '1')) ? 1 : 0;
+        int inv = madeira_cfg_int("msc-position-invariance", 1) ? 1 : 0;
+        int nan = madeira_cfg_int("msc-strict-nan", 1) ? 1 : 0;
+        int lod = madeira_cfg_int("msc-sampler-lod-bias", 1) ? 1 : 0;
+        int snz = madeira_cfg_int("msc-sample-nan-zero", 1) ? 1 : 0;
+        int pin = madeira_cfg_int("msc-position-inf-nan", 1) ? 1 : 0;
+        int f = (int)IRCompatibilityFlagForceTextureArray |
+                (bc ? (int)IRCompatibilityFlagBoundsCheck : 0) |
+                (inv ? (int)IRCompatibilityFlagPositionInvariance : 0) |
+                (lod ? (int)IRCompatibilityFlagSamplerLODBias : 0) |
+                (snz ? (int)IRCompatibilityFlagSampleNanToZero : 0) |
+                (pin ? (int)IRCompatibilityFlagVertexPositionInfToNan : 0);
+#if IR_VERSION_MAJOR >= 4
+        if (nan) f |= (int)IRCompatibilityFlagDisableNanInfOptimization;
+#else
+        nan = 0;   /* converted IR was strict before 4.0 */
+#endif
+        fprintf(stderr, "[madeira-ir] MSC %d.%d.%d compatibility: bounds check %s, position invariance %s, strict NaN/Inf %s, "
+                        "sampler LOD bias %s, sampled NaN -> 0 %s, Inf position -> NaN %s (madeira.cfg msc-bounds-check, "
+                        "msc-position-invariance, msc-strict-nan, msc-sampler-lod-bias, msc-sample-nan-zero, msc-position-inf-nan; "
+                        "env MADEIRA_IR_NO_BOUNDS_CHECK=1)\n",
+                IR_VERSION_MAJOR, IR_VERSION_MINOR, IR_VERSION_PATCH, bc ? "on" : "off", inv ? "on" : "off",
+                nan ? "on" : "off", lod ? "on" : "off", snz ? "on" : "off", pin ? "on" : "off");
+        cached = f;   /* one store: another converting thread sees -1 or the whole value */
+    }
+    return (uint32_t)cached;
+}
+
 extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     pthread_once(&g_ir_once, ir_load_once);
     if (!a) return MADEIRA_IR_UNSUPPORTED;
@@ -1425,6 +1505,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     struct madeira_ir_vs_input *all_vsin = NULL;
     uint32_t n_locs = 0, n_vsin = 0, vs_count = 0, vs_out_size = 0;
     uint32_t tg[3] = { 0, 0, 0 }, gs_max = 0, gs_payload = 0, gs_pt = 0;
+    uint32_t hs[8] = { 0 }, ds[4] = { 0 };   /* DXIL tessellation reflection, ret_hs_* / ret_ds_* order */
     size_t lib2_len = 0, dxc_len = 0;
     char dxc_note[128] = "";
     void *dxc_blob = NULL;
@@ -1441,9 +1522,9 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         void *hit = NULL;
         size_t hit_len = 0;
         env.converter_ident = g_ir.ident;
-        env.build_stamp = __DATE__ " " __TIME__;
+        env.build_stamp = MAD_SC_BUILD;
         env.ags_rewrite = (uint32_t)mad_ags_enabled();
-        env.compat_flags = (uint32_t)IRCompatibilityFlagForceTextureArray;
+        env.compat_flags = mad_ir_compat_flags();
         mad_dxc_key(a, &env, &dxc_key, &dxc_check);
         if (dxc_slot) hit = mad_dxc_slot_take(dxc_key, dxc_check, &hit_len);
         if (!hit && dxc_disk) {
@@ -1585,76 +1666,9 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
      * (TSR history: update declares 2darray, resolve declares 2d); Metal
      * returns zeros on the mismatch. With this flag every 1D/2D/cube texture
      * is an array in the converted shader, and the runtime allocates and
-     * views every such texture as an array to match. */
-    /* madeira-bcd: IRCompatibilityFlagBoundsCheck gives D3D12's robust buffer
-     * access -- an out-of-range read returns 0, an out-of-range write is
-     * dropped. Without it a read past a buffer returns whatever memory follows.
-     * Ghost of Tsushima dispatches a normal-recompute kernel with its thread
-     * count rounded up to the group size (Dispatch(221) x 64); the threads past
-     * the last vertex read their [first, last) adjacency range from beyond the
-     * buffer, got garbage instead of 0,0, and looped until the GPU timed out
-     * (MTLCommandBufferError 2) in every run. MADEIRA_IR_NO_BOUNDS_CHECK=1
-     * restores the old conversion. */
-    /* madeira-bcd: three more D3D12 guarantees the converter only gives on
-     * request (each can be turned off in madeira.cfg for an A/B run; the PE
-     * shader cache keys on the same three values):
-     * - msc-position-invariance: the same vertex shader in two pipelines gives
-     *   bit-identical positions. Metal compiles a vertex function per pipeline
-     *   and may optimise the position math differently in each; a pass that
-     *   redraws geometry with depth test EQUAL after a depth pre-pass then
-     *   loses pixels at random. Ghost of Tsushima draws ~350 such calls a frame
-     *   (cloth, moving objects, hair). DXVK and vkd3d-proton declare position
-     *   invariant by default for the same reason.
-     * - msc-strict-nan: MSC 4.0 compiles with Metal's default assumption that
-     *   no operand is NaN or Inf ("NaN/Inf optimization", on by default since
-     *   4.0; before 4.0 converted IR was strict), so isnan() can fold to false
-     *   and min/max lose their NaN rules. D3D12 keeps IEEE semantics, and Ghost
-     *   of Tsushima clears its RG16F velocity target to NaN on purpose every
-     *   frame as a "not written" marker.
-     * - msc-sampler-lod-bias: apply D3D12_SAMPLER_DESC::MipLODBias. Metal
-     *   samplers have no LOD bias; the runtime already writes it into every
-     *   sampler descriptor's metadata (IRDescriptorTableSetSampler), but the
-     *   converted shader reads it only with this flag.
-     * madeira-bcd (build 217), two more of the converter's D3D behaviours, for
-     * Ghost of Tsushima's dark specks and smears around fire and smoke:
-     * - msc-sample-nan-zero: NaN sampling COORDINATES are flushed to zero, as
-     *   D3D hardware treats them (man page: "Flush NaN sampling coordinates to
-     *   zero"); sampled values are untouched, so the game's isnan() tests on
-     *   its NaN-cleared velocity target (see msc-strict-nan) still work. A
-     *   reprojection uv - velocity over such a texel is NaN, Metal's result for
-     *   that sample is undefined, and a bad value that reaches the temporal
-     *   resolve stays in its history and spreads as black specks.
-     * - msc-position-inf-nan: a vertex position of +-Inf becomes NaN, which
-     *   Metal discards like D3D does. Particle systems kill particles by
-     *   writing an infinite position; kept as Inf, Metal can rasterise a
-     *   screen-sized sliver instead of nothing. */
-    {
-        static int no_bc = -1, extra = -1;
-        if (no_bc < 0) { const char *v = getenv("MADEIRA_IR_NO_BOUNDS_CHECK"); no_bc = v && v[0] == '1'; }
-        if (extra < 0) {
-            int inv = madeira_cfg_int("msc-position-invariance", 1) ? 1 : 0;
-            int nan = madeira_cfg_int("msc-strict-nan", 1) ? 1 : 0;
-            int lod = madeira_cfg_int("msc-sampler-lod-bias", 1) ? 1 : 0;
-            int snz = madeira_cfg_int("msc-sample-nan-zero", 1) ? 1 : 0;
-            int pin = madeira_cfg_int("msc-position-inf-nan", 1) ? 1 : 0;
-            int e = (inv ? (int)IRCompatibilityFlagPositionInvariance : 0) |
-                    (lod ? (int)IRCompatibilityFlagSamplerLODBias : 0) |
-                    (snz ? (int)IRCompatibilityFlagSampleNanToZero : 0) |
-                    (pin ? (int)IRCompatibilityFlagVertexPositionInfToNan : 0);
-#if IR_VERSION_MAJOR >= 4
-            if (nan) e |= (int)IRCompatibilityFlagDisableNanInfOptimization;
-#endif
-            extra = e;   /* one store: another converting thread sees -1 or the whole value */
-            fprintf(stderr, "[madeira-ir] MSC %d.%d.%d compatibility: position invariance %s, strict NaN/Inf %s, "
-                            "sampler LOD bias %s, sampled NaN -> 0 %s, Inf position -> NaN %s, bounds check %s "
-                            "(madeira.cfg msc-position-invariance, msc-strict-nan, msc-sampler-lod-bias, "
-                            "msc-sample-nan-zero, msc-position-inf-nan)\n", IR_VERSION_MAJOR, IR_VERSION_MINOR, IR_VERSION_PATCH,
-                    inv ? "on" : "off", nan ? "on" : "off", lod ? "on" : "off", snz ? "on" : "off", pin ? "on" : "off",
-                    no_bc ? "off" : "on");
-        }
-        g_ir.IRCompilerSetCompatibilityFlags(compiler, (IRCompatibilityFlags)(IRCompatibilityFlagForceTextureArray |
-                                             (no_bc ? 0 : IRCompatibilityFlagBoundsCheck) | extra));
-    }
+     * views every such texture as an array to match. The other flags:
+     * mad_ir_compat_flags. */
+    g_ir.IRCompilerSetCompatibilityFlags(compiler, (IRCompatibilityFlags)mad_ir_compat_flags());
     a->ret_len2 = 0; a->ret_vs_output_size = 0; a->ret_gs_max_prims = 0; a->ret_gs_payload = 0; a->ret_gs_passthrough = 0;
     a->ret_hs_patches_per_tg = a->ret_hs_threads_per_patch = a->ret_hs_input_cps = a->ret_hs_output_cps = 0;   /* madeira-bcd */
     a->ret_hs_output_cp_size = a->ret_hs_patch_const_size = a->ret_hs_out_prim = a->ret_hs_max_factor_bits = 0;
@@ -1814,39 +1828,6 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
                 if (lib2) g_ir.IRMetalLibBinaryDestroy(lib2);
             }
         }
-        /* madeira-bcd: DXIL tessellation. A hull or domain shader converted for
-         * the converter's emulation reports the numbers the pipeline and every
-         * draw need (IRRuntimeTessellationPipelineConfig, and the domain side
-         * of IRRuntimeValidateTessellationPipeline). */
-        if (a->gs_emulation && stage == IRShaderStageHull &&
-            g_ir.IRShaderReflectionCopyHullInfo && g_ir.IRShaderReflectionReleaseHullInfo) {
-            IRVersionedHSInfo hsi;
-            memset(&hsi, 0, sizeof hsi);
-            if (g_ir.IRShaderReflectionCopyHullInfo(refl, IRReflectionVersion_1_0, &hsi)) {
-                float mf = hsi.info_1_0.max_tessellation_factor;
-                a->ret_hs_patches_per_tg = hsi.info_1_0.max_patches_per_object_threadgroup;
-                a->ret_hs_threads_per_patch = hsi.info_1_0.max_object_threads_per_patch;
-                a->ret_hs_input_cps = hsi.info_1_0.input_control_point_count;
-                a->ret_hs_output_cps = hsi.info_1_0.output_control_point_count;
-                a->ret_hs_output_cp_size = hsi.info_1_0.output_control_point_size;
-                a->ret_hs_patch_const_size = hsi.info_1_0.patch_constants_size;
-                a->ret_hs_out_prim = (uint32_t)hsi.info_1_0.tessellator_output_primitive;
-                memcpy(&a->ret_hs_max_factor_bits, &mf, sizeof mf);
-                g_ir.IRShaderReflectionReleaseHullInfo(&hsi);
-            }
-        }
-        if (a->gs_emulation && stage == IRShaderStageDomain &&
-            g_ir.IRShaderReflectionCopyDomainInfo && g_ir.IRShaderReflectionReleaseDomainInfo) {
-            IRVersionedDSInfo dsi;
-            memset(&dsi, 0, sizeof dsi);
-            if (g_ir.IRShaderReflectionCopyDomainInfo(refl, IRReflectionVersion_1_0, &dsi)) {
-                a->ret_ds_prims_per_mesh_tg = dsi.info_1_0.max_input_prims_per_mesh_threadgroup;
-                a->ret_ds_input_cps = dsi.info_1_0.input_control_point_count;
-                a->ret_ds_input_cp_size = dsi.info_1_0.input_control_point_size;
-                a->ret_ds_patch_const_size = dsi.info_1_0.patch_constants_size;
-                g_ir.IRShaderReflectionReleaseDomainInfo(&dsi);
-            }
-        }
         if (stage == IRShaderStageGeometry && g_ir.IRShaderReflectionCopyGeometryInfo) {   /* ml927 */
             IRVersionedGSInfo gsi;
             memset(&gsi, 0, sizeof gsi);
@@ -1857,10 +1838,43 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
                 g_ir.IRShaderReflectionReleaseGeometryInfo(&gsi);
             }
         }
+        /* DXIL tessellation: a hull or domain shader converted for the
+         * converter's emulation reports the numbers the pipeline and every draw
+         * need (IRRuntimeTessellationPipelineConfig, and the domain side of
+         * IRRuntimeValidateTessellationPipeline). */
+        if (a->gs_emulation && stage == IRShaderStageHull &&
+            g_ir.IRShaderReflectionCopyHullInfo && g_ir.IRShaderReflectionReleaseHullInfo) {
+            IRVersionedHSInfo hsi;
+            memset(&hsi, 0, sizeof hsi);
+            if (g_ir.IRShaderReflectionCopyHullInfo(refl, IRReflectionVersion_1_0, &hsi)) {
+                float mf = hsi.info_1_0.max_tessellation_factor;
+                hs[0] = hsi.info_1_0.max_patches_per_object_threadgroup;
+                hs[1] = hsi.info_1_0.max_object_threads_per_patch;
+                hs[2] = hsi.info_1_0.input_control_point_count;
+                hs[3] = hsi.info_1_0.output_control_point_count;
+                hs[4] = hsi.info_1_0.output_control_point_size;
+                hs[5] = hsi.info_1_0.patch_constants_size;
+                hs[6] = (uint32_t)hsi.info_1_0.tessellator_output_primitive;
+                memcpy(&hs[7], &mf, sizeof mf);
+                g_ir.IRShaderReflectionReleaseHullInfo(&hsi);
+            }
+        }
+        if (a->gs_emulation && stage == IRShaderStageDomain &&
+            g_ir.IRShaderReflectionCopyDomainInfo && g_ir.IRShaderReflectionReleaseDomainInfo) {
+            IRVersionedDSInfo dsi;
+            memset(&dsi, 0, sizeof dsi);
+            if (g_ir.IRShaderReflectionCopyDomainInfo(refl, IRReflectionVersion_1_0, &dsi)) {
+                ds[0] = dsi.info_1_0.max_input_prims_per_mesh_threadgroup;
+                ds[1] = dsi.info_1_0.input_control_point_count;
+                ds[2] = dsi.info_1_0.input_control_point_size;
+                ds[3] = dsi.info_1_0.patch_constants_size;
+                g_ir.IRShaderReflectionReleaseDomainInfo(&dsi);
+            }
+        }
     }
-    /* madeira-bcd: an emulated hull/domain stage is looked up by the
-     * converter's fixed names when its pipeline is built, never by this one;
-     * name it so an empty reflection name cannot fail the conversion. */
+    /* An emulated hull/domain stage is looked up by the converter's fixed
+     * names when its pipeline is built, never by this one; name it so an empty
+     * reflection name cannot fail the conversion. */
     if (a->gs_emulation && (!nm || !nm[0]) &&
         (stage == IRShaderStageHull || stage == IRShaderStageDomain))
         nm = stage == IRShaderStageHull ? "irconverter_hull_shader" : "irconverter_dxil_domain_shader";
@@ -1879,6 +1893,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         parts.tg[0] = tg[0]; parts.tg[1] = tg[1]; parts.tg[2] = tg[2];
         parts.vs_output_size = vs_out_size;
         parts.gs_max_prims = gs_max; parts.gs_payload = gs_payload; parts.gs_passthrough = gs_pt;
+        memcpy(parts.hs, hs, sizeof parts.hs); memcpy(parts.ds, ds, sizeof parts.ds);
         parts.lib = lib_bytes; parts.lib_len = need;
         parts.lib2 = lib2_bytes; parts.lib2_len = lib2_len;
         dxc_blob = mad_dxc_blob_build(dxc_key, dxc_check, &parts, &dxc_len);

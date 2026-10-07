@@ -1,10 +1,23 @@
 /*
+ * Ported from programs/wineboot/wineboot.c
+ * Copyright (C) 2002 Andreas Mohr
+ * Copyright (C) 2002 Shachar Shemesh
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
  * madeira-bcd: the values of the volatile hardware description keys
  * (HKLM\HARDWARE\DESCRIPTION\System) that wineboot writes at every boot on
  * desktop Wine -- programs/wineboot/wineboot.c create_hardware_registry_keys,
  * create_bios_*_values and create_bios_processor_values. wineboot never runs
- * on iOS (env_ios.c: no fork/exec), so no session had these keys
- * (docs/hw-registry.md).
+ * on iOS (env_ios.c: no fork/exec), so no session had these keys.
  *
  * Only the value building lives here: plain C, no Wine headers, so that
  * tests/host/check-hw-registry.py compiles it on a host and compares it with

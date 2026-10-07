@@ -29,6 +29,9 @@ marker = "madeira-bcd: NUL-terminated NVAPI strings"
 if marker in src:
     print("already patched")
     sys.exit(0)
+if "CopyShortString(" in src:   # willfaust/dxmt#11 (37ec901)
+    print("NUL-terminated NVAPI strings are upstream (willfaust/dxmt#11, CopyShortString); nothing to do")
+    sys.exit(0)
 
 pattern = re.compile(r"memcpy\(([^,;]+), (\w+)\.c_str\(\), \2\.size\(\)\);")
 src, n = pattern.subn(r"madeira_nvapi_copy(\1, \2);", src)

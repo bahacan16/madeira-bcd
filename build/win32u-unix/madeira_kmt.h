@@ -1,10 +1,11 @@
-/* madeira-bcd: ONE D3DKMT adapter for the GPU that DXGI and madeira_d3d12
- * report -- opt-in, env.MADEIRA_KMT_ADAPTER = 1 (docs/gta5-d3d12-caps.md,
- * section "D3DKMT adapter").
+/* madeira-bcd: ONE D3DKMT adapter for the GPU that DXGI, NVAPI and
+ * madeira_d3d12 report -- opt-in, env.MADEIRA_KMT_ADAPTER = 1 in madeira.cfg
+ * (docs/gta5-d3d12-caps.md, section "D3DKMT adapter").
  *
  * Shared by the two iOS overrides of win32u:
  *   d3dkmt_ios.c    (wraps upstream d3dkmt.c) -- the switch, the adapter LUID,
- *                   the video budget, the QueryAdapterInfo answers and the
+ *                   the video budget (dedicated size), the QueryAdapterInfo /
+ *                   QueryStatistics / QueryVideoMemoryInfo answers and the
  *                   [vkmt] trace of every D3DKMT entry point implemented there;
  *   sysparams_ios.c -- EnumAdapters2 / OpenAdapterFromDeviceName /
  *                   OpenAdapterFromGdiDisplayName list and open that adapter,

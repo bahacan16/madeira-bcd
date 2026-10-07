@@ -81,6 +81,36 @@ Inside a window, TEB/PEB pairs, 32-bit stacks, images (relocated to their
 guest base) and `KUSER_SHARED_DATA` at guest `0x7ffe0000` are placed by the
 unix side. The page past `B + 4 GB` is an overrun guard.
 
+### .NET Framework programs (Wine Mono)
+
+A 32-bit .NET Framework program (verified: Terraria) runs on Wine Mono, which
+the app bundles when it is built with `build/wine-mono` (docs/BUILDING.md)
+and links as `C:\windows\mono\mono-2.0` every session. Three settings turn on
+by themselves when that runtime loads, and only then:
+
+- mscoree sets `MONO_THREADS_SUSPEND=coop` and adds `keep-delegates` to
+  `MONO_DEBUG` before it loads Mono. Mono's default hybrid suspend relies on
+  `SuspendThread` stopping the target, which it does not do here (section 5).
+- When `libmono-2.0-x86.dll` is mapped into a window, the window's anonymous
+  RWX memory becomes plain read/write to the host, Mono's 64 KB code chunks
+  included (`virtual_ios.c`, ml1279/ml1282). The host never executes those
+  bytes: FEX arms a chunk read-only when it translates from it and disarms it
+  on the first write, as on Windows. Before, every store Mono's JIT made into
+  a chunk was emulated through the JIT pool's alias (25 M stores in 7 minutes
+  of Terraria).
+- FEX arms its Mono backpatcher bridge for that DLL and, once it has found
+  the backpatcher, turns SMC detection off for the process (ml1280): Mono
+  rewrites live code only through the backpatcher, which the bridge handles.
+
+The bundled `mscorlib.dll` is patched at build time (`build/wine-mono/bundle.sh`,
+ml1281, a dirty hack, see the TODO there): `GC.Collect(gen,
+GCCollectionMode.Optimized, ...)` returns without collecting, as .NET allows.
+Mono ran a full blocking collection for every such call, and Terraria makes
+one per frame (85-150 ms each, ~8 FPS).
+
+Unity games load their own `mono-2.0-bdwgc.dll`, not through mscoree, and are
+not matched. The switches are in section 8.
+
 ## 3. Launch path (`app/Madeira/WineProcessBridge.m`)
 
 | Step | 32-bit target | Anything else |
@@ -103,8 +133,10 @@ because this port never runs wineboot's fake-DLL install. Only `x86_`
 assemblies are written, which 64-bit processes never look up.
 
 `FEX_MADEIRA_HOSTPROBE` carries the answers of the `hw.optional.*` sysctls
-FEX's WOW64 module cannot query itself (a wrong "present", e.g. FEAT_AFP,
-corrupts SSE results silently). Only the WOW64 module reads it.
+FEX's modules cannot query themselves (a wrong "present" either corrupts SSE
+results silently, e.g. FEAT_AFP, or is an illegal instruction, e.g. FlagM2 on
+A13). The app publishes it for every session, and both the WOW64 and the
+ARM64EC module read it; the ARM64EC module also takes LRCPC2 and AFP from it.
 
 ## 4. Unix calls from 32-bit DLLs
 
@@ -227,6 +259,9 @@ the switch is only consulted for a WoW64 process, window or thread.
 | `MADEIRA_STRICT_SPLITLOCK` | on | FEX WOW64 | `StrictInProcessSplitLocks` default for 32-bit guests (an explicit FEX setting wins) |
 | `MADEIRA_WOW_SYSCALL_SWEEP` | on | FEX WOW64 | Let the code-buffer sweeper move threads parked in a system call |
 | `MADEIRA_D3D9` | unset (emulated) | i386 `d3d9.dll` | `native`: the D3D9 shim uses the native ARM64 frontend. Also set by the `d3d9` key of `madeira.cfg` |
+| `MADEIRA_WOW_RWX_PLAIN` | unset (automatic) | 32-bit | Anonymous RWX memory in a window is plain read/write to the host once Wine Mono's `libmono-2.0-x86.dll` is mapped there; 1: in every window, 0: never (stores go through the JIT pool's alias, as before; also keeps FEX's Mono bridge off) |
+| `MADEIRA_WINEMONO_BRIDGE` | automatic for `libmono-2.0-x86.dll` | FEX WOW64 | FEX's Mono backpatcher bridge (ml712) and, once it finds the backpatcher, SMC detection off for the process (ml1280); 0 keeps both off. The 64-bit runtime still needs 1 |
+| `MADEIRA_MONO_DEFAULTS` | on | Wine Mono | mscoree sets `MONO_THREADS_SUSPEND=coop` and adds `keep-delegates` to `MONO_DEBUG` before Mono loads; values already set win; 0 sets nothing |
 
 `inproc-sync` (madsync) is a `madeira.cfg` key, not part of this series, and
 keeps its default of 1.

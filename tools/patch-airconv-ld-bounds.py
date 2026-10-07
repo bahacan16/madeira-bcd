@@ -31,6 +31,14 @@ import sys
 ROOT = pathlib.Path("dxmt/src")
 MARKER = "madeira-bcd: ld bounds"
 
+# willfaust/dxmt#8 (34b738f, dxmt db546ee): TextureAccessInBounds, the same
+# check for ld, ld_uav_typed and store_uav_typed, always on (no
+# MADEIRA_LD_BOUNDS=0) and with kDXMTShaderCacheVersion 16 instead of a salt.
+_base = (ROOT / "airconv/nt/dxbc_converter_base.cpp").read_text()
+if MARKER not in _base and "TextureAccessInBounds(" in _base:
+    print("dxbc_converter_base.cpp: texture load bounds are upstream (willfaust/dxmt#8); nothing to do")
+    sys.exit(0)
+
 
 def edit(rel, pairs):
     path = ROOT / rel

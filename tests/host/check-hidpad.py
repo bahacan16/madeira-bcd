@@ -388,6 +388,8 @@ server = (root / 'build/ntdll-unix/server_ios.c').read_text()
 a = server.index('#include "../hidpad/hidpad_ids.h"')
 b = server.index('\n}\n', server.index('static void ios_hidpad_publish(void)')) + 3
 publish = server[a:b].replace('#include "../hidpad/hidpad_ids.h"', '#include "hidpad_ids.h"')
+# (upstream 06ceaac also slices ios_hw_key here; the fork keeps its own key
+# helper inside the HID block, so only its -fno-builtin build flag is taken.)
 
 registry = r'''
 #include <assert.h>
@@ -630,7 +632,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-hidpad-') as tmp:
     binary = Path(tmp) / 'check'
     source.write_text(test)
     cc = os.environ.get('CC', 'cc')
-    flags = ['-std=gnu11', '-O1', '-fshort-wchar', '-Wno-format', '-Wno-unused-function',
+    flags = ['-std=gnu11', '-O1', '-fno-builtin', '-fshort-wchar', '-Wno-format', '-Wno-unused-function',
              '-D__WINESRC__', '-DWINE_UNIX_LIB', '-I', str(wine / 'include'),
              '-I', str(root / 'build/hidpad')]
     reg_source = Path(tmp) / 'registry.c'

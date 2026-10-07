@@ -67,6 +67,10 @@ def main():
     if MARKER in s:
         print("winemetal_unix.c: already patched")
         return 0
+    if "An iOS app cannot bootstrap-register the port" in s:
+        # willfaust/dxmt#10 (39aa198); MADEIRA_SHARED_TEXTURE_PORT=1 is gone with it
+        print("winemetal_unix.c: shared texture without mach port is upstream (willfaust/dxmt#10); nothing to do")
+        return 0
     if s.count(OLD) != 1:
         sys.exit(f"patch-winemetal-ios-shared-texture: anchor found {s.count(OLD)} times in {PATH}")
     PATH.write_text(s.replace(OLD, NEW))

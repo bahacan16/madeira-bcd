@@ -31,6 +31,12 @@ marker = "madeira-bcd: GPU memory and core count"
 if marker in src:
     print("already patched")
     sys.exit(0)
+# willfaust/dxmt#11 (37ec901): frame-buffer sizes, core count and clocks are
+# upstream (without the [nvapi] frame-buffer log lines; patch-nvapi-trace.py
+# traces those two entry points instead).
+if "NvAPI_GPU_GetPhysicalFrameBufferSize(" in src and "*pCount = 16384;" in src:
+    print("NVAPI GPU memory and core count are upstream (willfaust/dxmt#11); nothing to do")
+    sys.exit(0)
 if "madeira-bcd: NVAPI entry points" not in src:
     sys.exit("patch-nvapi-gpu-info: run patch-dxmt-nvapi.py first")
 

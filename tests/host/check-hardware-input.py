@@ -571,8 +571,8 @@ check('keys.wanted(focused: keyboardFocused)' in glue and 'keys.press(vk, focuse
 check('if r == .relative { postMotion(dx, -dy) }' in glue, 'GCMouse motion is posted only on the relative route')
 check('let blocked = route == .blocked' in glue, 'the wheel is gated on focus')
 check('let allowed = baseFocused ? want : []' in glue, 'UIKit pointer buttons are gated on focus')
-check('guard let p = profile, HardwareInput.shared.baseFocused else { return }' in glue,
-      'the right-stick mouse is gated on focus')
+check('guard let p = profile, HardwareInput.shared.baseFocused, !GamepadInput.shared.keyboardMouseOn else { return }' in glue,
+      'the right-stick mouse is gated on focus, and stands down in keyboard-and-mouse controller mode')
 check('presentedViewController != nil' in glue and 'fr is UIKeyInput' in glue
       and 'UIApplication.shared.applicationState == .active' in glue,
       'focus accounts for presented controllers, other text inputs and the app state')

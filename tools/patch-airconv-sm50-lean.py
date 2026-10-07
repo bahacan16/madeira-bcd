@@ -38,6 +38,15 @@ import sys
 ROOT = pathlib.Path("dxmt/src/airconv")
 MARKER = "madeira-bcd: lean SM50 shaders"
 
+# willfaust/dxmt#6 (d4c38a2, dxmt db546ee): the same change upstream
+# (SM50Initialize keeps `bytecode`, with_parsed_program re-parses per compile),
+# without the MADEIRA_SM50_LEAN=0 switch and the [sm50-lean] counters. Checked
+# before any edit, so an upstream pin is left untouched.
+_hpp = (ROOT / "dxbc_converter.hpp").read_text()
+if MARKER not in _hpp and "with_parsed_program(" in _hpp:
+    print("dxbc_converter: lean SM50 shaders are upstream (willfaust/dxmt#6); nothing to do")
+    sys.exit(0)
+
 
 def edit(rel, pairs):
     path = ROOT / rel

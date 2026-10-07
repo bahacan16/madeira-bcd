@@ -47,6 +47,16 @@ Statically linked into the application binary:
   ffmpeg.org) and its SHA-256: the Madeira repository, build/ffmpeg/src,
   built by build/ffmpeg/build.sh.
 
+Bundled as files only in a development build that includes it (wine-mono/;
+release builds download it from WineHQ when the user asks, into
+Library/Application Support/WineMono, with the same mscorlib patch):
+- Wine Mono 11.0.0, the .NET Framework runtime Wine's mscoree loads,
+  unmodified except mscorlib.dll (GC.Collect with GCCollectionMode.Optimized
+  returns; Madeira's build/wine-mono/bundle.sh): Mono (LGPL or MIT X11 per part), FNA (Ms-PL and MIT), FAudio,
+  FNA3D, MojoShader and SDL3 (zlib), winforms, wpf, monoDX, System.Speech and
+  Wine Mono's own code (MIT); details in wine-mono/COPYING. Source:
+  wine-mono-11.0.0-src.tar.xz from https://dl.winehq.org/wine/wine-mono/11.0.0/
+  (SHA-256 c504cb0b91ce09b72869e063844ce114564d4ac340479a82aa6789f51510e520).
 Dynamically loaded at runtime:
 - Apple Metal Shader Converter dynamic library: Apple proprietary, under the
   agreement in d3d12/METAL-SHADER-CONVERTER-AGREEMENT.txt (section 2.B:

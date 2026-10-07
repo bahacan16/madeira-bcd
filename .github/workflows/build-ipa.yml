@@ -388,6 +388,8 @@ jobs:
       - name: Check JIT pool image placement contracts
         run: |
           python3 tests/host/check-pool-low-images.py
+          python3 tests/host/check-x64-image-nocopy.py
+          python3 tests/host/check-ec-hook.py
           python3 tests/host/check-pool-startup-budget.py --require-swift
           python3 tests/host/check-pool-placement.py
           python3 tests/host/check-pool-split.py
@@ -890,88 +892,24 @@ jobs:
           done
           ls -la
 
-      # The native D3D12 runtime's unix half needs Apple's Metal Shader
-      # Converter public headers (Apache-2.0). Upstream resolves them from the
-      # installer package on the developer's Mac and does not track them. When
-      # they are vendored under build/madeira-d3d12/msc-include the real
-      # conversion service is built; otherwise build/dxmt-ios/build.sh links a
-      # stub and D3D12 pipelines fail by name while D3D11 is untouched.
-      # Apple's installer (the .pkg from developer.apple.com/download, or the
-      # .dmg around it) is an asset on a release tagged msc-private, meant to
-      # be a DRAFT so the package itself is never published. From it take the
-      # public headers (Apache-2.0) AND the iOS library, so the headers the
-      # runtime is compiled against always match the library it loads.
-      # Nothing extracted here is committed.
-      - name: Fetch Metal Shader Converter from the msc-private release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100"
-          ASSET=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" \
-            | python3 -c "
-          import json, sys
-          rels = json.load(sys.stdin)
-          for r in rels if isinstance(rels, list) else []:
-              if r.get('tag_name') == 'msc-private' or r.get('name') == 'msc-private':
-                  if not r.get('draft'):
-                      print('::warning::the msc-private release is PUBLISHED -- Apple\'s installer is publicly downloadable; make it a draft', file=sys.stderr)
-                  for a in r.get('assets', []):
-                      if a['name'].lower().endswith(('.dmg', '.pkg')):
-                          print(a['url'], a['name']); sys.exit(0)
-          ")
-          if [ -z "$ASSET" ]; then
-            # madeira-bcd: a stub build draws nothing in any D3D12 game (build 180
-            # after the release was deleted); fail instead of shipping one.
-            echo "::error::no msc-private release with a .dmg/.pkg asset -- a D3D12 stub build draws nothing; re-create the DRAFT release"
-            exit 1
-          fi
-          URL=${ASSET%% *}; NAME=${ASSET#* }
-          mkdir -p /tmp/msc && cd /tmp/msc
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o "$NAME" "$URL"
-          echo "downloaded $NAME: $(wc -c < "$NAME" | tr -d ' ') bytes, sha256 $(shasum -a 256 "$NAME" | cut -d' ' -f1)"
-          PKG=""
-          case "$NAME" in
-            *.dmg|*.DMG)
-              hdiutil attach -nobrowse -readonly -mountpoint /tmp/msc/mnt "$NAME" > /dev/null
-              PKG=$(find /tmp/msc/mnt -maxdepth 3 -name "*.pkg" | head -1) ;;
-            *) PKG="/tmp/msc/$NAME" ;;
-          esac
-          if [ -z "$PKG" ]; then
-            echo "::error::no .pkg inside $NAME"; hdiutil detach /tmp/msc/mnt > /dev/null 2>&1; exit 0
-          fi
-          pkgutil --expand-full "$PKG" /tmp/msc/x > /dev/null
-          hdiutil detach /tmp/msc/mnt > /dev/null 2>&1
-          HDR=$(find /tmp/msc/x -path "*include/metal_irconverter/metal_irconverter.h" | head -1)
-          LIB=$(find /tmp/msc/x -path "*lib_iOS/libmetalirconverter.dylib" | head -1)
-          if [ -z "$HDR" ] || [ -z "$LIB" ]; then
-            echo "::error::package layout not recognised (header: ${HDR:-none}, iOS lib: ${LIB:-none})"
-            find /tmp/msc/x -maxdepth 6 -type d | head -30
-            exit 0
-          fi
-          INC=$(dirname "$(dirname "$HDR")")
-          DEST="$GITHUB_WORKSPACE/build/madeira-d3d12/msc-include"
-          rm -rf "$DEST"; mkdir -p "$DEST"
-          cp -R "$INC/metal_irconverter" "$DEST/"
-          [ -d "$INC/metal_irconverter_runtime" ] && cp -R "$INC/metal_irconverter_runtime" "$DEST/"
-          OLD="$GITHUB_WORKSPACE/app/Madeira/d3d12/libmetalirconverter.dylib"
-          echo "tracked iOS library: sha256 $(shasum -a 256 "$OLD" | cut -d' ' -f1)"
-          echo "package iOS library: sha256 $(shasum -a 256 "$LIB" | cut -d' ' -f1)"
-          cp "$LIB" "$OLD"
-          V=$(grep -E "define IR_VERSION_(MAJOR|MINOR|PATCH)" "$DEST/metal_irconverter/ir_version.h" | awk '{print $3}' | paste -sd. -)
-          echo "::notice::Metal Shader Converter $V: headers staged, app library replaced with the package's own"
-
+      # Metal Shader Converter, the way upstream ships it (owner's decision
+      # 2026-10-07, replacing the msc-private draft release): the public headers
+      # (Apache-2.0) are vendored in madeira-d3d12/third_party/metal-shader-converter
+      # and the iOS library is tracked at app/Madeira/d3d12/libmetalirconverter.dylib
+      # (Apple's agreement, app/Madeira/d3d12/NOTICE.txt); build/madeira-d3d12/deps.sh
+      # checks both against their pinned hashes. A missing or mismatched converter
+      # would build the stub that draws nothing in any D3D12 game, so fail instead.
       - name: Locate Metal Shader Converter headers
         shell: bash
         run: |
-          INC="$GITHUB_WORKSPACE/build/madeira-d3d12/msc-include"
-          if [ -f "$INC/metal_irconverter/metal_irconverter.h" ]; then
-            echo "MADEIRA_MSC_INCLUDE=$INC" >> "$GITHUB_ENV"
-            echo "::notice::converter headers present -- building the real D3D12 conversion service"
-          else
-            echo "::warning::no Metal Shader Converter headers -- D3D12 shader conversion is a stub in this build"
+          INC="$GITHUB_WORKSPACE/madeira-d3d12/third_party/metal-shader-converter/include"
+          if ! bash -c 'source build/madeira-d3d12/deps.sh'; then
+            echo "::error::the vendored Metal Shader Converter does not match its pinned hashes (build/madeira-d3d12/deps.sh)"
+            exit 1
           fi
+          echo "MADEIRA_MSC_INCLUDE=$INC" >> "$GITHUB_ENV"
+          V=$(grep -E "define IR_VERSION_(MAJOR|MINOR|PATCH)" "$INC/metal_irconverter/ir_version.h" | awk '{print $3}' | paste -sd. -)
+          echo "::notice::Metal Shader Converter $V from the repository: headers vendored, iOS library tracked"
 
       # Upstream's Madeira Dock (Steam library helper): dockhost.exe is a build
       # output; without it the Dock stays hidden, so a failure here only warns.
@@ -1448,6 +1386,18 @@ jobs:
           start until the VC++ runtime DLLs are added -- see tools/fetch-vcruntime.md"
           fi
 
+      # Upstream's Built-in StikJIT pairs with the device itself (app/Madeira/
+      # JITPairing.swift, the MadeiraJITHelper extension); the app target links
+      # this Rust static library. Dependencies come from crates.io at the
+      # versions in Cargo.lock; the step regenerates the bundled licence notices.
+      - name: Build libmadeira_rppairing.a (Built-in StikJIT pairing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null || { echo "::error::rustup is not available on this runner"; exit 1; }
+          rustup target add aarch64-apple-ios
+          bash build/rppairing-ios/build.sh
+
       # Fail here with a clear list rather than deep inside a linker error.
       - name: Verify all linked archives exist
         shell: bash
@@ -1456,7 +1406,7 @@ jobs:
           MISSING=""
           for a in libgmp.a libgnutls.a libhogweed.a libnettle.a \
                    libntdll_unix.a libwin32u_unix.a libwineserver.a \
-                   libdxmt_combined.a; do
+                   libdxmt_combined.a libmadeira_rppairing.a; do
             [ -f "app/Madeira/$a" ] || MISSING="$MISSING app/Madeira/$a"
           done
           for a in FEXCore/Source/libFEXCore.a FEXCore/Source/libFEXCore_Base.a \
@@ -1469,7 +1419,7 @@ jobs:
             echo "::error::archives missing before archive step ::$MISSING"
             exit 1
           fi
-          echo "::notice::all 15 linked archives present"
+          echo "::notice::all 16 linked archives present"
 
       # The Xcode build phase fails when the bundled licence copies are stale.
       - name: Stage licence copies
@@ -1502,6 +1452,17 @@ jobs:
             /usr/libexec/PlistBuddy -c "Add :$k string $v" "$P"
           done
           echo "::notice::native ABI $ABI, shader cache identity ${SCID:-none}"
+
+      # Upstream's prebuilt StikJIT.xcframework (Built-in StikJIT, read by the
+      # MadeiraJITHelper extension) was built with Swift 6.4; its interface
+      # names types with module selectors (Swift::String) that the runners'
+      # Swift 6.3 cannot parse. Rewrite them into the dotted form in this
+      # checkout (valid for every Swift); the framework binary is unchanged.
+      - name: StikJIT interface for the runner's Swift
+        shell: bash
+        run: |
+          echo "::notice::$(xcrun swift --version 2>&1 | grep -m1 'Swift version')"
+          python3 tools/stikjit-interface-compat.py app/Frameworks/StikJIT.xcframework
 
       - name: Archive (unsigned)
         shell: bash

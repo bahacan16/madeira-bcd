@@ -38,6 +38,10 @@ def main():
     if MARKER in s:
         print("winemetal_unix.c: 30/40 FPS pacing already present")
         return 0
+    if "4=locked40" in s and "afterMinimumDuration:(1.0 / 40.0)" in s:
+        # willfaust/dxmt#14 (2e7454a): mode 4 upstream; mode 3 was already there.
+        print("winemetal_unix.c: 30/40 FPS pacing is upstream (willfaust/dxmt#14); nothing to do")
+        return 0
     if s.count(ANCHOR) != 1:
         print(f"::error::{PATH}: present-pacing anchor not found once -- dxmt moved, review this patch")
         return 1

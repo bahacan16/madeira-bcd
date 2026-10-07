@@ -376,7 +376,26 @@ def patch(path):
     return r.returncode, r.stdout + r.stderr
 
 
-if not adapter.exists():
+if adapter.exists() and "UINT64 GetUmdDriverVersion()" in adapter.read_text():
+    # willfaust/dxmt#13 (dxmt db546ee) carries the UMD version lookup itself; the
+    # fork's patch is then a no-op. It reports what the D3DKMT adapter answers and
+    # ~0 without one -- with MADEIRA_KMT_ADAPTER unset win32u has no Madeira adapter
+    # to answer, so other games still see ~0 as before.
+    up = adapter.read_text()
+    cis = up[up.index("CheckInterfaceSupport(const GUID &guid, LARGE_INTEGER *umd_version) final {"):]
+    cis = cis[:cis.index("    return hr;\n  }")]
+    check("upstream CheckInterfaceSupport takes the version from the adapter's own KMT handle",
+          "umd_version->QuadPart = GetUmdDriverVersion();" in cis)
+    helper = up[up.index("UINT64 GetUmdDriverVersion() {"):]
+    helper = helper[:helper.index("\n  }\n")]
+    check("upstream: ~0 without a KMT handle or a version", "return ~0ull;" in helper and "local_kmt_" in helper)
+    check("upstream asks KMTQAITYPE_UMD_DRIVER_VERSION", "KMTQAITYPE_UMD_DRIVER_VERSION" in helper)
+    with tempfile.TemporaryDirectory() as t:
+        cpp = Path(t) / "dxgi_adapter.cpp"
+        shutil.copy(adapter, cpp)
+        rc, out = patch(cpp)
+        check("fork patch is a no-op on the upstream lookup", rc == 0 and cpp.read_text() == up)
+elif not adapter.exists():
     print("note: %s not checked out (set DXMT_SRC); DXGI patch checks skipped" % adapter)
 else:
     with tempfile.TemporaryDirectory() as t:

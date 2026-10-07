@@ -880,7 +880,7 @@ static unsigned int ios_request_desktop_window( struct ntuser_thread_info *threa
     return status;
 }
 
-/* madeira-bcd: give a pseudo-process child what init_user gave the session.
+/* Give a pseudo-process child what init_user gave the session.
  *
  * init_user (class_ios.c) runs once per iOS process -- pthread_once -- so only
  * the session's first pseudo-process registers the desktop and message window
@@ -888,24 +888,21 @@ static unsigned int ios_request_desktop_window( struct ntuser_thread_info *threa
  * classes PER PROCESS, and creates a missing desktop window in the context of
  * the process asking for it (get_desktop_window with force, or the first
  * top-level CreateWindowEx). A main process that never opens a window before
- * starting its child (a launcher: PlayGTAV.exe, or GTA5_Enhanced.exe restarting
- * itself through it) leaves the shared desktop without one, and then the child
- * cannot make it: the class lookup fails in the child, GetDesktopWindow() stays
- * NULL for good ("iOS: skipping explorer.exe launch; top_window stays 0", 9
- * times on the game thread in both GTA V Enhanced logs of build 296 -- never in
- * a God of War / Ghost of Tsushima main process), and with it GetDC(NULL),
- * MonitorFromWindow(GetDesktopWindow(), ...) and the child's first top-level
- * CreateWindowEx. register_builtin_classes() was made per-process for the same
- * reason (Steam's update UI).
+ * starting its child (a launcher stub such as GTA V Enhanced's PlayGTAV.exe)
+ * leaves the shared desktop without one, and then the child cannot make it:
+ * the class lookup fails in the child, GetDesktopWindow() stays NULL for good
+ * ("iOS: skipping explorer.exe launch; top_window stays 0" on the game
+ * thread), and with it GetDC(NULL), MonitorFromWindow(GetDesktopWindow(), ...)
+ * and the child's first top-level CreateWindowEx. register_builtin_classes()
+ * was made per-process for the same reason (Steam's update UI).
  *
  * Only on the failure path, never in the session's own process, and once per
  * process (pid+PEB): register the two classes for this process and ask again;
  * if the thread has no desktop at all, connect this process the way
  * winstation_init connects the session (WinSta0, the default desktop) and ask
- * once more. The
- * desktop window is detached from its creator at once (the server releases
- * the class), so it outlives this process. MADEIRA_CHILD_DESKTOP=0 turns this
- * off. Logs [child-desktop]. See docs/gta5-child-crash.md. */
+ * once more. The desktop window is detached from its creator at once (the
+ * server releases the class), so it outlives this process.
+ * MADEIRA_CHILD_DESKTOP=0 turns this off. Logs [child-desktop]. */
 static BOOL ios_child_desktop_fixup( struct ntuser_thread_info *thread_info, BOOL force,
                                      unsigned int first_status )
 {
@@ -967,7 +964,7 @@ static BOOL ios_child_desktop_fixup( struct ntuser_thread_info *thread_info, BOO
                       "second retry %#x", status, desk_after, status2 );
         else
             snprintf( how, sizeof(how), "retry %#x", status );
-        ERR_(win)( "[child-desktop] madeira-bcd pid=%04x peb=%p tid=%04x: no desktop window (status %#x, "
+        ERR_(win)( "[child-desktop] pid=%04x peb=%p tid=%04x: no desktop window (status %#x, "
                    "thread desktop %p)%s; %s -> top_window=%#x msg_window=%#x\n",
                    (int)pid, peb, (int)GetCurrentThreadId(), first_status, desk_before,
                    registered ? "; registered the desktop/message classes for this process" : "",

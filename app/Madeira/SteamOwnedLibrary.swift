@@ -155,6 +155,16 @@ struct SteamPlaytime: Codable, Equatable, Sendable {
     /// Madeira Dock's session ended, or its start failed.
     func releaseDock() { heldForDock = false }
 
+    /// The app takes the account back while the game session still runs, to upload
+    /// its saves before the app quits. One way: the session's client loses its
+    /// logon and the app does not hand the account back.
+    func takeOver() async {
+        await closing?.value
+        open = true
+        closing = nil
+        reopenConnection()
+    }
+
     /// Lets the app's connection back when no game session runs and Dock does
     /// not hold the account. Returns whether it reopened.
     @discardableResult func reopen(sessionRunning: Bool) -> Bool {
@@ -285,6 +295,7 @@ final class SteamOwnedLibrary: ObservableObject {
 
     private func clearCaches() {
         cachedAccount = nil
+        DockOffline.clear()   // the offline notes belonged to that account
         try? FileManager.default.removeItem(at: Self.cacheURL)
         try? FileManager.default.removeItem(at: Self.playtimeURL)
     }
@@ -325,7 +336,7 @@ final class SteamOwnedLibrary: ObservableObject {
     /// app's own connection (signed in, no session running) and kept in the cache.
     /// nil when it cannot be had; the Program picker then decides.
     func launchOptions(appID: Int) async -> [SteamLaunchOption]? {
-        if let cached = game(appID)?.launches { return cached }
+        if let cached = game(appID)?.launches, cached.allSatisfy({ $0.index != nil }) { return cached }
         guard Self.enabled, signedIn, !inSession, appID > 0, appID <= Int(UInt32.max) else { return nil }
         do {
             guard let info = try await fetcher.fetchAppInfo(appID: UInt32(appID)) else { return nil }
@@ -372,9 +383,483 @@ final class SteamOwnedLibrary: ObservableObject {
             try? FileManager.default.createDirectory(at: Self.supportFolder, withIntermediateDirectories: true)
             try? JSONEncoder().encode(parsed).write(to: Self.playtimeURL, options: .atomic)
             SteamLog.event("[steam-playtime] apps=\(parsed.count)")
+            await auditCloudSaves()
         } catch {
             SteamLog.event("[steam-playtime] unavailable reason=\(Self.reason(error))")
         }
+    }
+
+    // MARK: Steam Cloud (docs/STEAM_CLOUD.md)
+
+    /// Steam Cloud is on unless Settings › Steam Cloud saves turns it off, kept in
+    /// madeira.cfg as `env.MADEIRA_STEAM_CLOUD = 0` (SteamCloudSetting). Off: no checks, no section.
+    static var cloudEnabled: Bool { enabled && SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: true) }
+    /// `env.MADEIRA_STEAM_CLOUD_AUTO = 0`: compare only; nothing is copied
+    /// either way without the user asking on the game's page.
+    static var cloudAutomatic: Bool { SteamSignIn.flag("MADEIRA_STEAM_CLOUD_AUTO", default: true) }
+
+    /// Steam Cloud state of the games checked in this app run, by App ID.
+    @Published private(set) var cloud: [Int: SteamCloudState] = [:]
+    private var cloudAudited = false
+    /// Copies of the saves a sync replaced, where the Files app shows them
+    /// (Madeira › Steam Cloud Backups): `<game> (<App ID>)/<time>/device/...` for a
+    /// device file a download replaced, `.../cloud/...` for a cloud file an upload
+    /// replaced (Steam keeps none).
+    static var cloudBackupsFolder: URL {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return documents.appendingPathComponent("Steam Cloud Backups", isDirectory: true)
+    }
+    private static func cloudBackup(_ appID: Int) -> URL {
+        let name = SteamGamesModel.shared.games.first { $0.id == appID }?.name ?? ""
+        let safe = String(name.map { "/\\:*?\"<>|".contains($0) ? "-" : $0 }.prefix(80))
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        return cloudBackupsFolder.appendingPathComponent(safe.isEmpty ? "\(appID)" : "\(safe) (\(appID))", isDirectory: true)
+            .appendingPathComponent(stamp, isDirectory: true)
+    }
+
+    // The record of what was last the same on both sides: SHA-1 (hex) by app
+    // and file, or a mark (SteamCloudPlan.missingMark). Without it a difference
+    // cannot be told from a change, so a file with no record is never copied
+    // over the other side unasked.
+    private static var cloudBaselineURL: URL { supportFolder.appendingPathComponent("steam-cloud-sync.json") }
+    private struct CloudBaseline: Codable { var account: String; var apps: [String: [String: String]] }
+    private var cloudBaseline: [String: [String: String]]?
+
+    private func baseline(_ appID: Int) -> [String: String] {
+        if cloudBaseline == nil {
+            let account = Self.accountKey(SteamSignIn.accountName)
+            if let data = try? Data(contentsOf: Self.cloudBaselineURL), data.count <= 16 << 20,
+               let stored = try? JSONDecoder().decode(CloudBaseline.self, from: data), stored.account == account {
+                cloudBaseline = stored.apps
+            } else {
+                cloudBaseline = [:]
+            }
+        }
+        return cloudBaseline?["\(appID)"] ?? [:]
+    }
+
+    private func recordBaseline(_ appID: Int, settled: [String: String]) {
+        guard !settled.isEmpty, let account = Self.accountKey(SteamSignIn.accountName) else { return }
+        var files = baseline(appID)
+        var changed = false
+        for (key, sha) in settled where files[key] != sha { files[key] = sha; changed = true }
+        guard changed else { return }
+        cloudBaseline?["\(appID)"] = files
+        try? FileManager.default.createDirectory(at: Self.supportFolder, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(CloudBaseline(account: account, apps: cloudBaseline ?? [:]))
+            .write(to: Self.cloudBaselineURL, options: .atomic)
+    }
+
+    /// Steam Cloud saves was turned on in Settings: sync the installed games now.
+    func cloudTurnedOn() {
+        objectWillChange.send()
+        Task { await auditCloudSaves() }
+    }
+
+    /// Once per app run: syncs each installed Steam game, then says which
+    /// games have saves that need a choice.
+    private func auditCloudSaves() async {
+        guard !cloudAudited, !inSession, Self.cloudEnabled else { return }
+        cloudAudited = true
+        let games = SteamGamesModel.shared.games.filter(\.installed).prefix(40)
+        SteamLog.event("[steam-cloud] sync games=\(games.count) automatic=\(Self.cloudAutomatic ? 1 : 0)")
+        for game in games {
+            guard !inSession else { break }
+            await syncCloud(game.id)
+        }
+    }
+
+    /// App IDs of the games whose saves need the user's choice. The library
+    /// says so in its Steam section; an alert would close an open game page.
+    var cloudUndecided: [Int] { cloud.filter { !$0.value.conflicts.isEmpty }.keys.sorted() }
+
+    /// What a cloud operation on one game needs: the app's save configuration
+    /// and where its folders are in the prefix.
+    private func cloudContext(_ appID: Int) async throws -> (info: SteamAppInfo, paths: SteamCloudPaths)? {
+        guard appID > 0, appID <= Int(UInt32.max),
+              let game = SteamGamesModel.shared.games.first(where: { $0.id == appID }),
+              let user = SteamCloudPaths.userFolder(drive: Self.drive) else { return nil }
+        try await session.ensureConnected()
+        let steamID = session.steamID
+        guard let info = try await fetcher.fetchAppInfo(appID: UInt32(appID)) else { return nil }
+        let drive = Self.drive
+        let paths = SteamCloudPaths(
+            drive: drive, userFolder: user.url,
+            installFolder: drive.appendingPathComponent(game.library + "/common/" + game.installDir, isDirectory: true),
+            remoteFolder: MadeiraDock.clientRoot.appendingPathComponent("userdata/\(steamID & 0xFFFF_FFFF)/\(appID)/remote", isDirectory: true),
+            steamID: steamID, overrides: info.rootOverrides)
+        return (info, paths)
+    }
+
+    private func cloudListing(_ appID: Int) async throws -> SteamCloudListing {
+        var request = ProtobufEncoder()
+        request.writeUInt32(fieldNumber: 1, value: UInt32(appID))      // appid
+        request.writeUInt64(fieldNumber: 2, value: 0)                  // synced_change_number: the whole list
+        return try SteamCloudListing.parse(
+            try await session.callServiceMethod(method: .cloudGetAppFileChangelist, body: request.data, timeout: 20))
+    }
+
+    private var cloudBusy: Set<Int> = []
+
+    /// Compares the game's cloud saves with the prefix and returns what to do
+    /// about the differences. Reads only (it records files found identical).
+    @discardableResult
+    func checkCloud(_ appID: Int) async -> SteamCloudPlan? {
+        guard Self.cloudEnabled, signedIn, !cloudBlocked else { return nil }
+        var state = cloud[appID] ?? SteamCloudState()
+        state.phase = .checking
+        cloud[appID] = state
+        do {
+            guard let context = try await cloudContext(appID) else {
+                state.phase = .failed(Self.cloudNoFolders); cloud[appID] = state; return nil
+            }
+            let listing = try await cloudListing(appID)
+            let saveFiles = context.info.saveFiles, paths = context.paths, drive = Self.drive
+            let result = await Task.detached(priority: .utility) { () -> (SteamCloudAudit, String?) in
+                let audit = SteamCloudAudit.run(listing: listing, saveFiles: saveFiles, paths: paths)
+                // Every cloud file missing and nothing local: the game may keep its saves elsewhere.
+                var elsewhere: String?
+                if audit.cloudFiles > 0, audit.count(.cloudOnly) == audit.cloudFiles, audit.count(.localOnly) == 0,
+                   let first = audit.entries.first {
+                    elsewhere = SteamCloudAudit.findElsewhere(cloudPath: first.path, drive: drive) ?? "(not found)"
+                }
+                return (audit, elsewhere)
+            }.value
+            let audit = result.0
+            let plan = SteamCloudPlan.make(audit: audit, baseline: baseline(appID))
+            recordBaseline(appID, settled: plan.settled)
+            state.audit = audit; state.conflicts = plan.conflicts; state.checked = Date(); state.phase = .ready
+            cloud[appID] = state
+            let roots = Set(saveFiles.map(\.root)).sorted().joined(separator: ",")
+            SteamLog.event("[steam-cloud] app=\(appID) \(audit.summary) patterns=\(saveFiles.count) roots=\(roots.isEmpty ? "-" : roots) overrides=\(context.info.rootOverrides.count) | plan download=\(plan.download.count) upload=\(plan.upload.count) ask=\(plan.conflicts.count)")
+            if let elsewhere = result.1 { SteamLog.event("[steam-cloud] app=\(appID) saves-found-elsewhere=\(elsewhere == "(not found)" ? 0 : 1)") }
+            return plan
+        } catch {
+            state.phase = .failed(SteamSignIn.message(error)); cloud[appID] = state
+            SteamLog.event("[steam-cloud] app=\(appID) failed reason=\(Self.reason(error))")
+            return nil
+        }
+    }
+
+    /// Compares, then copies what changed on one side only: new and changed
+    /// cloud saves come down, new and changed device saves go up. Saves that
+    /// need a choice are left for the game's page.
+    func syncCloud(_ appID: Int) async {
+        guard !cloudBusy.contains(appID) else { return }
+        cloudBusy.insert(appID)
+        defer { cloudBusy.remove(appID) }
+        guard let plan = await checkCloud(appID), Self.cloudAutomatic else { return }
+        var changed = false
+        if !plan.download.isEmpty { changed = await download(appID, plan.download) || changed }
+        if !plan.upload.isEmpty, !inSession { changed = await upload(appID, plan.upload) || changed }
+        if changed { await checkCloud(appID) }
+    }
+
+    /// The user's choice for the saves that differ: the cloud's replace the
+    /// device's (which are backed up first), or the device's replace the cloud's.
+    func resolveCloud(_ appID: Int, useCloud: Bool) async {
+        guard !cloudBusy.contains(appID), let state = cloud[appID], state.phase == .ready, !state.conflicts.isEmpty else { return }
+        cloudBusy.insert(appID)
+        defer { cloudBusy.remove(appID) }
+        SteamLog.event("[steam-cloud] app=\(appID) choice=\(useCloud ? "cloud" : "device") files=\(state.conflicts.count)")
+        if useCloud {
+            _ = await download(appID, state.conflicts)
+        } else {
+            // A save missing on this device stays missing; the cloud keeps its copy.
+            let gone = state.conflicts.filter { $0.kind == .cloudOnly }
+            recordBaseline(appID, settled: Dictionary(gone.map { ($0.key, SteamCloudPlan.deletedMark + SteamCloudPlan.hex($0.cloudSHA)) },
+                                                      uniquingKeysWith: { a, _ in a }))
+            let present = state.conflicts.filter { $0.kind != .cloudOnly }
+            if !present.isEmpty { _ = await upload(appID, present) }
+        }
+        await checkCloud(appID)
+    }
+
+    /// Downloads the given cloud files into the prefix. Each is checked
+    /// against Steam's checksum before anything is written, and a file it
+    /// replaces is backed up first. Returns whether any file arrived.
+    private func download(_ appID: Int, _ wanted: [SteamCloudEntry]) async -> Bool {
+        guard Self.cloudEnabled, signedIn, !inSession, var state = cloud[appID], !wanted.isEmpty else { return false }
+        state.phase = .downloading(done: 0, of: wanted.count); state.problem = nil; cloud[appID] = state
+        let backup = Self.cloudBackup(appID).appendingPathComponent("device", isDirectory: true)
+        var done = 0, backedUp = 0
+        var settled: [String: String] = [:]
+        do {
+            guard let context = try await cloudContext(appID) else { throw SteamFileError.invalid("This game's save folders could not be found.") }
+            for entry in wanted {
+                guard !inSession else { throw CancellationError() }
+                guard let place = context.paths.location(cloudPath: entry.path) else { continue }
+                let file = try await cloudFile(appID, entry)
+                let url = SteamCloudPaths.resolve(base: place.base, parts: place.parts)
+                let existed = FileManager.default.fileExists(atPath: url.path)
+                let label = SteamCloudPaths.split(entry.path).root ?? "remote"
+                try SteamCloudTransfer.place(file, at: url, backupTo: backup, relative: [label] + place.parts, time: entry.cloudTime)
+                done += 1; if existed { backedUp += 1 }
+                settled[entry.key] = SteamCloudPlan.hex(entry.cloudSHA)
+                state.phase = .downloading(done: done, of: wanted.count); cloud[appID] = state
+            }
+            SteamLog.event("[steam-cloud] app=\(appID) downloaded files=\(done) backed-up=\(backedUp)")
+        } catch {
+            SteamLog.event("[steam-cloud] app=\(appID) download failed after=\(done) reason=\(Self.reason(error))")
+            state.problem = "Steam Cloud download stopped: \(SteamSignIn.message(error)) Saves already downloaded are in place; nothing else was changed."
+        }
+        recordBaseline(appID, settled: settled)
+        state.lastDownload = (done, backedUp); state.phase = .ready; cloud[appID] = state
+        return done > 0
+    }
+
+    /// One cloud file's bytes, checked against the SHA-1 of the comparison:
+    /// a file that changed in the cloud since then throws.
+    private func cloudFile(_ appID: Int, _ entry: SteamCloudEntry) async throws -> Data {
+        var request = ProtobufEncoder()
+        request.writeUInt32(fieldNumber: 1, value: UInt32(appID))    // appid
+        request.writeString(fieldNumber: 2, value: entry.path)       // filename
+        let info = try SteamCloudDownloadInfo.parse(
+            try await session.callServiceMethod(method: .cloudClientFileDownload, body: request.data, timeout: 20))
+        return try await SteamCloudTransfer.fetch(info, expectedSHA: entry.cloudSHA)
+    }
+
+    /// A number Steam uses to tell this device's uploads from other machines'.
+    private static var cloudClientID: UInt64 {
+        let url = supportFolder.appendingPathComponent("steam-cloud-client-id")
+        if let text = try? String(contentsOf: url, encoding: .utf8), let stored = UInt64(text), stored != 0 { return stored }
+        let fresh = UInt64.random(in: 1...UInt64(Int64.max))
+        try? FileManager.default.createDirectory(at: supportFolder, withIntermediateDirectories: true)
+        try? String(fresh).write(to: url, atomically: true, encoding: .utf8)
+        return fresh
+    }
+
+    /// Uploads the given device saves to Steam Cloud as one batch. Returns
+    /// whether Steam accepted any file; the comparison that follows is what
+    /// confirms the cloud now holds them.
+    private func upload(_ appID: Int, _ wanted: [SteamCloudEntry]) async -> Bool {
+        guard Self.cloudEnabled, signedIn, !cloudBlocked, var state = cloud[appID], !wanted.isEmpty else { return false }
+        state.phase = .uploading(done: 0, of: wanted.count); state.problem = nil; cloud[appID] = state
+        var done = 0
+        var batchID: UInt64 = 0
+        func complete(_ ok: Bool) async {
+            guard batchID != 0 else { return }
+            var request = ProtobufEncoder()
+            request.writeUInt32(fieldNumber: 1, value: UInt32(appID))        // appid
+            request.writeUInt64(fieldNumber: 2, value: batchID)              // batch_id
+            request.writeUInt32(fieldNumber: 3, value: ok ? 1 : 2)           // batch_eresult: OK / Fail
+            _ = try? await session.callServiceMethod(method: .cloudCompleteAppUploadBatch, body: request.data, timeout: 30)
+        }
+        do {
+            guard let context = try await cloudContext(appID) else { throw SteamFileError.invalid("This game's save folders could not be found.") }
+            // Steam keeps no copy of a cloud file an upload replaces: keep one here
+            // first. If one cannot be fetched (or the cloud changed since the check),
+            // nothing is uploaded.
+            let replaced = wanted.filter { !$0.cloudSHA.isEmpty }
+            if !replaced.isEmpty {
+                let backup = Self.cloudBackup(appID).appendingPathComponent("cloud", isDirectory: true)
+                for entry in replaced {
+                    guard !cloudBlocked else { throw CancellationError() }
+                    guard let place = context.paths.location(cloudPath: entry.path) else { continue }
+                    let file = try await cloudFile(appID, entry)
+                    var target = backup.appendingPathComponent(SteamCloudPaths.split(entry.path).root ?? "remote", isDirectory: true)
+                    for part in place.parts { target.appendPathComponent(part) }
+                    try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try file.write(to: target, options: .atomic)
+                }
+                SteamLog.event("[steam-cloud] app=\(appID) cloud copies backed up before upload files=\(replaced.count)")
+            }
+            var begin = ProtobufEncoder()
+            begin.writeUInt32(fieldNumber: 1, value: UInt32(appID))          // appid
+            begin.writeString(fieldNumber: 2, value: "Madeira")              // machine_name
+            for entry in wanted { begin.writeString(fieldNumber: 3, value: entry.path) }   // files_to_upload
+            begin.writeUInt64(fieldNumber: 5, value: Self.cloudClientID)     // client_id
+            begin.writeUInt64(fieldNumber: 6, value: UInt64(context.info.buildID))   // app_build_id
+            var batch = ProtobufDecoder(try await session.callServiceMethod(method: .cloudBeginAppUploadBatch, body: begin.data, timeout: 30))
+            while let tag = try batch.readTag() {
+                if tag.fieldNumber == 1, tag.wireType == .varint { batchID = try batch.readVarint() } else { try batch.skip(wireType: tag.wireType) }
+            }
+            guard batchID != 0 else { throw SteamFileError.invalid("Steam did not open an upload for this game.") }
+            for entry in wanted {
+                guard !cloudBlocked else { throw CancellationError() }
+                guard let place = context.paths.location(cloudPath: entry.path) else { continue }
+                let url = SteamCloudPaths.resolve(base: place.base, parts: place.parts)
+                let file = try Data(contentsOf: url)
+                guard file.count <= SteamCloudTransfer.maxFileBytes else { throw SteamFileError.invalid("A save is too large to upload.") }
+                let sha = Data(Insecure.SHA1.hash(data: file))
+                let time = UInt64(max(0, (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970 ?? Date().timeIntervalSince1970))
+                var request = ProtobufEncoder()
+                request.writeUInt32(fieldNumber: 1, value: UInt32(appID))            // appid
+                request.writeUInt32(fieldNumber: 2, value: UInt32(file.count))       // file_size
+                request.writeUInt32(fieldNumber: 3, value: UInt32(file.count))       // raw_file_size
+                request.writeBytes(fieldNumber: 4, value: sha)                       // file_sha
+                request.writeUInt64(fieldNumber: 5, value: time)                     // time_stamp
+                request.writeString(fieldNumber: 6, value: entry.path)               // filename
+                request.writeUInt32(fieldNumber: 7, value: 0xFFFF_FFFF)              // platforms_to_sync: all
+                request.writeUInt32(fieldNumber: 9, value: session.cellID)           // cell_id
+                request.writeUInt64(fieldNumber: 13, value: batchID)                 // upload_batch_id
+                let answer = try SteamCloudUploadBlock.parse(
+                    try await session.callServiceMethod(method: .cloudClientBeginFileUpload, body: request.data, timeout: 30))
+                guard !answer.encrypt else { throw SteamFileError.invalid("Steam asked for an encrypted upload, which is not supported.") }
+                var sent = true
+                var statuses: [Int] = []
+                do { statuses = try await SteamCloudTransfer.send(file, blocks: answer.blocks) } catch {
+                    sent = false
+                    SteamLog.event("[steam-cloud] app=\(appID) upload part failed reason=\(Self.reason(error))")
+                }
+                var commit = ProtobufEncoder()
+                commit.writeBool(fieldNumber: 1, value: sent)                        // transfer_succeeded
+                commit.writeUInt32(fieldNumber: 2, value: UInt32(appID))             // appid
+                commit.writeBytes(fieldNumber: 3, value: sha)                        // file_sha
+                commit.writeString(fieldNumber: 4, value: entry.path)                // filename
+                var committed = false
+                var reply = ProtobufDecoder(try await session.callServiceMethod(method: .cloudClientCommitFileUpload, body: commit.data, timeout: 30))
+                while let tag = try reply.readTag() {
+                    if tag.fieldNumber == 1, tag.wireType == .varint { committed = try reply.readVarint() != 0 } else { try reply.skip(wireType: tag.wireType) }
+                }
+                SteamLog.event("[steam-cloud] app=\(appID) upload file=\(done + 1)/\(wanted.count) bytes=\(file.count) parts=\(answer.blocks.count) http=\(statuses.map(String.init).joined(separator: ",")) committed=\(committed ? 1 : 0)")
+                guard sent, committed else { throw SteamFileError.invalid("Steam did not accept a save file.") }
+                done += 1
+                state.phase = .uploading(done: done, of: wanted.count); cloud[appID] = state
+            }
+            await complete(true)
+            SteamLog.event("[steam-cloud] app=\(appID) uploaded files=\(done) blocks-per-file=steam-decided")
+        } catch {
+            await complete(false)
+            SteamLog.event("[steam-cloud] app=\(appID) upload failed after=\(done) reason=\(Self.reason(error))")
+            state.problem = "Steam Cloud upload stopped: \(SteamSignIn.message(error)) This device's saves were not changed."
+        }
+        state.lastUpload = done; state.phase = .ready; cloud[appID] = state
+        return done > 0
+    }
+
+    // MARK: Before Play
+
+    private static let cloudNoFolders = "This game's save folders could not be found."
+
+    /// Why a game should not start yet: its saves may not be the latest.
+    /// `env.MADEIRA_STEAM_CLOUD_PLAY_CHECK = 0` starts games without asking.
+    enum CloudHold: Equatable {
+        /// A check or a transfer is running.
+        case syncing
+        /// Not checked in this app run yet (Play pressed before the start-up sync got
+        /// to it), or the last check is older than `cloudFresh`: checked before the
+        /// start, without asking.
+        case stale
+        /// The check or a transfer failed (why).
+        case unchecked(String?)
+        /// Saves that need the user's choice (count).
+        case conflict(Int)
+    }
+    static var cloudPlayCheck: Bool { cloudEnabled && SteamSignIn.flag("MADEIRA_STEAM_CLOUD_PLAY_CHECK", default: true) }
+    private static let cloudFresh: TimeInterval = 600
+    /// The game whose saves are being synced before it starts (the library says so).
+    @Published private(set) var cloudWaitingFor: Int?
+
+    func cloudHold(_ appID: Int) -> CloudHold? {
+        guard Self.cloudPlayCheck, signedIn, !inSession else { return nil }
+        if cloudBusy.contains(appID) { return .syncing }
+        guard let state = cloud[appID] else { return .stale }
+        switch state.phase {
+        case .checking, .downloading, .uploading: return .syncing
+        // No prefix yet (first start): there is nothing to compare with.
+        case .failed(let message): return message == Self.cloudNoFolders ? nil : .unchecked(message)
+        case .ready: break
+        }
+        if let problem = state.problem { return .unchecked(problem) }
+        if !state.conflicts.isEmpty { return .conflict(state.conflicts.count) }
+        if Date().timeIntervalSince(state.checked ?? .distantPast) > Self.cloudFresh { return .stale }
+        return nil
+    }
+
+    /// Waits for a running sync, syncs once more, and returns what still holds the start.
+    func settleCloud(_ appID: Int) async -> CloudHold? {
+        cloudWaitingFor = appID
+        defer { cloudWaitingFor = nil }
+        for _ in 0..<600 where cloudBusy.contains(appID) { try? await Task.sleep(nanoseconds: 200_000_000) }
+        cloud[appID]?.problem = nil      // a transfer that stops again says so again
+        await syncCloud(appID)
+        let hold = cloudHold(appID)
+        SteamLog.event("[steam-cloud] app=\(appID) before-play sync result=\(hold.map { "\($0)" } ?? "clear")")
+        return hold == .stale ? nil : hold
+    }
+
+    // MARK: Upload and quit
+
+    /// A game cannot be closed from Madeira, so its saves otherwise reach the
+    /// cloud only at the next app start. The session menu's "Upload saves and
+    /// close Madeira" sends them now: the app takes the account back from the
+    /// session's client, uploads what changed on this device, and the app quits.
+    /// Nothing is downloaded while the game runs. `env.MADEIRA_STEAM_CLOUD_QUIT = 0`
+    /// hides the button.
+    static var cloudQuitEnabled: Bool { cloudEnabled && SteamSignIn.flag("MADEIRA_STEAM_CLOUD_QUIT", default: true) }
+
+    enum CloudQuit: Equatable {
+        case working(String)
+        /// The cloud's copies changed too (count): uploading would replace them.
+        case conflict(Int)
+        case failed(String)
+        /// Uploaded (count) and confirmed; the app may quit.
+        case done(Int)
+    }
+    @Published private(set) var cloudQuit: CloudQuit?
+    /// The app holds the account although a session runs (uploadForQuit).
+    private var cloudTakeover = false
+    private var cloudBlocked: Bool { inSession && !cloudTakeover }
+
+    /// Uploads the running game's changed saves. `replaceCloud` also sends the
+    /// saves that changed in the cloud as well, replacing the cloud's copies.
+    func uploadForQuit(_ appID: Int, replaceCloud: Bool = false) async {
+        guard Self.cloudQuitEnabled, signedIn, !cloudBusy.contains(appID) else { return }
+        if case .working = cloudQuit { return }
+        cloudBusy.insert(appID)
+        defer { cloudBusy.remove(appID) }
+        cloudQuit = .working("Connecting to Steam…")
+        if !cloudTakeover {
+            cloudTakeover = true
+            await gate.takeOver()
+            SteamLog.event("[steam-cloud] app=\(appID) quit-upload: connection reopened during the session")
+        }
+        func failure() -> String {
+            if case .failed(let message)? = cloud[appID]?.phase { return message }
+            return cloud[appID]?.problem ?? "Steam Cloud could not be reached."
+        }
+        // The game is still running and may be writing: go on once two looks,
+        // 2 s apart, find the same device files.
+        var plan: SteamCloudPlan?
+        var seen: [String: Data] = [:]
+        for round in 0..<5 {
+            cloudQuit = .working(round == 0 ? "Checking saves…" : "Waiting for the game to finish saving…")
+            guard let look = await checkCloud(appID) else {
+                SteamLog.event("[steam-cloud] app=\(appID) quit-upload: check failed")
+                cloudQuit = .failed(failure()); return
+            }
+            let now = (look.upload + look.conflicts).reduce(into: [String: Data]()) { $0[$1.key] = $1.localSHA }
+            plan = look
+            if round > 0, now == seen { break }
+            seen = now
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        guard let plan else { cloudQuit = .failed(failure()); return }
+        // A save missing on this device has nothing to upload; it waits for its choice.
+        let differing = plan.conflicts.filter { $0.kind != .cloudOnly }
+        if !differing.isEmpty, !replaceCloud {
+            SteamLog.event("[steam-cloud] app=\(appID) quit-upload: held, conflicts=\(differing.count) upload=\(plan.upload.count)")
+            cloudQuit = .conflict(differing.count); return
+        }
+        let wanted = plan.upload + (replaceCloud ? differing : [])
+        guard !wanted.isEmpty else {
+            SteamLog.event("[steam-cloud] app=\(appID) quit-upload: nothing to upload")
+            cloudQuit = .done(0); return
+        }
+        cloudQuit = .working("Uploading \(wanted.count) save\(wanted.count == 1 ? "" : "s")…")
+        _ = await upload(appID, wanted)
+        guard cloud[appID]?.problem == nil, cloud[appID]?.lastUpload == wanted.count else {
+            cloudQuit = .failed(failure()); return
+        }
+        // The comparison records the uploaded files as in sync for the next start.
+        cloudQuit = .working("Confirming…")
+        guard let after = await checkCloud(appID) else { cloudQuit = .failed(failure()); return }
+        let sent = Set(wanted.map(\.key))
+        let left = (after.upload + after.conflicts).filter { sent.contains($0.key) }.count
+        SteamLog.event("[steam-cloud] app=\(appID) quit-upload: uploaded=\(wanted.count) replaced-cloud=\(replaceCloud ? 1 : 0) changed-since=\(left)")
+        cloudQuit = .done(wanted.count)
     }
 
     // MARK: Game sessions

@@ -267,8 +267,10 @@ enum VDFParser {
     /// Parse a text-format VDF / KeyValues blob into a nested dictionary.
     /// Steam PICS sends *app* product info in this text format (`"key" "value"`
     /// pairs and `"key" { ... }` sections) — package info uses the binary
-    /// format. Leaf values are always `String`. Standard VDF does not process
-    /// escape sequences, so a quoted string runs verbatim to the next `"`.
+    /// format. Leaf values are always `String`. Steam escapes `"` and `\` inside
+    /// a quoted string (for example a launch argument `/Name=\"Two Words\"`); read
+    /// verbatim, such a string ends early and every later section, the depots
+    /// among them, is lost.
     static func parseTextVDF(from data: Data) -> [String: Any] {
         guard let text = String(data: data, encoding: .utf8) else { return [:] }
         let scalars = Array(text.unicodeScalars)
@@ -300,6 +302,12 @@ enum VDFParser {
             if c == "\"" {
                 i += 1
                 while i < n && scalars[i] != "\"" {
+                    // \" and \\ are escapes; any other backslash is literal (paths).
+                    if scalars[i] == "\\", i + 1 < n, scalars[i + 1] == "\"" || scalars[i + 1] == "\\" {
+                        s.unicodeScalars.append(scalars[i + 1])
+                        i += 2
+                        continue
+                    }
                     s.unicodeScalars.append(scalars[i])
                     i += 1
                 }

@@ -337,6 +337,10 @@ def main():
     if MARKER in s:
         print("winemetal_unix.c: frame generation already present")
         return 0
+    if "static int madeira_fg_present(" in s and "MADEIRA_FRAMEGEN" in s:
+        # willfaust/dxmt#15 (52e2d9a, + b106702 counting its presents)
+        print("winemetal_unix.c: frame generation is upstream (willfaust/dxmt#15); nothing to do")
+        return 0
     for name, anchor in (("present function", ANCHOR_MODULE), ("present hook", ANCHOR_HOOK),
                          ("layer props", ANCHOR_PROPS)):
         if s.count(anchor) != 1:

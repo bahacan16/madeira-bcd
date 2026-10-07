@@ -117,6 +117,13 @@ int madeira_dxmt_has_display_pacing(void) {
     return !g_dxmt_display_pacing_missing;
 }
 
+// DXMT with the 40 FPS cap (vsync mode 4) defines madeira_dxmt_has_40_cap()
+// returning 1. A DXMT without it would present mode 4 uncapped, so this weak
+// fallback says no and the front end does not offer 40.
+__attribute__((weak)) int madeira_dxmt_has_40_cap(void) {
+    return 0;
+}
+
 // --- macdrv_* implementations ---
 
 // DXMT only dereferences client_cocoa_view (passing it straight back to
@@ -153,8 +160,8 @@ static int madeira_desktop_mode(void) {
 // Winios.m compositor: per-window CAMetalLayer inside the window's
 // compositor layer (desktop mode only).
 extern CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd);
-// madeira-bcd: game sessions -- the window a swapchain presents from is the
-// game's own; Winios.m's game-mode window overlay must not draw its GDI bits.
+// Game sessions: the window a swapchain presents from is the game's own;
+// Winios.m's game-mode window overlay must not draw its GDI bits.
 extern void winios_note_game_metal_hwnd(void *hwnd);
 
 static macdrv_metal_device my_create_metal_device(void) {

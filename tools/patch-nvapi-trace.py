@@ -33,17 +33,43 @@ marker = "madeira-bcd: NVAPI trace"
 if marker in src:
     print("patch-nvapi-trace: already patched")
     sys.exit(0)
-if "madeira-bcd: NVAPI entry points" not in src:
+# dxmt db546ee has willfaust/dxmt#11: the entry points patch-dxmt-nvapi.py
+# added are upstream, without its fprintf query trace (and the display-id
+# fallback is inside NvAPI_DISP_GetDisplayIdByDisplayName itself).
+upstream = "madeira-bcd: NVAPI entry points" not in src and "FindDevice(uint64_t registry_id)" in src
+if "madeira-bcd: NVAPI entry points" not in src and not upstream:
     sys.exit("patch-nvapi-trace: run tools/patch-dxmt-nvapi.py first")
 
 # 1. The query trace through the Logger.
 old_trace = 'fprintf(stderr, "[nvapi] query 0x%08x %s\\n", (unsigned)id, name);'
-if src.count(old_trace) != 1:
-    sys.exit("patch-nvapi-trace: query trace anchor not found")
-src = src.replace(old_trace, (
-    'char line[160];  /* ' + marker + ': the Logger reaches the session log */\n'
-    '      snprintf(line, sizeof(line), "[nvapi] query 0x%08x %s", (unsigned)id, name);\n'
-    '      Logger::info(line);'))
+qi = 'extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {'
+if upstream:
+    if src.count(qi) != 1:
+        sys.exit("patch-nvapi-trace: nvapi_QueryInterface anchor not found")
+    src = src.replace(qi, qi + """
+  {
+    static NvU32 seen[256];
+    static unsigned nseen;
+    bool known = false;
+    for (unsigned i = 0; i < nseen; i++)
+      if (seen[i] == id) { known = true; break; }
+    if (!known && nseen < 256) {
+      seen[nseen++] = id;
+      const char *name = "?";
+      for (auto &iface : nvapi_interface_table)
+        if (iface.id == id) { name = iface.func; break; }
+      char line[160];  /* """ + marker + """: the Logger reaches the session log */
+      snprintf(line, sizeof(line), "[nvapi] query 0x%08x %s", (unsigned)id, name);
+      Logger::info(line);
+    }
+  }""")
+else:
+    if src.count(old_trace) != 1:
+        sys.exit("patch-nvapi-trace: query trace anchor not found")
+    src = src.replace(old_trace, (
+        'char line[160];  /* ' + marker + ': the Logger reaches the session log */\n'
+        '      snprintf(line, sizeof(line), "[nvapi] query 0x%08x %s", (unsigned)id, name);\n'
+        '      Logger::info(line);'))
 
 # 2./3. Wrappers.
 wrappers = r'''
@@ -196,7 +222,6 @@ static NvAPI_Status __cdecl madeira_nv_GPU_GetFullName(NvPhysicalGpuHandle hPhys
 
 '''
 
-qi = 'extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {'
 if src.count(qi) != 1:
     sys.exit("patch-nvapi-trace: nvapi_QueryInterface anchor not found")
 src = src.replace(qi, wrappers + qi)
@@ -222,6 +247,8 @@ status_only = [
     "NvAPI_GetPhysicalGPUsFromLogicalGPU", "NvAPI_GetAssociatedDisplayOutputId", "NvAPI_GPU_GetPCIIdentifiers",
     "NvAPI_GPU_GetThermalSettings", "NvAPI_D3D_GetCurrentSLIState",
 ]
+if upstream:   # patch-nvapi-gpu-info.py logged these two itself; upstream's do not
+    status_only += ["NvAPI_GPU_GetPhysicalFrameBufferSize", "NvAPI_GPU_GetVirtualFrameBufferSize"]
 
 body_start = src.index(qi)
 head, body = src[:body_start], src[body_start:]

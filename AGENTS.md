@@ -22,9 +22,12 @@ evidence or analysis).
 Hard rules (do not break):
 
 * Never commit Microsoft VC++ runtime DLLs (CI fetches them).
-* Apple's Metal Shader Converter lives only as an asset of the DRAFT release
-  `msc-private`: never commit its pkg, headers or library, never publish
-  that release.
+* Apple's Metal Shader Converter is handled as upstream does (owner's
+  decision 2026-10-07): the iOS library is tracked at
+  `app/Madeira/d3d12/libmetalirconverter.dylib` and the Apache-2.0 headers
+  are vendored in `madeira-d3d12/third_party/metal-shader-converter`; both
+  are pinned by hash in `build/madeira-d3d12/deps.sh`. Never commit Apple's
+  installer package (.pkg/.dmg) or the macOS library.
 * No public IPA releases without the owner's decision.
 * Do not commit externally supplied binaries (exception: the 125hz PR
   #28/#29 DLLs).

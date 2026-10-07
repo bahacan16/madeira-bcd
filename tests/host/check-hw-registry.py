@@ -199,9 +199,9 @@ int main( void )
         check("FEX iOS FetchHostFeatures: one MIDR, 0, and SupportsCRC set",
               ios.count("HostFeatures.CPUMIDRs.push_back(") == 1 and "HostFeatures.CPUMIDRs.push_back(0u);" in ios
               and "HostFeatures.SupportsCRC = true;" in ios)
-        check("FEX: the host-probe override (CRC=0 etc.) is WOW64-only",
-              "#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)" in ios
-              and ios.index("#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)") < ios.index('Absent("CRC")'))
+        probe_if = "#if defined(FEX_IOS_HOST)\n  /* The list above assumes the newest cores."
+        check("FEX: the host-probe override (CRC=0 etc.) applies to both modules",
+              probe_if in ios and ios.index(probe_if) < ios.index('Absent("CRC")'))
         table = re.findall(r"\{(0x[0-9a-fA-F]+), (0x?[0-9a-fA-F]*|0), ([01]), ProductNames::(\w+)\}", cpp)
         first0 = next((t for t in table if int(t[0], 16) == 0 and int(t[1], 0) == 0), None)
         unk = re.search(r'static const char ARM_UNKNOWN\[\] = "([^"]*)";', cpp)
@@ -319,6 +319,9 @@ int main( void )
 #ifndef min
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #endif
+#ifndef FIXME
+#define FIXME(...) do { } while (0)
+#endif
 static ULONGLONG cpu_id = 0x0000000a000661ull;
 ''' + sys_structs + sys_append + r'''
 /* kind: 0 generic (no host data), 1 Apple with manufacturer/model, 2 Apple with
@@ -374,6 +377,7 @@ unsigned char *gen_table( int kind, unsigned int *len )
 #include "winbase.h"
 #include "winnls.h"
 #define WARN(...) do { } while (0)
+#define FIXME(...) do { } while (0)
 static char rec[4096];
 static void narrow( const WCHAR *w, char *out ) { while ((*out++ = (char)*w++)) ; }
 static DWORD set_reg_value( HKEY hkey, const WCHAR *name, const WCHAR *value )
@@ -467,7 +471,7 @@ int main( void )
     return 0;
 }
 '''
-    flags = ["-fshort-wchar", "-D__WINESRC__", "-DWINE_UNIX_LIB", "-I", str(wine / "include"),
+    flags = ["-Wno-deprecated-declarations", "-fshort-wchar", "-D__WINESRC__", "-DWINE_UNIX_LIB", "-I", str(wine / "include"),
              "-Wno-unused-variable", "-Wno-pointer-sign", "-Wno-unknown-pragmas"]
     out = run_c({"gen.c": generator, "wb.c": wineboot, "ours.c": ours, "cmp.c": compare}, tmp / "cmp", flags)
     check("wineboot's parser, ntdll's generator and hw_registry_ios.h compile together and run", out is not None)

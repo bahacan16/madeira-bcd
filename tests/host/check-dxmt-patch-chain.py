@@ -56,7 +56,10 @@ with tempfile.TemporaryDirectory() as tmp:
         for what, cond in [
             ("cache salt for every converter experiment",
              all(n in cache for n in ("MADEIRA_TGSM_SYNC", "MADEIRA_SAMPLE_L_BIAS", "MADEIRA_PRECISE_MATH",
-                                      "MADEIRA_BOUNDS_EXTRA", "MADEIRA_LD_BOUNDS", "MADEIRA_PS_CLAMP"))),
+                                      "MADEIRA_BOUNDS_EXTRA", "MADEIRA_PS_CLAMP"))
+             # dxmt db546ee made ld bounds unconditional and dropped its switch; a
+             # switch that still exists in the converter must salt the cache.
+             and ("MADEIRA_LD_BOUNDS" in cache or "MADEIRA_LD_BOUNDS" not in conv + ctx + dxc)),
             ("simdgroup barrier pass registered behind MADEIRA_TGSM_SYNC",
              "MadeiraSimdgroupImplicitMemBarrierPass()" in ctx and "madeira_gow::tgsm_sync()" in ctx),
             ("sample_l adds the sampler bias behind MADEIRA_SAMPLE_L_BIAS",

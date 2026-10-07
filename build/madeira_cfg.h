@@ -9,6 +9,8 @@
  * Keys are the old per-file names without the "madeira-" prefix and ".txt"
  * suffix: swap-mb, vram-mb, pool, totalphys, inproc-sync, wx, ...
  * Environment exports are "env.NAME = value" (see madeira_cfg_env_export).
+ * A library game's own lines ($MADEIRA_CFG_GAME, same syntax) are read after
+ * madeira.cfg, so its keys win (madeira_cfg_get).
  *
  * Header-only and dependency-free on purpose: it is included from six
  * separately built libraries (ntdll unix, wineserver, madsync, the winemetal
@@ -104,8 +106,8 @@ static int madeira_cfg_present(void)
 }
 
 /* Scan one key = value file for `key` (the last occurrence wins). Returns -1
- * when the file cannot be read, else 1/0 for found/not found; out is written
- * only when found. buf is scratch of MADEIRA_CFG_MAX bytes. */
+ * when the file cannot be read, else 1 or 0 for found or not found; out is
+ * written only when the key is found. buf is scratch of MADEIRA_CFG_MAX bytes. */
 static int madeira_cfg__scan(const char *path, const char *key, char *out, size_t cap, char *buf)
 {
     size_t klen = strlen(key);
@@ -138,10 +140,10 @@ static int madeira_cfg__scan(const char *path, const char *key, char *out, size_
 /* Look `key` up. Returns 1 and the trimmed value in out (may be empty) when the
  * key is set; 0 when it is not (out is then "").
  *
- * madeira-bcd: $MADEIRA_CFG_GAME names the running game's own file (the app's
- * per-game settings, same syntax); a key set there wins over madeira.cfg and
- * the legacy files, so one game can change a switch without touching the
- * others. */
+ * $MADEIRA_CFG_GAME names the running game's own file (the library's Game
+ * details > This game's config, same syntax, written by the app for each
+ * launch). A key set there wins over madeira.cfg and the legacy files, so one
+ * game can change a switch without touching the others. */
 static int madeira_cfg_get(const char *key, char *out, size_t cap)
 {
     char path[1024];
@@ -177,7 +179,7 @@ static int madeira_cfg_get(const char *key, char *out, size_t cap)
             }
         }
     }
-    game = getenv("MADEIRA_CFG_GAME");
+    game = getenv("MADEIRA_CFG_GAME");   /* set by the app for a library game's own lines; not a madeira.cfg option */
     if (game && *game && madeira_cfg__scan(game, key, out, cap, buf) == 1) found = 1;
     free(buf);
     return found;

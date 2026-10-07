@@ -59,12 +59,57 @@ MARKER = "madeira-bcd: gow experiments"
 NAME = "patch-airconv-gow-experiments"
 
 
+# dxmt db546ee carries willfaust/dxmt#6 (lean SM50 shaders) and #8 (ld / typed
+# UAV store bounds) itself, so patch-airconv-sm50-lean.py, -ld-bounds.py and
+# -uav-store-bounds.py leave such a pin alone. Their upstream forms differ in
+# names only: TextureAccessInBounds (always on, so no Force argument and no
+# MADEIRA_LD_BOUNDS salt), `Done` for the store's join block, the shader's
+# `bytecode` (kept by every SM50Initialize) for madeira_bytecode/madeira_lean.
+_base = (ROOT / "airconv/nt/dxbc_converter_base.cpp").read_text()
+UP_BOUNDS = "madeira-bcd: ld bounds" not in _base and "TextureAccessInBounds(" in _base
+_hpp = (ROOT / "airconv/dxbc_converter.hpp").read_text()
+UP_LEAN = "madeira-bcd: lean SM50 shaders" not in _hpp and "with_parsed_program(" in _hpp
+UP_SALT_OLD = ("      salt += (c && c[0] == '0') ? 0 : 200; }   "
+               "/* madeira-bcd: uav store bounds (was 100 in build 282) */\n")
+UP_SALT_NEW = "    salt = clamp * 10 + (b && b[0] == '1');\n"
+UP_LEAN_OLD = """    madeira_lean_lean++;
+    madeira_lean_bytecode += (long long)BytecodeSize;
+  }
+"""
+UP_LEAN_NEW = "  decltype(sm50_shader->signature_handlers)().swap(sm50_shader->signature_handlers);\n"
+
+
+def upstream_form(rel, text):
+    if UP_BOUNDS and rel == "airconv/nt/dxbc_converter_base.cpp":
+        text = text.replace("madeira_ld_in_bounds(air, ir, *Tex, Address, ArrayIndex, NoLOD, true)",
+                            "TextureAccessInBounds(air, ir, *Tex, Address, ArrayIndex, NoLOD)")
+        text = text.replace("madeira_ld_in_bounds(", "TextureAccessInBounds(")
+        text = text.replace("  if (InBounds)   /* madeira-bcd: ld bounds */\n", "  if (InBounds)\n")
+        text = text.replace("  llvm::BasicBlock *Cont = nullptr;\n", "  llvm::BasicBlock *Done = nullptr;\n")
+    if UP_BOUNDS and rel == "winemetal/unix/cache.c":
+        text = text.replace(UP_SALT_OLD, UP_SALT_NEW)
+    if UP_LEAN and rel == "airconv/dxbc_converter.hpp":
+        text = text.replace("  bool madeira_lean = false;\n", "  std::vector<uint8_t> bytecode;\n")
+    if UP_LEAN and rel == "airconv/dxbc_converter.cpp":
+        text = text.replace(UP_LEAN_OLD, UP_LEAN_NEW)
+        text = text.replace("sh->madeira_lean", "!sh->bytecode.empty()").replace("sh->madeira_bytecode", "sh->bytecode")
+        text = text.replace("they keep their DXBC (madeira_bytecode)", "they keep their DXBC (bytecode)")
+    return text
+
+
 def edit(rel, pairs, needs=None):
     path = ROOT / rel
     s = path.read_text()
     if MARKER in s:
         print(f"{rel}: already patched")
         return
+    if UP_BOUNDS and needs == "madeira-bcd: uav store bounds":
+        needs = '"uav_store_in_bounds"' if rel.endswith(".cpp") else "madeira-bcd: float experiments"
+    if UP_LEAN and needs == "madeira-bcd: lean SM50 shaders":
+        needs = "with_parsed_program("
+    if UP_BOUNDS:   # the Force argument: upstream's check is always on
+        pairs = [p for p in pairs if "madeira_ld_bounds_on()" not in p[0]]
+    pairs = [(upstream_form(rel, o), upstream_form(rel, n), w) for o, n, w in pairs]
     if needs and needs not in s:
         sys.exit(f"{NAME}: {rel} lacks '{needs}' -- run the earlier airconv patches first")
     for old, new, want in pairs:

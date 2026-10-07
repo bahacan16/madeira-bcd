@@ -59,8 +59,7 @@ FAILED_FILES=""
 
 compile_objc() {
     local src=$1 name=$2
-    # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
-    # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
+    # MADEIRA_ONLY=<name>: recompile one object only.
     if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang $COMMON_FLAGS -x objective-c $INCLUDES \
@@ -73,8 +72,7 @@ compile_objc() {
 
 compile_cxx() {
     local src=$1 name=$2 extra="${3:-}"
-    # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
-    # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
+    # MADEIRA_ONLY=<name>: recompile one object only.
     if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang++ $COMMON_FLAGS $CXX_FLAGS $INCLUDES $INCLUDES_DIRECTX $INCLUDES_SHADERS $LLVM_INCLUDES $AIRCONV_DEFS $extra \
@@ -116,8 +114,7 @@ compile_madeira_c() {
 # and the DXMT build must not start failing when it is absent.
 compile_objcxx_arc() {
     local src=$1 name=$2 extra="${3:-}"
-    # MADEIRA_ONLY=<name>: recompile one object only. madeira_ir_unix carries a __DATE__
-    # stamp in the shader-cache key, so a full rebuild costs a full shader recompile on device.
+    # MADEIRA_ONLY=<name>: recompile one object only.
     if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
     printf "  %-40s " "$name"
     if xcrun -sdk iphoneos clang++ $COMMON_FLAGS -std=c++20 -fobjc-arc -x objective-c++ $extra \
@@ -132,6 +129,25 @@ if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
     echo "=== madeira-d3d12 canary (Objective-C++, Metal Shader Converter) ==="
     compile_objcxx_arc "$REPO_ROOT/madeira-d3d12/tests/native/msc_canary.mm" \
                        msc_canary "-DIR_PRIVATE_IMPLEMENTATION -I$MSC_INCLUDE"
+    # The shader caches' converter identity (madeira_ir_unix.mm, MAD_SC_BUILD):
+    # a hash of everything that shapes a conversion -- the service and the IR
+    # ABI, this script (its compiler flags), DXMT's AIR compiler and DXBC
+    # parser, LLVM's configuration, the converter's headers and iOS library.
+    # A build that changes none of them keeps the device's shader cache instead
+    # of converting every shader again.
+    converter_id_inputs() {
+        local f x
+        for f in "$REPO_ROOT/madeira-d3d12/src/unix" "$REPO_ROOT/madeira-d3d12/src/madeira_ir_abi.h" \
+                 "$BUILD_DIR/build.sh" "$DXMT_SRC/airconv" "$DXMT_ROOT/libs" \
+                 "$LLVM_BUILD/include/llvm/Config/llvm-config.h" "$MSC_INCLUDE" "$MSC_LIB_IOS"; do
+            [ -e "$f" ] || { echo "absent ${f#"$REPO_ROOT"/}"; continue; }
+            find "$f" -type f | LC_ALL=C sort | while read -r x; do
+                echo "$(shasum -a 256 < "$x" | cut -c1-64) ${x#"$REPO_ROOT"/}"
+            done
+        done
+    }
+    CONVERTER_ID=$(converter_id_inputs | shasum -a 256 | cut -c1-16)
+    echo "  shader cache converter identity $CONVERTER_ID"
     # The runtime conversion service reached from the D3D12 runtime through
     # winemetal's unix call. Deliberately NOT defining IR_PRIVATE_IMPLEMENTATION
     # here: the converter's runtime header emits its bind points and helper
@@ -141,7 +157,7 @@ if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
     # in-tree AIR compiler, which is linked into this same archive, so the shim
     # includes the compiler's real header rather than restating its structs.
     compile_objcxx_arc "$REPO_ROOT/madeira-d3d12/src/unix/madeira_ir_unix.mm" \
-                       madeira_ir_unix "-I$MSC_INCLUDE -I$REPO_ROOT/madeira-d3d12/src $INCLUDES $INCLUDES_DIRECTX"
+                       madeira_ir_unix "-I$MSC_INCLUDE -I$REPO_ROOT/madeira-d3d12/src $INCLUDES $INCLUDES_DIRECTX -DMADEIRA_IR_CONVERTER_ID=\"$CONVERTER_ID\""
     # ml1011: the input-layout resolver, plain C++ because DXBCParser's signature
     # reader includes a Windows shim whose BOOL clashes with Objective-C's.
     compile_cxx "$REPO_ROOT/madeira-d3d12/src/unix/madeira_sm5_ia.cpp" \
@@ -204,14 +220,28 @@ echo "=== MADEIRA: dxmt_madeira_native -- internal command library ==="
 # with the metalir/metallib/xxd generator chain (src/dxmt/meson.build:24-32).
 # Same chain, same symbol names (xxd -n dxmt_command gives dxmt_command /
 # dxmt_command_len, which is what dxmt_command.cpp:16 expects).
+# The shading-language version is pinned. Without -std, Xcode's metal compiler
+# emits the newest version its SDK knows, and a device whose OS is older refuses
+# the library at load: "This library is using language version 4.1 which is not
+# supported on this OS" (a device on iOS 26.1 running a build from a macOS 27
+# toolchain). The library then does not exist, no Direct3D device can be
+# created, and every game that needs one fails to start. dxmt_command.metal
+# needs nothing past Metal 3.1 (iOS 17), the same version the Windows Metal
+# tools used for the committed header. The AIR target is pinned with it, as in
+# DXMT's meson build (the container format must also be one the OS reads). The
+# script's own timestamp is part of
+# the cache check so that a flag change here regenerates the header.
+DXMT_METAL_STD="${DXMT_METAL_STD:-metal3.1}"
 if [ ! -f "$BUILD_DIR/shader-headers/dxmt_command.h" ] \
-   || [ "$DXMT_SRC/dxmt/dxmt_command.metal" -nt "$BUILD_DIR/shader-headers/dxmt_command.h" ]; then
+   || [ "$DXMT_SRC/dxmt/dxmt_command.metal" -nt "$BUILD_DIR/shader-headers/dxmt_command.h" ] \
+   || [ "$0" -nt "$BUILD_DIR/shader-headers/dxmt_command.h" ]; then
     mkdir -p "$BUILD_DIR/shader-headers"
     (cd "$BUILD_DIR/shader-headers" \
-     && xcrun -sdk macosx metal -o dxmt_command.air -c "$DXMT_SRC/dxmt/dxmt_command.metal" \
+     && xcrun -sdk macosx metal -std="$DXMT_METAL_STD" --target=air64-apple-macos14.0 \
+          -o dxmt_command.air -c "$DXMT_SRC/dxmt/dxmt_command.metal" \
      && xcrun -sdk macosx metallib -o dxmt_command.metallib dxmt_command.air \
      && xxd -n dxmt_command -i dxmt_command.metallib dxmt_command.h)
-    echo "  dxmt_command.h                           OK"
+    echo "  dxmt_command.h                           OK (-std=$DXMT_METAL_STD)"
 else
     echo "  dxmt_command.h                           CACHED"
 fi

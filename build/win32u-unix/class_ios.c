@@ -344,7 +344,7 @@ DLGPROC get_dialog_proc( DLGPROC ret, BOOL ansi )
     return (DLGPROC)(ansi ? proc->procA : proc->procW);
 }
 
-/* madeira-bcd: PEB of the pseudo-process that ran init_user (read by
+/* iOS: PEB of the pseudo-process that ran init_user (read by
  * get_desktop_window in winstation_ios.c). */
 void *ios_win32u_session_peb = NULL;
 
@@ -368,7 +368,7 @@ static void init_user(void)
     sysparams_init();
     winstation_init();
     register_desktop_class();
-    /* madeira-bcd: only this pseudo-process got winstation_init and the desktop
+    /* iOS: only this pseudo-process got winstation_init and the desktop
      * classes; get_desktop_window (winstation_ios.c) gives a later child the
      * same when it needs them. Published last: the child path stays off until
      * the session's own init is complete. */

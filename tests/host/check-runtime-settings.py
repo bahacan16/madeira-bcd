@@ -140,7 +140,8 @@ check('Toggle("Fast synchronization"' in detail and 'Toggle("Fast semaphore wait
 check('if syncEngine != .fastsync {' in detail and 'Choose Fastsync in Settings' in detail,
       'game details: a note says where to choose Fastsync')
 check('if SyncEngine.current == .fastsync {' in apply_env and 'setenv("MADEIRA_FASTSYNC", fastSync == false ? "0" : mode, 1)' in apply_env
-      and 'setenv("MADEIRA_FASTSYNC_SEM", semaphoreFastPath == true ? "1" : "0", 1)' in apply_env,
+      and 'if let sem = semaphoreFastPath { setenv("MADEIRA_FASTSYNC_SEM", sem ? "1" : "0", 1) }' in apply_env
+      and 'else { unsetenv("MADEIRA_FASTSYNC_SEM") }' in apply_env,
       'a launch exports the fastsync switches only when the engine is Fastsync')
 check('static let swapChoices = [0, 1024, 2048, 3072, 4096]' in settings and 'mb > 0 ? String(mb) : nil' in settings,
       'swap tier: Off removes swap-mb (off by default)')

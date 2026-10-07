@@ -793,10 +793,10 @@ struct HomeView: View {
 
     private func enableJIT() {
         enablingJIT = true
-        StikJITHelper.enableJIT { success in
+        StikJITHelper.enableJIT { result in
             DispatchQueue.main.async {
                 enablingJIT = false
-                jitOn = success || jit_check_debugged()
+                if case .success = result { jitOn = true } else { jitOn = jit_check_debugged() }
                 if jitOn, let request = pendingAfterJIT {
                     pendingAfterJIT = nil
                     onLaunch(request)

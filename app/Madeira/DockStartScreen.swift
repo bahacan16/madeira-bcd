@@ -202,6 +202,9 @@ enum DockStartStatus {
     /// only matters before the host's first field.
     static func text(_ fields: [String: String], installers: Bool, installerProgress: String?,
                      installsFinished: Bool, waited: Double) -> String {
+        if fields["launch-option-missing"] != nil || fields["launch-option-invalid"] != nil {
+            return "Steam rejected this game's launch option."
+        }
         if fields["launch-update-wait"] != nil && fields["launch-update-ready"] == nil {
             return "Steam is installing content this game needs. The game starts when it finishes…"
         }
@@ -216,6 +219,14 @@ enum DockStartStatus {
         if fields["launch-client-error"] == "0" { return "The game is starting. Waiting for its window…" }
         if ["ceg-scm", "ceg-request-busy", "ceg-request"].contains(where: { fields[$0] != nil }) && fields["ceg-result"] == nil {
             return "Steam is preparing this game's executable…"
+        }
+        // Offline start: Valve's client signs in from what it saved while online.
+        if fields["session-offline-listed"] == "1" { return "Offline: Steam found this game's license in what it saved. Starting the game…" }
+        if fields["session-offline-logon-result"] == "1" || fields["session-offline-logon-retry"] == "1" {
+            return "Offline: Steam signed in from its saved sign-in. Checking this game's license…"
+        }
+        if fields["session-offline-requested"] != nil || fields["session-offline-fallback"] != nil {
+            return "No connection. Asking Steam to sign in offline…"
         }
         if fields["session-requested-app-listed"] == "1" { return "License confirmed. Steam is starting the game…" }
         if fields["session-authenticated-online"] == "1" { return "Signed in. Waiting for Steam to confirm this game's license…" }

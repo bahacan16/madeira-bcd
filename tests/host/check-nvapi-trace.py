@@ -24,19 +24,28 @@ if not nvapi.exists():
 
 def run(script, path, ok=True):
     r = subprocess.run([sys.executable, str(root / "tools" / script), str(path)], capture_output=True, text=True)
-    assert (r.returncode == 0) == ok, (script, r.returncode, r.stdout, r.stderr)
+    if ok is not None:
+        assert (r.returncode == 0) == ok, (script, r.returncode, r.stdout, r.stderr)
     return r.stdout + r.stderr
 
 with tempfile.TemporaryDirectory() as t:
     t = Path(t)
     cpp = t / "nvapi.cpp"
     shutil.copy(nvapi, cpp)
-    assert "patch-dxmt-nvapi.py first" in run("patch-nvapi-trace.py", cpp, ok=False)
+    # dxmt db546ee already carries patch-dxmt-nvapi.py's entry points (willfaust/dxmt
+    # merged them); the ordering refusal only applies to a tree that lacks them.
+    probe = t / "probe.cpp"
+    shutil.copy(nvapi, probe)
+    run("patch-dxmt-nvapi.py", probe)
+    if probe.read_text() != nvapi.read_text():
+        assert "patch-dxmt-nvapi.py first" in run("patch-nvapi-trace.py", cpp, ok=False)
     run("patch-dxmt-nvapi.py", cpp)
     run("patch-nvapi-strings.py", cpp)
-    assert "frame-buffer sizes" in run("patch-nvapi-gpu-info.py", cpp)
+    out = run("patch-nvapi-gpu-info.py", cpp)
+    assert "frame-buffer sizes" in out or "are upstream (willfaust/dxmt#11)" in out, out
     gpu_info = cpp.read_text()
-    assert "already patched" in run("patch-nvapi-gpu-info.py", cpp)
+    out = run("patch-nvapi-gpu-info.py", cpp)
+    assert "already patched" in out or "are upstream (willfaust/dxmt#11)" in out, out
     assert cpp.read_text() == gpu_info
     assert "entry points traced" in run("patch-nvapi-trace.py", cpp)
     once = cpp.read_text()
@@ -56,8 +65,10 @@ with tempfile.TemporaryDirectory() as t:
         assert "return (void *)&NvAPI_%s;" % fn in qi, fn
     # patch-nvapi-gpu-info.py: GTA V Enhanced's frame-buffer queries resolve, the
     # core count answers (and keeps its trace status line).
-    assert "  case 0x46fbeb03:\n    return (void *)&NvAPI_GPU_GetPhysicalFrameBufferSize;" in qi
-    assert "  case 0x5a04b644:\n    return (void *)&NvAPI_GPU_GetVirtualFrameBufferSize;" in qi
+    # (on dxmt db546ee the trace also wraps them; either way they resolve)
+    for case, fn in (("0x46fbeb03", "GPU_GetPhysicalFrameBufferSize"), ("0x5a04b644", "GPU_GetVirtualFrameBufferSize")):
+        assert ("  case %s:\n    return (void *)&NvAPI_%s;" % (case, fn) in qi or
+                "  case %s:\n    return (void *)&madeira_nv_trace<&dxmt::NvAPI_%s, %su>::call;" % (case, fn, case) in qi), fn
     assert "madeira_nv_trace<&dxmt::NvAPI_GPU_GetGpuCoreCount, 0x" in qi
     core = once[once.index("NvAPI_GPU_GetGpuCoreCount(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pCount) {"):]
     core = core[:core.index("\n}\n")]

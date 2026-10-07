@@ -125,6 +125,7 @@ struct thread *current = NULL;  /* thread handling the current request */
 unsigned int global_error = 0;  /* global error code for when no thread is current */
 timeout_t server_start_time = 0;  /* server startup time */
 char *server_dir = NULL;   /* server directory */
+int wineserver_ready;  /* set by main() once start-up is complete, just before the main loop */
 int server_dir_fd = -1;    /* file descriptor for the server dir */
 int config_dir_fd = -1;    /* file descriptor for the config dir */
 

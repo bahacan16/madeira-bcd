@@ -35,6 +35,9 @@ app/libwineserver.a
 app/Madeira/libdxmt_combined.a
 app/Madeira/libwin32u_unix.a
 app/libwin32u_unix.a
+# On-device pairing (build/rppairing-ios/build.sh)
+app/Madeira/libmadeira_rppairing.a
+build/rppairing-ios/target/
 # FFmpeg (build/ffmpeg/build.sh): static archives and build tree (the source
 # tarball in build/ffmpeg/src/ is tracked, like build/gnutls-ios/src/)
 app/Madeira/libavformat.a
@@ -120,6 +123,10 @@ clean-prefix/
 tests/x64/asmconf_gen/
 tests/x64/asmconf_obj/
 
+# Wine Mono, fetched (hash-checked) by build/wine-mono/fetch.sh and bundled by
+# build/wine-mono/bundle.sh; the scripts are tracked, the payload is not.
+build/wine-mono/wine-mono-*
+
 # Microsoft Visual C++ runtime redistributables.
 # Microsoft-authored binaries, redistributable only under the Visual Studio
 # redistributable terms and only unmodified. Not ours to ship -- obtain them
@@ -150,8 +157,8 @@ app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
 app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
 madeira-d3d12/tests/offline/sm51/
 
-# Metal Shader Converter headers extracted by CI from the msc-private release;
-# staged per build, never committed.
+# Former CI staging dir for the Metal Shader Converter headers (now vendored in
+# madeira-d3d12/third_party/metal-shader-converter); kept ignored.
 build/madeira-d3d12/msc-include/
 build/faultrep/out/
 app/Madeira/arm64ec-windows/faultrep.dll

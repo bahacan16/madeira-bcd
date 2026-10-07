@@ -217,6 +217,7 @@ enum SteamDirectStart {
         var program: String
         var arguments: String
         var folder: String?
+        var launchIndex: UInt32? = nil
     }
 
     /// Launch types Steam gives entries that are not the game itself.
@@ -270,6 +271,7 @@ enum SteamDirectStart {
         func rank(_ option: SteamLaunchOption) -> Int? {
             let type = option.type.lowercased()
             guard option.betaKey.isEmpty, !otherKinds.contains(type),
+                  option.requiredDLC == nil || option.requiredDLC == "" || option.requiredDLC == "0",
                   option.oslist.isEmpty || option.oslist.lowercased().contains("windows") else { return nil }
             let kind: Int
             if type == "default" { kind = 0 } else if type.isEmpty || type == "none" { kind = 1 } else { kind = 2 }
@@ -298,7 +300,8 @@ enum SteamDirectStart {
                     folder = found
                 }
             }
-            return Choice(program: program, arguments: option.arguments.trimmingCharacters(in: spaces), folder: folder)
+            return Choice(program: program, arguments: option.arguments.trimmingCharacters(in: spaces), folder: folder,
+                          launchIndex: option.index)
         }
         return nil
     }
@@ -494,6 +497,20 @@ struct SteamGamesSection: View {
                     if SteamGamesRules.showsSignIn(library: libraryEnabled, signedIn: steam.signedIn) {
                         SteamSignInCard { showSignIn = true }
                     }
+                    // Saves that differ on the two sides wait for a choice on the game's page.
+                    // A line here, not an alert: an alert would close a page that is open.
+                    if SteamOwnedLibrary.cloudEnabled, !steam.cloudUndecided.isEmpty {
+                        let names = steam.cloudUndecided.compactMap { id in model.games.first { $0.id == id }?.name }
+                        Label("Steam Cloud: \(names.joined(separator: ", ")) \(names.count == 1 ? "has" : "have") saves that differ from this device's. Open the game's details to choose which to keep.",
+                              systemImage: "exclamationmark.icloud")
+                            .font(.footnote).foregroundStyle(.orange)
+                    }
+                    if let waiting = steam.cloudWaitingFor {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                            Text("Syncing \(model.games.first { $0.id == waiting }?.name ?? "the game")'s Steam Cloud saves, then starting it…")
+                        }.font(.footnote).foregroundStyle(.secondary)
+                    }
                     if hideInstalled && collapsible {
                         EmptyView()
                     } else if !groups.downloading.isEmpty || !installed.isEmpty {
@@ -675,7 +692,7 @@ private extension SteamOwnedLibrary.Download {
 
 /// A game's card, or its row in the library's list layouts (as the fork's
 /// library rows: artwork, name, state and playtime, or the download's progress).
-private struct SteamGameCell: View {
+struct SteamGameCell: View {
     let item: SteamGamesRules.Item
     var list = false
     var dense = false
@@ -950,6 +967,188 @@ func steamActionLabel(_ title: String, symbol: String) -> some View {
         Image(systemName: symbol)
         Text(title).fontWeight(.semibold)
     }.frame(minWidth: 100, minHeight: 30)
+}
+
+// MARK: - Game details: Steam Cloud
+
+/// The Steam Cloud section of a Steam game's Game details page: how the
+/// account's cloud saves compare with the saves in the prefix, and the
+/// download of cloud saves. A save that differs on the two sides is never
+/// replaced without the user choosing it here (docs/STEAM_CLOUD.md).
+/// The session menu's "Upload saves and close Madeira" (SteamOwnedLibrary.uploadForQuit).
+struct SteamCloudQuitRow: View {
+    let appID: Int
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @State private var confirmReplace = false
+
+    private var working: Bool { if case .working = steam.cloudQuit { return true }; if case .done = steam.cloudQuit { return true }; return false }
+
+    private func run(replaceCloud: Bool) {
+        Task {
+            await steam.uploadForQuit(appID, replaceCloud: replaceCloud)
+            guard case .done(let count) = steam.cloudQuit else { return }
+            LogStore.shared.log("[steam-cloud] app=\(appID) quit-upload done files=\(count): closing Madeira")
+            try? await Task.sleep(nanoseconds: 1_200_000_000)   // long enough to read the result
+            exit(0)
+        }
+    }
+
+    var body: some View {
+        if SteamOwnedLibrary.cloudQuitEnabled, steam.signedIn {
+            VStack(alignment: .leading, spacing: 8) {
+                Button("Upload saves and close Madeira", systemImage: "icloud.and.arrow.up") { run(replaceCloud: false) }
+                    .disabled(working)
+                switch steam.cloudQuit {
+                case .working(let text):
+                    HStack(spacing: 10) { ProgressView(); Text(text).font(.callout) }
+                case .done(let count):
+                    Label(count == 0 ? "Steam Cloud is already up to date. Closing…" : "Uploaded \(count) save\(count == 1 ? "" : "s"). Closing…",
+                          systemImage: "checkmark.circle.fill").font(.callout).foregroundStyle(.green)
+                case .failed(let message):
+                    Text("Not uploaded, Madeira stays open: \(message)").font(.callout).foregroundStyle(.orange)
+                case .conflict(let count):
+                    Text("Not uploaded: \(count) save\(count == 1 ? " was" : "s were") also changed in Steam Cloud, by another device or with no record of a sync here. Uploading would replace the cloud's \(count == 1 ? "copy" : "copies").")
+                        .font(.callout).foregroundStyle(.orange)
+                    Button("Replace the Steam Cloud saves and close", role: .destructive) { confirmReplace = true }
+                        .confirmationDialog("Replace the Steam Cloud saves with this device's?", isPresented: $confirmReplace, titleVisibility: .visible) {
+                            Button("Replace the cloud saves", role: .destructive) { run(replaceCloud: true) }
+                            Button("Cancel", role: .cancel) { }
+                        } message: { Text("The saves in Steam Cloud are overwritten for every device. Their current copies are saved first, in Files › Madeira › Steam Cloud Backups.") }
+                case nil:
+                    EmptyView()
+                }
+                Text("Save in the game first. Uploads this game's saves to Steam Cloud, then closes Madeira; Steam in this session is signed out when the upload starts.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+/// Whether Steam Cloud saves sync: Settings › Steam Cloud saves, kept in madeira.cfg as
+/// env.MADEIRA_STEAM_CLOUD (on unless it is 0; docs/STEAM_CLOUD.md). Turning it back on
+/// syncs the installed games at once.
+@MainActor final class SteamCloudSetting: ObservableObject {
+    static let shared = SteamCloudSetting()
+    @Published var on = SteamSignIn.flag("MADEIRA_STEAM_CLOUD", default: true) {
+        didSet {
+            guard on != oldValue else { return }
+            MadeiraConfig.set("env.MADEIRA_STEAM_CLOUD", on ? nil : "0")
+            SteamLog.event("[steam-cloud] setting on=\(on ? 1 : 0)")
+            if on { SteamOwnedLibrary.shared.cloudTurnedOn() } else { SteamOwnedLibrary.shared.objectWillChange.send() }
+        }
+    }
+}
+
+struct SteamCloudSection: View {
+    let appID: Int
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    @State private var confirmCloud = false
+    @State private var confirmDevice = false
+
+    private static func when(_ seconds: UInt64) -> String {
+        seconds == 0 ? "unknown date" : Date(timeIntervalSince1970: TimeInterval(seconds)).formatted(date: .abbreviated, time: .shortened)
+    }
+    private static func size(_ bytes: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(min(bytes, UInt64(Int64.max))), countStyle: .file)
+    }
+    private static func saves(_ count: Int) -> String { "\(count) save\(count == 1 ? "" : "s")" }
+
+    var body: some View {
+        if SteamOwnedLibrary.cloudEnabled {
+            Section {
+                rows
+            } header: {
+                Text("Steam Cloud")
+            } footer: {
+                Text("Saves sync with Steam Cloud when Madeira starts and when this page opens, not while you play: use Upload saves and close Madeira in the game menu when you stop, or what you played is uploaded the next time Madeira starts. A save that differs on both sides, or that is missing on this device, is never replaced without asking, and a save a sync replaces is kept in Files › Madeira › Steam Cloud Backups.")
+            }
+        }
+    }
+
+    @ViewBuilder private var rows: some View {
+        let state = steam.cloud[appID]
+        if !steam.signedIn {
+            Text("Sign in to Steam to use Steam Cloud.").foregroundStyle(.secondary)
+        } else if let state {
+            switch state.phase {
+            case .checking:
+                HStack(spacing: 10) { ProgressView(); Text("Checking Steam Cloud…").foregroundStyle(.secondary) }
+            case .downloading(let done, let total):
+                ProgressView(value: Double(done), total: Double(max(total, 1))) { Text("Downloading \(done) of \(total)") }
+            case .uploading(let done, let total):
+                ProgressView(value: Double(done), total: Double(max(total, 1))) { Text("Uploading \(done) of \(total)") }
+            case .failed(let message):
+                Text(message).font(.callout).foregroundStyle(.orange)
+                Button("Try again") { Task { await steam.syncCloud(appID) } }
+            case .ready:
+                ready(state)
+            }
+        } else {
+            Text("Not synced yet.").foregroundStyle(.secondary)
+                .task { await steam.syncCloud(appID) }
+            Button("Sync now") { Task { await steam.syncCloud(appID) } }
+        }
+    }
+
+    @ViewBuilder private func ready(_ state: SteamCloudState) -> some View {
+        let audit = state.audit
+        let conflicts = state.conflicts
+        let same = audit.count(.same)
+        if audit.entries.isEmpty {
+            Text("No saves in Steam Cloud or on this device for this game.").foregroundStyle(.secondary)
+        }
+        if !conflicts.isEmpty {
+            let missing = conflicts.filter { $0.kind == .cloudOnly }.count
+            Label(missing == conflicts.count ? "\(Self.saves(missing)) synced here before \(missing == 1 ? "is" : "are") missing on this device"
+                  : "\(Self.saves(conflicts.count)) differ between Steam Cloud and this device", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            ForEach(conflicts) { entry in
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(entry.name).font(.subheadline.weight(.medium))
+                    Text("Steam Cloud: \(Self.when(entry.cloudTime)) · \(Self.size(entry.cloudSize))\(entry.kind != .cloudOnly && entry.cloudTime > entry.localTime ? " · newer" : "")")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text(entry.kind == .cloudOnly ? "This device: missing (it was synced here before)"
+                         : "This device: \(Self.when(entry.localTime)) · \(Self.size(entry.localSize))\(entry.localTime > entry.cloudTime ? " · newer" : "")")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Text("Nothing is changed until you choose which to keep.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("Keep the Steam Cloud saves…") { confirmCloud = true }
+                .confirmationDialog("Use the Steam Cloud version of \(Self.saves(conflicts.count)) on this device? This device's copies are saved first, in Files › Madeira › Steam Cloud Backups.",
+                                    isPresented: $confirmCloud, titleVisibility: .visible) {
+                    Button("Use the Steam Cloud saves", role: .destructive) { Task { await steam.resolveCloud(appID, useCloud: true) } }
+                    Button("Cancel", role: .cancel) {}
+                }
+            Button("Keep this device's saves…") { confirmDevice = true }
+                .confirmationDialog("Keep this device's version of \(Self.saves(conflicts.count))? Saves that differ replace Steam Cloud's for every device; the cloud's copies are saved first, in Files › Madeira › Steam Cloud Backups. Saves missing on this device stay missing, and Steam Cloud keeps them.",
+                                    isPresented: $confirmDevice, titleVisibility: .visible) {
+                    Button("Keep this device's saves", role: .destructive) { Task { await steam.resolveCloud(appID, useCloud: false) } }
+                    Button("Cancel", role: .cancel) {}
+                }
+        } else if !audit.entries.isEmpty {
+            let waiting = audit.count(.differ) + audit.count(.cloudOnly) + audit.count(.localOnly)
+            if waiting == 0 {
+                Label("In sync", systemImage: "checkmark.icloud").foregroundStyle(.secondary)
+            } else {
+                // One-sided leftovers: a file deleted on one side, or automatic sync turned off.
+                LabeledContent("Not synced", value: Self.saves(waiting))
+            }
+        }
+        if same > 0 { LabeledContent("Same on both", value: "\(same)") }
+        if let problem = state.problem {
+            Text(problem).font(.callout).foregroundStyle(.orange)
+        }
+        if let last = state.lastDownload, last.files > 0 {
+            Text("Downloaded \(Self.saves(last.files))."
+                 + (last.backedUp > 0 ? " \(Self.saves(last.backedUp)) replaced on this device \(last.backedUp == 1 ? "was" : "were") backed up." : ""))
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if let last = state.lastUpload, last > 0 {
+            Text("Uploaded \(Self.saves(last)).").font(.caption).foregroundStyle(.secondary)
+        }
+        Button("Sync now") { Task { await steam.syncCloud(appID) } }
+    }
 }
 
 // MARK: - Game details: the Steam section

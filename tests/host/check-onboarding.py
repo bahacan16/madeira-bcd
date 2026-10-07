@@ -2,20 +2,22 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 125hz
 # Madeira Converter Exception: see LICENSE-EXCEPTION.md
-"""Steam setup in the library (app/Madeira/Onboarding.swift), on the host.
+"""First-run setup in the library (app/Madeira/Onboarding.swift), on the host.
 
 1. Swift: compiles the production OnboardingRules with the production
    MadeiraConfig.swift (HOME pointed at a scratch directory) and checks the
-   pages with and without Madeira Dock and Steam sign-in, the first-run
-   decision and the UserDefaults done key, navigation and the step counter,
-   and the MADEIRA_ONBOARDING switch from madeira.cfg and from the environment.
+   JIT page, pages with and without Madeira Dock and Steam sign-in, the
+   first-run decision and the UserDefaults done key, navigation and the step
+   counter, and the MADEIRA_ONBOARDING switch from madeira.cfg and from the
+   environment.
 2. Source checks: the library opens setup once and reopens it from Settings,
-   never over a session; the Steam settings use only sign-in's and Dock's
-   public pieces (no Keychain or token access here); setup starts no Wine
-   session and touches no JIT pool, engine switch or launch environment; no
-   program-name list; no account, token or path in a log line; a Dock start
-   from the library is an unsaved library session behind the
-   one-session-per-run rule; the file is in the Xcode project.
+   never over a session; JIT setup uses the coordinator's pairing import and
+   method selection, while Steam settings use only sign-in's and Dock's public
+   pieces (no Keychain or token access here); setup starts no Wine session and
+   touches no JIT pool, engine switch or launch environment; no program-name
+   list; no account, token or path in a log line; a Dock start from the library
+   is an unsaved library session behind the one-session-per-run rule; the file
+   is in the Xcode project.
 
 Synthetic data only: no Steam, Wine or credentials. Needs `swiftc` on PATH
 (or SWIFTC).
@@ -51,10 +53,12 @@ library = (app / 'Library.swift').read_text()
 content = (app / 'ContentView.swift').read_text()
 project = (root / 'app/Madeira.xcodeproj/project.pbxproj').read_text()
 docs = (root / 'docs/LIBRARY.md').read_text()
+jit_setup = (app / 'JITSetup.swift').read_text()
 
 rules = onboarding[onboarding.index('// MARK: - Rules'):onboarding.index('// MARK: - Setup model')]
 model = block(onboarding, 'final class OnboardingModel')
 settings_section = block(onboarding, 'struct SteamSettingsSection: View')
+jit_settings_section = block(jit_setup, 'struct JITSettingsSection: View')
 
 # ------------------------------------------------------------------ static: provenance and project
 require(onboarding.startswith('// SPDX-License-Identifier: GPL-3.0-or-later\n// Copyright 2026 125hz\n'
@@ -67,18 +71,24 @@ require(not re.search(r'\b(SwiftUI|UIKit|View|UIDevice)\b', rules.replace('// MA
 
 # ------------------------------------------------------------------ static: when setup opens
 present = block(model, 'func presentIfNeeded()')
-require('guard !considered' in present and 'OnboardingRules.shouldShow(done: Self.done, enabled: Self.enabled, steps: steps)' in present,
-        'setup is considered once per run and opens only by the rules')
-opener = block(model, 'private func open(reason: String)')
+require('guard !considered' in present and 'OnboardingRules.shouldShow(seen: Self.seen, enabled: Self.enabled, steps: steps(since: Self.seen))' in present
+        and 'open(reason: "revision \\(Self.seen)->\\(OnboardingRules.revision)", since: Self.seen)' in present,
+        'setup is considered once per run, opens only by the rules, and after an update shows only the new pages')
+require('func rerun() { open(reason: "settings", since: 0) }' in model,
+        'Run setup again shows every page')
+opener = block(model, 'private func open(reason: String, since: Int)')
 require('LibraryModel.shared.current == nil' in opener and 'wine_process_is_running() == 0' in opener and 'guard available' in opener,
         'setup never opens over a running session, or with nothing to set up')
-require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled)' in model,
-        'the pages follow the sign-in and Dock switches')
-require(model.count('UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)') == 2
-        and 'UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)' in block(model, 'func finish()')
-        and 'UserDefaults.standard.set(true, forKey: OnboardingRules.doneKey)' in block(model, 'func skip()')
-        and 'removeObject' not in onboarding and 'set(false' not in onboarding,
-        'only finishing or skipping stores the done key; nothing clears it')
+require('OnboardingRules.steps(signIn: SteamSignIn.isEnabled, dock: MadeiraDock.enabled, localDevVPN: offerLocalDevVPN,\n'
+        '                              wineMono: offerWineMono, since: since)' in model,
+        'the pages follow the sign-in and Dock switches, whether LocalDevVPN and Wine Mono are here, and the revision seen')
+require(opener.index('offerLocalDevVPN = !LocalDevVPN.isInstalled') < opener.index('[onboarding] shown')
+        and opener.index('offerWineMono = !WineMonoModel.available') < opener.index('[onboarding] shown'),
+        "LocalDevVPN's and Wine Mono's pages are decided once, when setup opens, so installing on the way does not renumber the steps")
+stamp = 'UserDefaults.standard.set(OnboardingRules.revision, forKey: OnboardingRules.revisionKey)'
+require(model.count(stamp) == 2 and stamp in block(model, 'func finish()') and stamp in block(model, 'func skip()')
+        and 'removeObject' not in onboarding and 'set(false' not in onboarding and 'set(0' not in onboarding,
+        'only finishing or skipping stores the setup revision; nothing clears it')
 require('static var enabled: Bool { OnboardingRules.enabled }' in model, 'the model uses the rules switch')
 require('.fullScreenCover(isPresented: $onboarding.presented) { OnboardingView() }' in library,
         'Library: setup is presented over the library')
@@ -87,19 +97,52 @@ require('onboarding.presentIfNeeded()' in block(library, 'struct LibraryView: Vi
 require(library.count('!onboarding.presented') >= 2, 'Library: controller commands do not act behind setup')
 require('if onboarding.available {' in settings_section and 'onboarding.rerun()' in settings_section,
         'Settings › Steam: Run setup again, hidden with MADEIRA_ONBOARDING=0')
+require('if onboarding.available {' in jit_settings_section and 'onboarding.rerun()' in jit_settings_section,
+        'Settings › JIT: Run setup again, hidden with MADEIRA_ONBOARDING=0')
 
 # ------------------------------------------------------------------ static: skippable steps
 view = block(onboarding, 'struct OnboardingView: View')
 for page in ['private var signInPage', 'private var dockClientPage']:
     require('secondary("Set up later") { model.next() }' in block(view, page), f'{page.split()[-1]}: Set up later')
 require('secondary("Skip setup") { model.skip() }' in block(view, 'private var welcome'), 'welcome: visible Skip setup')
+jit_page = block(view, 'private var jitPage')
+choices = block(view, 'private var jitChoices')
+require(all(f'case .{path}: {guide}' in jit_page for path, guide in
+            [('onDevice', 'onDeviceGuide'), ('pairingFile', 'pairingFileGuide'), ('stikDebug', 'stikDebugGuide')]),
+        'JIT: each of the three ways in has its own guide')
+require(all(f'jitChoice("{title}"' in choices for title in ['In-app', 'In-app with pairing file', 'StikDebug'])
+        and 'enabled: OnDevicePairing.isSupported' in choices,
+        'JIT: In-app (iOS 27), In-app with pairing file, StikDebug')
+on_device = block(view, 'private var onDeviceGuide')
+require('startPairing()' in on_device and 'OnDevicePairingPanel()' in on_device
+        and 'pairing.start()' in block(view, 'private func startPairing'),
+        'JIT: the on-device guide pairs and shows its progress')
+require('importPairingFile()' in block(view, 'private var pairingFileGuide')
+        and 'importingPairingFile = true' in block(view, 'private func importPairingFile'),
+        'JIT: the pairing-file guide imports')
+require('jit.method = .stikDebug' in block(view, 'private var stikDebugGuide'), 'JIT: the StikDebug guide selects StikDebug')
+for guide in ['onDeviceGuide', 'pairingFileGuide', 'stikDebugGuide']:
+    require('secondary("Back to options") { leaveGuide() }' in block(view, f'private var {guide}'), f'JIT: {guide} goes back')
+require('pairing.cancel()' in block(view, 'private func leaveGuide'), 'JIT: leaving the guide stops a waiting pairing')
+require("secondary(\"I'll do this later\") { model.next() }" in choices, 'JIT: visible defer choice')
+require('jit.importPairingFile(url)' in view and 'jit.method = .builtIn' in view,
+        'JIT: validated import selects Built-in StikJIT through the coordinator')
+ldv_page = block(view, 'private var localDevVPNPage')
+require('UIApplication.shared.open(LocalDevVPN.appStore)' in ldv_page and "secondary(\"I'll do this later\") { model.next() }" in ldv_page
+        and 'if localDevVPNInstalled' in ldv_page and 'case .localDevVPN: localDevVPNPage' in view,
+        "LocalDevVPN's page sends a missing LocalDevVPN to the App Store, and can be skipped")
+require('if phase == .active { localDevVPNInstalled = LocalDevVPN.isInstalled }' in view
+        and 'UIApplication.shared.canOpenURL(URL(string: "localdevvpn://")!)' in (app / 'JITSetup.swift').read_text(),
+        'LocalDevVPN is checked with canOpenURL (nothing opens), again whenever Madeira comes back to the front')
 require('onTapGesture' not in onboarding, 'no hidden gestures')
 require('dock.prepareClient()' in block(view, 'private var dockClientPage'), "components through Dock's verified download")
 
 # ------------------------------------------------------------------ static: sign-in and tokens
-require('SteamSignInView()' in view and 'SteamSignInView()' in settings_section, "sign-in through #45's sheet")
+require('SteamSignInView()' in view and 'open(.steamSignIn)' in settings_section
+        and 'case .steamSignIn: SteamSignInView()' in library, "sign-in through #45's sheet")
 require('signIn.signOut()' in settings_section, "sign-out through #45's model")
-require('MadeiraDockView(start: startDock)' in settings_section, "Settings opens Dock's sheet")
+require('open(.dock)' in settings_section and 'case .dock: MadeiraDockView(start: startDock)' in library,
+        "Settings opens Dock's sheet")
 for forbidden in ['SteamTokenStore', 'credentialsForDock', 'refreshToken', 'SecItem', 'kSec', 'accessToken']:
     require(forbidden not in onboarding, f'Onboarding.swift: no {forbidden} (tokens only via the sign-in store)')
 for line in onboarding.splitlines():
@@ -119,7 +162,7 @@ require('.exe' not in rules, 'rules key nothing on program names')
 
 # ------------------------------------------------------------------ static: Dock from the library
 start = block(content, 'private func startDock(_ game: DockGame, compactPool: Bool')
-require('LibraryView(play: launchLibraryEntry, enableJIT: enableJITViaStikDebug,\n                                startDock: { startDock($0, compactPool: $1) })' in content,
+require('LibraryView(play: launchLibraryEntry, enableJIT: enableJIT,\n                                startDock: { startDock($0, compactPool: $1) })' in content,
         "ContentView hands Dock's start to the library")
 held = start.index('LibraryModel.sessionsThisRun > 0, MadeiraConfig.flag("MADEIRA_ONE_SESSION_PER_RUN")')
 require(held < start.index('MadeiraDock.writeHandoff('), 'a held Dock start writes no sign-in transfer')
@@ -141,7 +184,8 @@ require('if remember { var played = entry; played.lastPlayed = Date(); save(play
         'begin(remember: false) neither adds nor stamps an entry')
 dock_entry = block(onboarding, 'static func dockSession(')
 require('entry.desktop = true' in dock_entry and 'save(' not in dock_entry, 'the Dock session entry is a desktop session, never saved')
-require('MADEIRA_ONBOARDING' in docs and '## Steam setup' in docs, 'docs/LIBRARY.md documents setup and its switch')
+require('MADEIRA_ONBOARDING' in docs and '## First-run setup' in docs,
+        'docs/LIBRARY.md documents setup and its switch')
 
 # ------------------------------------------------------------------ compiled rules
 checks = r'''
@@ -154,30 +198,60 @@ import Foundation
     }
     static func main() {
         typealias R = OnboardingRules
-        let full: [R.Step] = [.welcome, .signIn, .dockClient, .done]
-        expect(R.doneKey == "madeiraOnboardingDone", "done key")
-        expect(R.Step.signIn.rawValue == "sign-in" && R.Step.dockClient.rawValue == "dock-client", "log step names")
+        let full: [R.Step] = [.welcome, .jit, .signIn, .dockClient, .done]
+        expect(R.revisionKey == "madeiraOnboardingRevision" && R.revision >= 2, "revision key; revision 2 or later")
+        expect(R.Step.jit.rawValue == "jit" && R.Step.signIn.rawValue == "sign-in"
+               && R.Step.dockClient.rawValue == "dock-client", "log step names")
 
-        // Pages with and without Dock.
-        expect(R.steps(signIn: true, dock: true) == full, "with Dock: sign-in, then Valve's client components")
-        expect(R.steps(signIn: true, dock: false) == [.welcome, .signIn, .done], "without Dock: sign-in only, no components page")
-        expect(R.steps(signIn: false, dock: true) == full, "Dock keeps the sign-in page (it needs a sign-in)")
-        expect(R.steps(signIn: false, dock: false) == [.welcome, .done], "neither: nothing to set up")
-        expect(R.hasSetup(full) && R.hasSetup([.welcome, .signIn, .done]) && !R.hasSetup([.welcome, .done]), "hasSetup")
+        // JIT is always present; Steam pages still follow their feature switches.
+        expect(R.steps(signIn: true, dock: true) == full, "with Dock: JIT, sign-in, then Valve's client components")
+        expect(R.steps(signIn: true, dock: false) == [.welcome, .jit, .signIn, .done],
+               "without Dock: JIT and sign-in, no components page")
+        expect(R.steps(signIn: false, dock: true) == full, "Dock keeps the sign-in page after JIT (it needs a sign-in)")
+        expect(R.steps(signIn: true, dock: true, localDevVPN: true) == [.welcome, .localDevVPN, .jit, .signIn, .dockClient, .done]
+               && R.steps(signIn: false, dock: false, localDevVPN: true) == [.welcome, .localDevVPN, .jit, .done],
+               "LocalDevVPN missing: its page comes first, before JIT")
+        expect(R.position(of: .localDevVPN, in: [.welcome, .localDevVPN, .jit, .done])! == (1, 2)
+               && R.Step.localDevVPN.rawValue == "localdevvpn", "LocalDevVPN's page counts as step 1")
+        expect(R.steps(signIn: false, dock: false) == [.welcome, .jit, .done],
+               "JIT remains when Steam setup is unavailable")
+        // Wine Mono (revision 3): offered when this device has none, before done; after an
+        // update from revision 2 only it is shown.
+        expect(R.revision == 3 && R.Step.wineMono.rawValue == "wine-mono" && R.Step.wineMono.introduced == 3
+               && R.Step.localDevVPN.introduced == 2 && R.Step.jit.introduced == 1, "revision 3 adds Wine Mono")
+        expect(R.steps(signIn: true, dock: true, wineMono: true) == [.welcome, .jit, .signIn, .dockClient, .wineMono, .done],
+               "Wine Mono's page comes last, before done")
+        expect(R.steps(signIn: true, dock: true, localDevVPN: true, wineMono: true, since: 2) == [.welcome, .wineMono, .done]
+               && R.steps(signIn: true, dock: true, localDevVPN: true, wineMono: true, since: 1) == [.welcome, .localDevVPN, .wineMono, .done],
+               "after an update only the pages added since the revision seen")
+        expect(!R.shouldShow(seen: 2, enabled: true, steps: R.steps(signIn: true, dock: true, wineMono: false, since: 2))
+               && R.shouldShow(seen: 2, enabled: true, steps: R.steps(signIn: true, dock: true, wineMono: true, since: 2))
+               && R.hasSetup([.welcome, .wineMono, .done]),
+               "an update shows setup only when a new page applies (Wine Mono missing)")
+        expect(R.hasSetup(full) && R.hasSetup([.welcome, .jit, .done])
+               && !R.hasSetup([.welcome, .done]), "hasSetup")
 
         // First-run decision.
-        expect(R.shouldShow(done: false, enabled: true, steps: full), "new install shows setup")
-        expect(!R.shouldShow(done: true, enabled: true, steps: full), "finished or skipped setup stays closed")
-        expect(!R.shouldShow(done: false, enabled: false, steps: full), "MADEIRA_ONBOARDING=0 never shows it")
-        expect(!R.shouldShow(done: false, enabled: true, steps: [.welcome, .done]), "nothing to set up: never shown")
+        expect(R.shouldShow(seen: 0, enabled: true, steps: full), "new install shows setup")
+        expect(R.shouldShow(seen: R.revision - 1, enabled: true, steps: full),
+               "an update that raised the revision shows setup once more")
+        expect(!R.shouldShow(seen: R.revision, enabled: true, steps: full)
+               && !R.shouldShow(seen: R.revision + 1, enabled: true, steps: full),
+               "setup finished or skipped at this revision (or a later one, after a downgrade) stays closed")
+        expect(!R.shouldShow(seen: 0, enabled: false, steps: full), "MADEIRA_ONBOARDING=0 never shows it")
+        expect(!R.shouldShow(seen: 0, enabled: true, steps: [.welcome, .done]),
+               "synthetic setup with no middle page never shows")
 
-        // The done key in UserDefaults.
+        // The revision in UserDefaults.
         let suite = "madeira-onboarding-check"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
-        expect(R.shouldShow(done: defaults.bool(forKey: R.doneKey), enabled: true, steps: full), "missing key (fresh install) shows setup")
-        defaults.set(true, forKey: R.doneKey)
-        expect(!R.shouldShow(done: defaults.bool(forKey: R.doneKey), enabled: true, steps: full), "stored key hides setup")
+        expect(R.shouldShow(seen: defaults.integer(forKey: R.revisionKey), enabled: true, steps: full), "missing key (fresh install) shows setup")
+        defaults.set(true, forKey: "madeiraOnboardingDone")
+        expect(R.shouldShow(seen: defaults.integer(forKey: R.revisionKey), enabled: true, steps: full),
+               "setup finished before revisions (only madeiraOnboardingDone) shows once more")
+        defaults.set(R.revision, forKey: R.revisionKey)
+        expect(!R.shouldShow(seen: defaults.integer(forKey: R.revisionKey), enabled: true, steps: full), "stored revision hides setup")
         defaults.removePersistentDomain(forName: suite)
 
         // Navigation and the step counter.
@@ -185,10 +259,16 @@ import Foundation
         while let next = R.next(after: walked.last!, in: full) { walked.append(next) }
         expect(walked == full, "Next walks every page in order")
         expect(R.next(after: .done, in: full) == nil, "done is the last page")
-        expect(R.next(after: .dockClient, in: [.welcome, .signIn, .done]) == nil, "a page not in the list ends setup")
-        expect(R.next(after: .signIn, in: [.welcome, .signIn, .done]) == .done, "without Dock, sign-in leads to done")
-        expect(R.position(of: .signIn, in: full)! == (1, 2) && R.position(of: .dockClient, in: full)! == (2, 2), "step n of m with Dock")
-        expect(R.position(of: .signIn, in: [.welcome, .signIn, .done])! == (1, 1), "one step without Dock")
+        expect(R.next(after: .dockClient, in: [.welcome, .jit, .signIn, .done]) == nil,
+               "a page not in the list ends setup")
+        expect(R.next(after: .signIn, in: [.welcome, .jit, .signIn, .done]) == .done,
+               "without Dock, sign-in leads to done")
+        expect(R.position(of: .jit, in: full)! == (1, 3)
+               && R.position(of: .signIn, in: full)! == (2, 3)
+               && R.position(of: .dockClient, in: full)! == (3, 3), "step n of m with Dock")
+        expect(R.position(of: .jit, in: [.welcome, .jit, .signIn, .done])! == (1, 2)
+               && R.position(of: .signIn, in: [.welcome, .jit, .signIn, .done])! == (2, 2),
+               "two steps without Dock")
         expect(R.position(of: .welcome, in: full) == nil && R.position(of: .done, in: full) == nil, "no counter on welcome and done")
 
         // The switch: default on; env.MADEIRA_ONBOARDING = 0 in madeira.cfg; the environment.

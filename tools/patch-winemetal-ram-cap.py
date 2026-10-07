@@ -125,6 +125,10 @@ def main():
     if MARKER in s:
         print("winemetal_unix.c: already patched")
         return 0
+    if "madeira_avail_memory(" in s and '"ram-reserve-mb"' in s:
+        # willfaust/dxmt#7 (644a354) + bb18171 (default reserve 1536 MB, not 2048)
+        print("winemetal_unix.c: RAM cap is upstream (willfaust/dxmt#7); nothing to do")
+        return 0
     for old, new in PAIRS:
         if s.count(old) != 1:
             sys.exit(f"patch-winemetal-ram-cap: anchor found {s.count(old)} times (want 1) in {PATH}:\n{old}")

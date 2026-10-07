@@ -31,6 +31,13 @@ import sys
 ROOT = pathlib.Path("dxmt/src")
 MARKER = "madeira-bcd: uav store bounds"
 
+# willfaust/dxmt#8 (34b738f, dxmt db546ee): the store is branched around
+# upstream too ("uav_store_in_bounds"); see patch-airconv-ld-bounds.py.
+_base = (ROOT / "airconv/nt/dxbc_converter_base.cpp").read_text()
+if MARKER not in _base and "TextureAccessInBounds(" in _base and '"uav_store_in_bounds"' in _base:
+    print("dxbc_converter_base.cpp: typed UAV store bounds are upstream (willfaust/dxmt#8); nothing to do")
+    sys.exit(0)
+
 
 def edit(rel, pairs):
     path = ROOT / rel

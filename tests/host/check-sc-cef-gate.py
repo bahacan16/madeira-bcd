@@ -121,7 +121,7 @@ enums = proc[proc.index('enum { SC_NOT_HELPER = 0'):]
 enums = enums[:enums.index('\n\n')] + '\n'
 proc_helpers = enums + ''.join(function(proc, sig) for sig in (
     'static int sc_switch_end(',
-    'static int sc_image_is(',
+    'static int ios_image_name_is(',   # renamed in the merge (same body)
     'static int ec_conhost_refuse(',
     'static const char *child_extra_args(',
     'static int sc_helper_kind(',

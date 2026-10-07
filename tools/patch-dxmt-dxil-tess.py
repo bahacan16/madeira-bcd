@@ -166,6 +166,12 @@ def patch(path, pairs):
 
 
 def main():
+    if MARKER not in HDR.read_text() and "obj_handle_t hull_library;" in HDR.read_text():
+        # willfaust/dxmt#5 (490f7d1): the pipeline, the header fields and the
+        # direct draw are upstream; its squash dropped the indirect draw's
+        # 0x7e55 handling, which madeira_d3d12's ExecuteIndirect path uses.
+        print(f"{HDR}: DXIL tessellation is upstream (willfaust/dxmt#5); adding only the indirect draw")
+        return patch(UNIX, [(DRAWI_OLD, DRAWI_NEW)])
     rc = patch(HDR, [(HDR_OLD, HDR_NEW)])
     rc |= patch(UNIX, [(BUILD_OLD, BUILD_NEW), (DRAW_OLD, DRAW_NEW), (DRAWI_OLD, DRAWI_NEW)])
     return rc

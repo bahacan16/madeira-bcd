@@ -9,11 +9,9 @@
  * ntoskrnl.exe, winebus.sys (with a unix backend), winehid.sys, hidclass.sys
  * and hidparse.sys; hidclass creates the device object and serves its reads
  * and IOCTLs from that process. None of it runs in a Madeira game session:
- * the IPA ships no .sys file and CI builds no winedevice.exe/plugplay.exe
- * (.gitignore, build-ipa.yml); the prefix template has winebus, winehid and
- * PlugPlay at Start=4 because winedevice "wedges on iOS and starves every
- * demand-start behind the startup lock" (patches/wine-rpcss-scm-bootstrap.patch);
- * a library game session starts no SCM, and under madsync services.exe never
+ * the app ships no .sys file and no winedevice.exe/plugplay.exe (.gitignore),
+ * the prefix template keeps winebus, winehid and PlugPlay disabled, a library
+ * game session starts no service manager, and under madsync services.exe never
  * answered its RPC clients (DockInstallers.swift). The port already replaced
  * two drivers the same way (nsiproxy.sys -> nsi_unixlib_ios.c, mountmgr.sys ->
  * ios_create_drive_symlinks), and Wine's own server serves \Device\ConDrv,
@@ -250,7 +248,6 @@ static struct object *hidpad_device_open_file( struct object *obj, unsigned int 
 static void hidpad_file_destroy( struct object *obj )
 {
     struct hidpad_file *file = (struct hidpad_file *)obj;
-
     struct hidpad_device *device = file->device;
 
     free_async_queue( &file->read_q );
@@ -413,7 +410,8 @@ static void hidpad_output_log( struct hidpad_device *device, const unsigned char
 }
 
 /* An output report from WriteFile or IOCTL_HID_SET_OUTPUT_REPORT; the same
- * checks as hidclass's hid_device_xfer_report. */
+ * checks as hidclass's hid_device_xfer_report. A DualSense effects report is
+ * decoded into the snapshot the app applies to the physical pad (PadOutput.m). */
 static unsigned int hidpad_output( struct hidpad_device *device, const unsigned char *data, data_size_t size,
                                    const char *how )
 {
@@ -430,6 +428,9 @@ static unsigned int hidpad_output( struct hidpad_device *device, const unsigned 
         winios_hidpad_set_output( &device->output );
         hidpad_output_log( device, data, size, how );
     }
+    else if (!device->outputs)
+        fprintf( stderr, "[hid-pad] ml2101 first output report via %s: report %#x, %u bytes\n", how,
+                 data[0], size );
     device->outputs++;
     return STATUS_SUCCESS;
 }

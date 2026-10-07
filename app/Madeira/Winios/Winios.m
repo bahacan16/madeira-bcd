@@ -823,7 +823,7 @@ extern void winios_screen_size(int *w, int *h);
 extern NSString * const MadeiraDisplayModeChangedNotification;
 
 static UIView *g_compositor_view;
-static BOOL g_comp_game;   /* madeira-bcd: g_compositor_view is the game-mode overlay (below) */
+static BOOL g_comp_game;   /* g_compositor_view is the game-mode overlay (below) */
 static void winios_drop_compositor(const char *why);
 static CALayer *g_desk_bg;               /* teal desktop-area backdrop */
 static CGFloat g_px_to_pt = 1.0 / 3.0;   /* desktop px → screen pt (x, and y unless stretched) */
@@ -927,7 +927,7 @@ void winios_set_compositor_frame(double x, double y, double w, double h) {
  * next session. Returns 1 when there was a view to change. */
 int winios_compositor_set_hidden(int hidden) {
     if (!g_compositor_view) return 0;
-    if (g_comp_game) {   /* madeira-bcd: an ended game session's windows go away */
+    if (g_comp_game) {   /* an ended game session's windows go away */
         if (!hidden) return 0;
         dispatch_async(dispatch_get_main_queue(), ^{ winios_drop_compositor("session ended"); });
         return 1;
@@ -975,16 +975,15 @@ int winios_desktop_point_from_window(double wx, double wy, int *px, int *py) {
     return 1;
 }
 
-/* madeira-bcd: GAME-MODE WINDOWS. A game's launcher or message box (Ghost of
- * Tsushima's Play / Options box, its "No installed graphics card" dialog) is a
- * GDI window; outside desktop mode nothing drew it, so the game sat waiting
- * for a click on something invisible (since the switch to upstream, build
- * 222; the fork's earlier overlay did this). In a game session the compositor
- * view is now created too, as a transparent overlay: no backdrop, no
- * letterbox colour, no touches (userInteractionEnabled = NO), laid out in the
- * same game rect the front end publishes (winios_set_desktop_rect), which is
- * the rect MetalBackedView maps touches through -- a tap lands where the
- * window is drawn. Only top-level windows reach it (driver_ios.c), and a
+/* GAME-MODE WINDOWS. A game's launcher or message box (Ghost of Tsushima's
+ * Play / Options box, its "No installed graphics card" dialog) is a GDI
+ * window; outside desktop mode nothing drew it, so the game sat waiting for a
+ * click on something invisible. In a game session the compositor view is
+ * created too, as a transparent overlay: no backdrop, no letterbox colour, no
+ * touches (userInteractionEnabled = NO), laid out in the same game rect the
+ * front end publishes (winios_set_desktop_rect), which is the rect
+ * MetalBackedView maps touches through -- a tap lands where the window is
+ * drawn. Only top-level windows reach it (driver_ios.c), and a
  * window is drawn only if it does not cover the whole guest desktop and does
  * not present through Metal (winios_note_game_metal_hwnd): a game's own
  * window never covers its picture, and God of War's (full-desktop) window is
@@ -1374,7 +1373,7 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_ensure_compositor();
         if (!g_compositor_view) return;
         NSNumber *key = @((uintptr_t)hwnd);
-        if (g_comp_game) {   /* madeira-bcd: game-mode windows, see winios_game_window_shown */
+        if (g_comp_game) {   /* game-mode windows, see winios_game_window_shown */
             g_px_rects[key] = [NSValue valueWithCGRect:CGRectMake(x, y, w, h)];
             if (!winios_game_window_shown(key)) return;
         }
@@ -1386,8 +1385,8 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         [CATransaction setDisableActions:YES];
         l.frame = winios_layer_rect(x, y, w, h);
         l.hidden = !visible;
-        /* madeira-bcd: a game window whose bits came before its position is
-         * on screen now -- the library's starting screen counts it */
+        /* a game-mode window whose bits came before its position is on
+         * screen now -- the library's starting screen counts it */
         if (g_comp_game && visible && l.contents)
             atomic_fetch_add_explicit(&g_surface_present_count, 1, memory_order_relaxed);
         winios_apply_contents_rect(key, l);
@@ -1815,9 +1814,9 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
          * and released with the block, which is exactly why the snapshot has to
          * own its bytes: this runs AFTER winios_surface_present has returned. */
         if (!g_compositor_view) return;
-        /* madeira-bcd: game mode draws a window only once its position says it
-         * is not the game's own (winios_game_window_shown); bits that arrive
-         * before any position wait in a hidden layer for winios_window_frame. */
+        /* game mode draws a window only once its position says it is not
+         * the game's own (winios_game_window_shown); bits that arrive before
+         * any position wait in a hidden layer for winios_window_frame. */
         BOOL pending = NO;   /* game mode, position not known yet: keep the bits, hidden */
         if (g_comp_game) {
             NSNumber *k = @((uintptr_t)hwnd);

@@ -307,10 +307,10 @@ struct mad_device {
     volatile LONG64 aidx_ver;   /* ml1132: odd while a writer changes aidx; lets mad_resolve_address read it lock-free */
     obj_handle_t *samplers;      /* held for the process's life; see CreateSampler */
     unsigned nsamplers, samplers_cap;
-    /* madeira-bcd: guards samplers, srv_res and uav_res. D3D12 device methods
-     * are free-threaded: GoT's streaming threads create samplers and views at
-     * the same time, and two unlocked reallocs of one array corrupted the heap
-     * (pack-4 crash in mad_grow <- mad_note_sampler, ntdll heap AV). */
+    /* Guards samplers, srv_res and uav_res. D3D12 device methods are
+     * free-threaded: Ghost of Tsushima's streaming threads create samplers and
+     * views at the same time, and two unlocked reallocs of one array corrupted
+     * the heap (a crash in mad_grow under mad_note_sampler). */
     SRWLOCK list_lock;
     /* Textures that have had a shader resource view created. A descriptor heap
      * stores resource IDs, not resource pointers, so the encoder cannot recover
@@ -384,7 +384,7 @@ struct mad_device {
      * runtime-owned 64 MB placement heaps instead. The game's own heaps are NOT
      * backed (1,320 texture heaps totalling 1,985 MB for ~280 MB of textures). */
     CRITICAL_SECTION heap_lock;
-    obj_handle_t ds_scratch; UINT64 ds_scratch_size;   /* madeira-bcd: staging for depth/stencil aspect copies */
+    obj_handle_t ds_scratch; UINT64 ds_scratch_size;   /* staging for depth/stencil aspect copies (exec_copy_aspect) */
     struct mad_texheap { obj_handle_t heap; UINT64 size; struct mad_hblk { UINT64 off, size; } *fl; unsigned nfl, fl_cap; } *theaps;
     unsigned ntheaps, theaps_cap;
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
@@ -763,6 +763,8 @@ struct mad_resource {
     UINT samples;
     struct mad_device *owner;
     int borrowed;              /* texture belongs to a drawable; do not release */
+    obj_handle_t resolve_tmp;  /* exec_resolve: render-target stand-in when this is a resolve destination without that usage */
+    UINT resolve_tmp_w, resolve_tmp_h, resolve_tmp_pf;   /* the stand-in's size and pixel format, to replace it when they change */
     D3D12_RESOURCE_DESC desc;  /* as created; answered by GetDesc */
     /* ml905: typed-buffer views (Buffer<T> / RWBuffer<T>). The converter reads
      * a typed buffer as a texture buffer, so each distinct (format, offset,
@@ -773,7 +775,7 @@ struct mad_resource {
     struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav; obj_handle_t tex; UINT64 id; } *tview;
     unsigned ntview, tview_cap;
     void *view_old[24]; unsigned nview_old;   /* outgrown arrays, freed with the resource */
-    unsigned srv_slot, uav_slot;              /* madeira-bcd: index+1 in the device's srv_res / uav_res, 0 = absent (list_lock) */
+    unsigned srv_slot, uav_slot;              /* index + 1 in the device's srv_res / uav_res, 0 = absent (list_lock) */
     UINT64 acct_bytes; unsigned acct_cat;        /* ml1057: live-backing census */
     int hp_used; unsigned hp_heap; UINT64 hp_off, hp_size;   /* ml1072: placed in a runtime texture heap */
     /* ml913: dimension-correct texture views. Metal binds a texture only to a
@@ -785,21 +787,25 @@ struct mad_resource {
     enum WMTTextureType tex_type; enum WMTPixelFormat tex_pf; UINT tex_mips, tex_layers; UINT tex_depth;   /* ml924: 3D depth */
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     unsigned nxview, xview_cap;
-    UINT64 reserved_bytes;   /* madeira-bcd: d3d12-tiled-resources -- created by CreateReservedResource (fully backed); its tile count x 64 KB */
+    UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
 };
-/* madeira-bcd: srv_res / uav_res membership, O(1) through the resource's slot
- * (the old linear scan ran over ~15,000 textures on every view creation). */
+/* srv_res / uav_res membership, O(1) through the resource's slot (the linear
+ * scan it replaces ran over ~15,000 textures on every view creation). */
 static void mad_view_list_add(struct mad_device *d, int uav, struct mad_resource *r) {
     struct mad_resource ***arr = uav ? &d->uav_res : &d->srv_res;
     unsigned *n = uav ? &d->nuav : &d->nsrv, *cap = uav ? &d->nuav_cap : &d->nsrv_cap;
     unsigned *slot = uav ? &r->uav_slot : &r->srv_slot;
     if (*slot) return;   /* unlocked peek: the common case, already listed */
+    if (r->owner) d = r->owner;   /* the list res_Release removes it from */
+    arr = uav ? &d->uav_res : &d->srv_res;
+    n = uav ? &d->nuav : &d->nsrv; cap = uav ? &d->nuav_cap : &d->nsrv_cap;
     AcquireSRWLockExclusive(&d->list_lock);
     if (!*slot && mad_grow((void **)arr, cap, *n + 1, sizeof **arr)) {
         (*arr)[*n] = r; *slot = ++*n;
     }
     ReleaseSRWLockExclusive(&d->list_lock);
 }
+/* list_lock held exclusively */
 static void mad_view_list_del(struct mad_device *d, int uav, struct mad_resource *r) {
     struct mad_resource **arr = uav ? d->uav_res : d->srv_res;
     unsigned *n = uav ? &d->nuav : &d->nsrv;
@@ -810,8 +816,6 @@ static void mad_view_list_del(struct mad_device *d, int uav, struct mad_resource
     if (uav) last->uav_slot = i + 1; else last->srv_slot = i + 1;
     *slot = 0;
 }
-
-
 
 DEFINE_GUID(IID_IMTLDXGIDevice, 0x6bfa1657, 0x9cb1, 0x471a, 0xa4, 0xfb, 0x7c, 0xac, 0xf8, 0xa8, 0x12, 0x07);
 
@@ -842,7 +846,7 @@ struct mad_rootsig {
      * end of the top-level argument buffer for the static samplers; this is
      * the table it points at (nsamplers sampler descriptors, built once). */
     obj_handle_t stab; UINT64 stab_gpu;
-    const struct mad_descriptor *stab_cpu;   /* madeira-bcd: the same table, for the DXBC backend's copies */
+    const struct mad_descriptor *stab_cpu;   /* the same table, for the DXBC backend's copies (mad_air_resolve) */
 };
 struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
@@ -871,10 +875,10 @@ struct mad_pso {
     UINT root_off[MAD_ROOT_PARAM_MAX]; int has_root_off; /* ml882: offsets from the converter's reflection */
     UINT static_off; int has_static_off;                  /* ml923: the implicit static-sampler table slot */
     int gs_emu;                                     /* ml927: a geometry-shader pipeline through the converter's mesh emulation;
-                                                     * madeira-bcd: 2 = a DXIL hull+domain pipeline through its tessellation emulation */
+                                                     * 2 = a DXIL hull+domain pipeline through its tessellation emulation */
     obj_handle_t si_lib, gs_lib;                    /* stage-in library, geometry (mesh) library; gs_emu 2: gs_lib is the DOMAIN library */
-    obj_handle_t hs_lib;                            /* madeira-bcd: gs_emu 2: the hull library (hull function + tessellator) */
-    struct { UINT out_prim, patches_per_tg, threads_per_patch, input_cps, mesh_prims; float max_factor; } dt;   /* madeira-bcd: IRRuntimeTessellationPipelineConfig */
+    obj_handle_t hs_lib;                            /* gs_emu 2: the hull library (hull function + tessellator) */
+    struct { UINT out_prim, patches_per_tg, threads_per_patch, input_cps, mesh_prims; float max_factor; } dt;   /* gs_emu 2: IRRuntimeTessellationPipelineConfig */
     UINT gs_vertex_size, gs_max_prims;              /* IRRuntimeGeometryPipelineConfig */
     char gs_name[64];                               /* the converter's name for the mesh (geometry) function */
     int is_compute;
@@ -1018,7 +1022,7 @@ struct mad_device;
 static void mad_mheap_reclaim(struct mad_device *d, int all);   /* ml1148 */
 struct mad_rootsig;
 static UINT mad_root_layout(const struct mad_rootsig *rs, UINT offsets[32]);
-static int mad_tiled_on(void);   /* madeira-bcd: d3d12-tiled-resources (opt-in), see TILED RESOURCES */
+static int mad_tiled_on(void);   /* d3d12-tiled-resources (opt-in), see TILED RESOURCES */
 
 static HRESULT mad_creation_failure(struct mad_device *d, const char *what) {
     if (d && !d->device_lost && MTLDevice_recommendedMaxWorkingSetSize(d->mtl_device) == 0) {
@@ -1319,6 +1323,7 @@ enum mad_ck {
     MC_DRAW_INDIRECT, MC_DRAW_INDEXED_INDIRECT, MC_DISPATCH_INDIRECT,   /* ml889: ExecuteIndirect */
     MC_FILL_BB, MC_BLEND_FACTOR, MC_FILL_TEX,   /* madeira-bcd: MC_FILL_TEX = texture UAV clear */   /* ml892: UAV buffer clears, blend factor */
     MC_COPY_BB, MC_COPY_B2T, MC_COPY_T2B, MC_COPY_T2T, MC_DISPATCH,
+    MC_RESOLVE,   /* ResolveSubresource: uses u.tt */
     MC_ROOTSIG, MC_ROOT_CONST, MC_STENCIL_REF,
     MC_CROOTSIG, MC_CROOT, MC_CROOT_CONST,
     MC_QUERY_BEGIN, MC_QUERY_END, MC_QUERY_RESOLVE,   /* ml1088: occlusion queries */
@@ -1344,13 +1349,14 @@ struct mad_cmd {
         struct { UINT vcount, icount, vstart, istart; } draw;
         struct { UINT icount, inst, start; INT base; UINT istart; } drawi;
         struct { struct mad_resource *dst, *src; UINT64 doff, soff, len; } bb;
-        /* buffer<->texture: the buffer side is described by a footprint */
-        struct { struct mad_resource *tex, *buf; UINT64 off; UINT row, rows; UINT w, h, d; UINT level, slice; UINT x, y, z; UINT plane; } bt;   /* madeira-bcd: plane = depth-stencil aspect */
+        /* buffer<->texture: the buffer side is described by a footprint.
+         * plane = the depth-stencil plane (0 depth, 1 stencil), see mad_subresource_plane */
+        struct { struct mad_resource *tex, *buf; UINT64 off; UINT row, rows; UINT w, h, d; UINT level, slice; UINT x, y, z; UINT plane; } bt;
         struct { struct mad_resource *dst, *src; UINT dlevel, dslice, slevel, sslice; UINT w, h, d; UINT dx, dy, dz, sx, sy, sz; UINT dplane, splane; } tt;
         struct { UINT x, y, z; } dispatch;
         struct { struct mad_resource *args; UINT64 off; UINT count; UINT stride; struct mad_resource *cnt; UINT64 cnt_off; } ind;
         struct { struct mad_resource *res; UINT64 off, len; UINT8 byte; obj_handle_t pattern; } fill;   /* ml1151: pattern = exact 32-bit source */
-        struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* madeira-bcd */
+        struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
         struct { float rgba[4]; } blend;
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
     } u;
@@ -1993,7 +1999,7 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
             for (k = 0; k < c->u.barrier.n; k++)
                 if (c->u.barrier.res[k] == r) { cls = rebound ? &g_ac_st_rebound : c->u.barrier.cls[k] == BC_ALL ? &g_ac_st_write : &g_ac_st_read; goto done; }
             break;
-        case MC_COPY_T2T:
+        case MC_COPY_T2T: case MC_RESOLVE:
             if (c->u.tt.src == r) { cls = &g_ac_st_read; goto done; }
             if (c->u.tt.dst == r) { cls = &g_ac_st_write; goto done; }
             break;
@@ -4178,7 +4184,6 @@ static void mad_gs_draw(UINT pt, UINT vertex_size, UINT max_prims, UINT instance
         mesh_tg->width = max_prims ? max_prims : 1; mesh_tg->height = 1; mesh_tg->depth = 1;
     }
 }
-
 /* madeira-bcd: the converter runtime's TESSELLATION draw contract, ported
  * from IRRuntimeDrawIndexedPatchesTessellationEmulation /
  * IRRuntimeDrawPatchesTessellationEmulation (IRRuntimeCalculateDrawInfoFor-
@@ -4392,7 +4397,7 @@ static void mad_prebuild_lists(UINT count, ID3D12CommandList *const *lists) {
     if (!on) return;
     for (i = 0; i < count && n < 256; i++) {
         struct mad_list *l = (struct mad_list *)lists[i];
-        if (!l || !l->closed) continue;
+        if (!l || !l->closed || (l->alloc && l->recorded_generation != l->alloc->generation)) continue;   /* the replay rejects these */
         for (k = 0; k < l->ncmds && n < 256; k++) {
             struct mad_pso *p = l->cmds[k].kind == MC_PSO ? l->cmds[k].u.pso : NULL;
             if (!p) continue;
@@ -4713,11 +4718,10 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
     }
 
     /* Static samplers are baked into the shader by the DXIL converter, but the
-     * DXBC backend expects them in the table like any other sampler.
-     * madeira-bcd: the root signature already built each one's descriptor (the
-     * ml923 table the DXIL path points at); copy it into the slot. Skipping
-     * the draw instead left Ghost of Tsushima's intro videos and final image
-     * black -- one draw per frame, every frame. */
+     * DXBC backend expects them in the table like any other sampler. The root
+     * signature already built each one's descriptor (the ml923 table the DXIL
+     * path points at); copy it into the slot. Skipping the draw instead left
+     * Ghost of Tsushima's intro videos and final image black. */
     if (rg->type == MADEIRA_IR_AIR_SAMPLER) {
         for (i = 0; i < rs->nsamplers && i < 32; i++)
             if (rs->samplers[i].shader_register == rg->lower_bound &&
@@ -5539,7 +5543,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
      * (Astra). An engine that zeroes the count of a culled draw would have drawn
      * one instance of it. Not a skip: there is nothing to draw. */
     if ((c->kind == MC_DRAW && !c->u.draw.icount) || (c->kind == MC_DRAW_INDEXED && !c->u.drawi.inst)) { InterlockedIncrement(&g_zero_inst); return; }
-    if (e->pso && !e->pso->rps && e->pso->lazy) mad_pso_realize(e->pso);   /* madeira-bcd */
+    if (e->pso && !e->pso->rps && e->pso->lazy) mad_pso_realize(e->pso);
     if (!e->pso || (!e->pso->rps && !e->pso->tess)) {   /* ml1086: a tessellation pipeline may have no plain pipeline */
         if (!said_nopso++) d3d12_log("[madeira-d3d12] draw without a pipeline state; skipped\n");
         MAD_SKIP(e);
@@ -5818,7 +5822,7 @@ tess_go:
 #undef MAD_SETBUF
     /* ml1130: no 8 KB clear per draw; each entry is zeroed as it is used */
     const UINT32 use_stages = (UINT32)((gsemu || tv) ? (WMTRenderStageObject | WMTRenderStageMesh | WMTRenderStageFragment) : (WMTRenderStageVertex | WMTRenderStageFragment));
-    mad_use_begin(e, e->renc);   /* madeira-bcd */
+    mad_use_begin(e, e->renc);
 #define MAD_USE_U(h, u) do { if ((h) && nur < 256 && !mad_use_seen(e, e->renc, (h), (UINT32)(u), use_stages)) { \
         memset(&ur[nur], 0, sizeof ur[nur]); ur[nur].type = WMTRenderCommandUseResource; ur[nur].resource = (h); \
         ur[nur].usage = (enum WMTResourceUsage)(u); ur[nur].stages = (enum WMTRenderStages)use_stages; \
@@ -5843,7 +5847,7 @@ tess_go:
      * meaningless; small applications keep the old behaviour. */
     const int ml1060_skip_lists = dev->resset && dev->nsrv > 256;
     if (!ml1060_skip_lists) {
-        AcquireSRWLockShared(&dev->list_lock);   /* madeira-bcd: views are created on other threads */
+        AcquireSRWLockShared(&dev->list_lock);   /* views are created on other threads */
         for (i = 0; i < dev->nsrv && nur < 256; i++) {
             struct mad_resource *r = dev->srv_res[i];
             if (r) MAD_USE(r->texture ? r->texture : r->buffer);
@@ -6050,7 +6054,7 @@ tess_go:
         }
         if (want != ~(UINT64)0) v->dirty = 1;
     }
-    mad_use_commit(e);   /* madeira-bcd: this draw's useResource entries reached the encoder */
+    mad_use_commit(e);   /* this draw's useResource entries reached the encoder */
 #undef MAD_APPEND
     e->draws++; e->pass_draws++;   /* ml1098 */
     if (e->nrt && e->rt[0] && e->rtp[0].layers > 1) {   /* ml926: layered draws */
@@ -6078,9 +6082,10 @@ tess_go:
     }
 }
 
-/* madeira-bcd: depth-stencil aspect copies. Metal copies a combined
- * depth-stencil texture's planes only through a buffer, with
- * MTLBlitOptionDepthFromDepthStencil (1) / StencilFromDepthStencil (2). */
+/* Depth-stencil plane copies. Metal copies one plane of a combined
+ * depth-stencil texture only through a buffer, with
+ * MTLBlitOptionDepthFromDepthStencil (1) / StencilFromDepthStencil (2); a
+ * plane to or from a colour texture therefore goes through a staging buffer. */
 static UINT mad_aspect_opt(const struct mad_resource *r, UINT plane) {
     if (!r->is_depth || !r->has_stencil) return 0;
     return plane ? 2u : 1u;
@@ -6138,9 +6143,10 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     k2.size.width = c->u.tt.w; k2.size.height = c->u.tt.h; k2.size.depth = c->u.tt.d ? c->u.tt.d : 1;
     k2.dst = d->texture; k2.slice = c->u.tt.dslice; k2.level = c->u.tt.dlevel;
     k2.origin.x = c->u.tt.dx; k2.origin.y = c->u.tt.dy; k2.origin.z = c->u.tt.dz;
-    k2.reserved[0] = (uint16_t)mad_aspect_opt(d, c->u.tt.dplane);   /* tools/patch-dxmt-b2t-aspect.py */
+    k2.reserved[0] = (uint16_t)mad_aspect_opt(d, c->u.tt.dplane);   /* the MTLBlitOption; winemetal honours it for a combined depth-stencil destination */
     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
 }
+
 #define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
@@ -6196,7 +6202,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = c->u.bt.d;
         k.dst = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
         k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
-        k.reserved[0] = (uint16_t)mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);   /* madeira-bcd (tools/patch-dxmt-b2t-aspect.py) */
+        k.reserved[0] = (uint16_t)mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);   /* the MTLBlitOption, see exec_copy_aspect */
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
         return;
     }
@@ -6237,7 +6243,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = c->u.bt.d;
         k.dst = c->u.bt.buf->buffer; k.offset = c->u.bt.off;
         k.bytes_per_row = c->u.bt.row; k.bytes_per_image = c->u.bt.row * c->u.bt.rows;
-        k.options = mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);   /* madeira-bcd */
+        k.options = mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
         return;
     }
@@ -6246,7 +6252,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         if (!c->u.tt.dst->texture || !c->u.tt.src->texture) { MAD_SKIP(e); return; }
         if ((c->u.tt.src->is_depth || c->u.tt.dst->is_depth) &&
             (c->u.tt.src->tex_pf != c->u.tt.dst->tex_pf || c->u.tt.splane || c->u.tt.dplane)) {
-            exec_copy_aspect(e, c);   /* madeira-bcd: a depth or stencil plane to or from a colour texture */
+            exec_copy_aspect(e, c);   /* a depth or stencil plane to or from a colour texture */
             return;
         }
         memset(&k, 0, sizeof k);
@@ -6491,6 +6497,103 @@ static int exec_tess_indirect_prep(struct mad_exec *e, const struct mad_cmd *c, 
     *out_off = off;
     return 1;
 }
+static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTTextureInfo *ti, enum WMTPixelFormat *pf, int *is_depth);
+
+/* ResolveSubresource. Metal resolves as the store action of a render pass, so
+ * this is a pass of its own with nothing drawn: load the multisampled source,
+ * keep it, and resolve into the destination. A clear still pending on either
+ * texture has to land first or the pass would load stale contents.
+ *
+ * Metal only resolves into a texture with render-target usage, which a D3D12
+ * resolve destination need not have. Such a destination gets a stand-in of
+ * the subresource's size that is resolved into and then copied from.
+ *
+ * Metal also wants the resolve texture in the source attachment's pixel
+ * format, while D3D12 resolves between sRGB/linear and typeless pairs (an
+ * sRGB multisampled target into a UNORM back buffer is common). When the
+ * formats differ, the destination subresource is resolved (or copied) through
+ * a view of it in the source's format; every texture here has PixelFormatView
+ * usage. Formats of different sizes cannot be viewed as each other: skipped. */
+static obj_handle_t mad_resolve_view(struct mad_resource *r, enum WMTPixelFormat pf, UINT level, UINT slice) {
+    struct WMTTextureSwizzleChannels sw;
+    uint64_t id = 0;
+    sw.r = (enum WMTTextureSwizzle)2; sw.g = (enum WMTTextureSwizzle)3;   /* identity, as MAD_SWZ_IDENTITY */
+    sw.b = (enum WMTTextureSwizzle)4; sw.a = (enum WMTTextureSwizzle)5;
+    return MTLTexture_newTextureView(r->texture, pf, WMTTextureType2D, (uint16_t)level, 1, (uint16_t)slice, 1, sw, &id);
+}
+
+static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_resource *src = c->u.tt.src, *dst = c->u.tt.dst;
+    struct WMTRenderPassInfo rpi;
+    obj_handle_t enc, target = dst->texture, dview = 0;
+    enum WMTPixelFormat spf = src->tex_pf;
+    UINT w = src->width >> c->u.tt.slevel, h = src->height >> c->u.tt.slevel;
+    UINT dlevel = c->u.tt.dlevel, dslice = c->u.tt.dslice;
+    int direct = dst->borrowed || (dst->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    static unsigned said_pf;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    if (!src->texture || !dst->texture || src->is_depth || dst->is_depth) { MAD_SKIP(e); return; }
+    if (dst->tex_pf != spf) {
+        if (mad_pf_bytes((UINT)dst->tex_pf) != mad_pf_bytes((UINT)spf) || !(dview = mad_resolve_view(dst, spf, dlevel, dslice))) {
+            if (said_pf++ < 4)
+                d3d12_log("[madeira-d3d12] ResolveSubresource skipped: Metal format %u cannot be resolved into %u\n",
+                          (unsigned)spf, (unsigned)dst->tex_pf);
+            MAD_SKIP(e); return;
+        }
+        target = dview; dlevel = 0; dslice = 0;
+    }
+    if (!direct) {
+        if (dst->resolve_tmp && (dst->resolve_tmp_w != w || dst->resolve_tmp_h != h || dst->resolve_tmp_pf != (UINT)spf)) {
+            NSObject_release(dst->resolve_tmp);
+            dst->resolve_tmp = 0;
+        }
+        if (!dst->resolve_tmp) {
+            D3D12_RESOURCE_DESC td = dst->desc;
+            struct WMTTextureInfo ti; enum WMTPixelFormat pf; int is_depth = 0;
+            td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+            td.SampleDesc.Count = 1; td.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            if (mad_texinfo_from_desc(&td, &ti, &pf, &is_depth)) {
+                ti.pixel_format = spf;   /* resolved in the source's format, copied as it */
+                dst->resolve_tmp = MTLDevice_newTexture(e->q->device->mtl_device, &ti);
+                dst->resolve_tmp_w = w; dst->resolve_tmp_h = h; dst->resolve_tmp_pf = (UINT)spf;
+            }
+        }
+        if (!dst->resolve_tmp) { if (dview) NSObject_release(dview); MAD_SKIP(e); return; }
+        target = dst->resolve_tmp;
+    }
+    exec_end(e);
+    while (e->npend) exec_flush_clear(e, 0);
+    e->wr_all = 1;
+    memset(&rpi, 0, sizeof rpi);
+    rpi.colors[0].texture = src->texture;
+    rpi.colors[0].level = c->u.tt.slevel; rpi.colors[0].slice = c->u.tt.sslice;
+    rpi.colors[0].load_action = WMTLoadActionLoad;
+    rpi.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
+    rpi.colors[0].resolve_texture = target;
+    if (direct) { rpi.colors[0].resolve_level = dlevel; rpi.colors[0].resolve_slice = dslice; }
+    rpi.render_target_width = w; rpi.render_target_height = h;
+    rpi.default_raster_sample_count = src->samples;
+    enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+    e->f6_att[0] = src; e->f6_att[1] = dst; e->f6_natt = 2;
+    if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }
+    e->f6_natt = 0;
+    if (!enc) { if (dview) NSObject_release(dview); MAD_SKIP(e); return; }
+    MTLCommandEncoder_endEncoding(enc);
+    if (!direct) {
+        struct wmtcmd_blit_copy_from_texture_to_texture k;
+        if (!exec_begin_blit(e)) { if (dview) NSObject_release(dview); MAD_SKIP(e); return; }
+        memset(&k, 0, sizeof k);
+        k.type = WMTBlitCommandCopyFromTextureToTexture;
+        k.src = target;
+        k.src_size.width = w; k.src_size.height = h; k.src_size.depth = 1;
+        k.dst = dview ? dview : dst->texture; k.dst_slice = dslice; k.dst_level = dlevel;
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+    }
+    /* The command buffer keeps the view alive until it has run. */
+    if (dview) NSObject_release(dview);
+}
+
 static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_compute_setpso c_pso;
     e->wr_all = 1;   /* ml1116: a dispatch writes through UAVs we do not enumerate here */
@@ -6504,7 +6607,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     unsigned nsb = 0, nur = 0, i;
     struct mad_device *dev = e->q->device;
     static unsigned said_nopso;
-    if (e->cpso && !e->cpso->cps && e->cpso->lazy_cs) mad_cpso_realize(e->cpso);   /* madeira-bcd */
+    if (e->cpso && !e->cpso->cps && e->cpso->lazy_cs) mad_cpso_realize(e->cpso);
     if (!e->cpso || !e->cpso->cps) {
         if (!said_nopso++) d3d12_log("[madeira-d3d12] Dispatch without a compute pipeline; skipped\n");
         MAD_SKIP(e);
@@ -6583,7 +6686,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     }
 #undef MAD_CSETBUF
     /* ml1130: no 8 KB clear per dispatch; each entry is zeroed as it is used */
-    mad_use_begin(e, e->cenc);   /* madeira-bcd: one declaration per resource and encoder */
+    mad_use_begin(e, e->cenc);   /* one declaration per resource and encoder */
 #define MAD_CUSE(h, u) do { if ((h) && nur < 256 && !mad_use_seen(e, e->cenc, (h), (UINT32)(u), 0)) { \
         memset(&ur[nur], 0, sizeof ur[nur]); ur[nur].type = WMTComputeCommandUseResource; ur[nur].resource = (h); \
         ur[nur].usage = (u); MAD_APPEND(&ur[nur]); nur++; } } while (0)
@@ -6615,7 +6718,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     tail->next.ptr = NULL;
 #undef MAD_APPEND
     MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&c_pso);
-    mad_use_commit(e);   /* madeira-bcd */
+    mad_use_commit(e);
     e->draws++;
     if (g_capture_on && g_cap_uav) mad_capture_dispatch_outputs(e, c);   /* madeira-bcd: contact sheets */
     if (e->ncap_after_buf) {   /* ml922 */
@@ -6775,6 +6878,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: exec_copy(&e, c); break;
         case MC_BLEND_FACTOR: memcpy(e.blend, c->u.blend.rgba, sizeof e.blend); e.has_blend = 1; break;
         case MC_DISPATCH: exec_dispatch(&e, c); break;
+        case MC_RESOLVE: exec_resolve(&e, c); break;
         }
     }
     if (e.renc) InterlockedIncrement(&g_pass_end_list);
@@ -7639,13 +7743,13 @@ static UINT mad_clamp_sample_count(UINT requested)
     return 2;                       /* 3 -> 2 */
 }
 
-/* madeira-bcd: ARCHITECTURE(1).TileBasedRenderer; madeira.cfg / game file
- * d3d12-tile-based = 0 reports FALSE (see D3D12_FEATURE_ARCHITECTURE). */
+/* ARCHITECTURE(1).TileBasedRenderer; madeira.cfg d3d12-tile-based = 0 reports
+ * FALSE, as desktop GPUs and vkd3d-proton do (see D3D12_FEATURE_ARCHITECTURE). */
 static BOOL mad_tile_based_answer(void) {
     static int v = -1;
     if (v < 0) {
-        v = mad_cfg_int_pe("d3d12-tile-based", 1) ? 1 : 0;   /* 0: TileBasedRenderer FALSE, as desktop GPUs and vkd3d-proton report */
-        if (!v) d3d12_log("[d3d12-caps] madeira-bcd tile-based=0 (d3d12-tile-based): ARCHITECTURE reports TileBasedRenderer FALSE\n");
+        v = mad_cfg_int_pe("d3d12-tile-based", 1) ? 1 : 0;   /* 0: TileBasedRenderer FALSE, as desktop GPUs report */
+        if (!v) d3d12_log("[d3d12-caps] tile-based=0 (d3d12-tile-based): ARCHITECTURE reports TileBasedRenderer FALSE\n");
     }
     return v ? TRUE : FALSE;
 }
@@ -7709,11 +7813,9 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
          * is mappable textures (a CPU shadow per subresource, uploaded at Unmap /
          * first GPU use), after which these can go back to TRUE.
          * TileBasedRenderer stays TRUE: it is a hint and promises nothing.
-         * madeira-bcd: d3d12-tile-based = 0 answers FALSE, as desktop GPUs and
-         * vkd3d-proton do. GTA V Enhanced reads ARCHITECTURE and OPTIONS5 on its
-         * real device right before it gives up with ERR_GFX_D3D_NOD3D12 (build
-         * 310, log PlayGTAV.exe 2026-10-01 23:06:13), after every feature-level
-         * 12_0 answer was already consistent. */
+         * d3d12-tile-based = 0 answers FALSE, as desktop GPUs and vkd3d-proton
+         * do: GTA V Enhanced reads ARCHITECTURE right before it decides about
+         * the device. */
         a->TileBasedRenderer = mad_tile_based_answer(); a->UMA = FALSE; a->CacheCoherentUMA = FALSE;
         return S_OK;
     }
@@ -7833,10 +7935,11 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         }
         if ((f->Format == DXGI_FORMAT_R32G32B32_FLOAT || f->Format == DXGI_FORMAT_R32G32B32_UINT || f->Format == DXGI_FORMAT_R32G32B32_SINT) &&
             mad_tiled_on()) {
-            /* madeira-bcd, opt-in with d3d12-tiled-resources: every 11_0+ device
-             * takes these as vertex formats, and so do we (float3 / uint3 / int3
-             * attributes); Metal has no 96-bit texture or texture-buffer format,
-             * so nothing else is claimed. Without the key: E_FAIL as before. */
+            /* Opt-in with d3d12-tiled-resources: every 11_0+ device takes these
+             * as vertex formats, and so do the input layouts here (float3 /
+             * uint3 / int3 attributes); Metal has no 96-bit texture or
+             * texture-buffer format, so nothing else is claimed. Without the
+             * key: E_FAIL as before. */
             f->Support1 = D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER;
             return S_OK;
         }
@@ -7875,17 +7978,16 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
          * unsupported here and then handing that same count to Metal is what
          * cost 28 pipelines. */
         m->NumQualityLevels = (m->SampleCount == mad_clamp_sample_count(m->SampleCount)) ? 1 : 0;
-        /* madeira-bcd: d3d12-msaa8 = 1 reports 8x as supported (one quality
+        /* madeira.cfg d3d12-msaa8 = 1 reports 8x as supported (one quality
          * level); resources and pipelines asking for it still get 4x through
-         * mad_clamp_sample_count, so the answer never reaches Metal. GTA V
-         * Enhanced asks R8G8B8A8_UNORM x1/x2/x4/x8 on its real device and gives
-         * up with ERR_GFX_D3D_NOD3D12 after the 8x answer 0 (build 311, log
-         * PlayGTAV.exe 2026-10-01 23:45:52); every FL 11_0+ GPU has 8x there. */
+         * mad_clamp_sample_count, so the answer never reaches Metal. Every
+         * FL 11_0+ GPU has 8x for R8G8B8A8_UNORM, and GTA V Enhanced gives up
+         * on the device when it is missing. */
         if (m->SampleCount == 8 && !m->NumQualityLevels) {
             static int msaa8 = -1;
             if (msaa8 < 0) {
                 msaa8 = mad_cfg_int_pe("d3d12-msaa8", 0) ? 1 : 0;   /* 1: report 8x MSAA (rendered at 4x) */
-                if (msaa8) d3d12_log("[d3d12-caps] madeira-bcd msaa8=1 (d3d12-msaa8): 8x MSAA reported, rendered at 4x\n");
+                if (msaa8) d3d12_log("[d3d12-caps] msaa8=1 (d3d12-msaa8): 8x MSAA reported, rendered at 4x\n");
             }
             if (msaa8) m->NumQualityLevels = 1;
         }
@@ -8003,6 +8105,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
             if (d->k_tind_pso) NSObject_release(d->k_tind_pso);
             if (d->k_probe_pso) NSObject_release(d->k_probe_pso);
             if (d->k_lib) NSObject_release(d->k_lib);
+            if (d->ds_scratch) NSObject_release(d->ds_scratch);   /* exec_copy_aspect */
             free(d->theaps); free(d->hret);
             DeleteCriticalSection(&d->heap_lock);
         }
@@ -8622,25 +8725,11 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
     return id;
 }
 
-static void STDMETHODCALLTYPE device_CreateConstantBufferView(ID3D12Device *This,
-        const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
-    struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
-    if (!e) return;
-    if (g_sd_state > 0) mad_dg_write(e, 1, "CreateConstantBufferView");   /* madeira-bcd: desc-guard */
-    if (!desc || !desc->BufferLocation) {   /* a null view: defined to read as zeros (ml1049) */
-        struct mad_device *nd = (struct mad_device *)This;
-        memset(e, 0, sizeof *e);
-        if (nd && nd->null_gpu) { e->gpu_va = nd->null_gpu; e->metadata = 65536; }
-        return;
-    }
-    mad_set_buffer_descriptor(e, desc->BufferLocation, desc->SizeInBytes);
-}
-
-/* madeira-bcd: texture UAV clears. A texture UAV descriptor holds only the
- * Metal view's resource id; ClearUnorderedAccessView* needs the mip, slices
- * and format behind it, so every texture UAV's shape is remembered by id (a
- * small bounded table: a lost entry only means that clear is skipped, as
- * every texture UAV clear was before). */
+/* Texture UAV clears. A texture UAV descriptor holds only the Metal view's
+ * resource id; ClearUnorderedAccessView* needs the mip, slices and format
+ * behind it, so every texture UAV's shape is remembered by id (a small
+ * bounded table: a lost entry only means that clear falls back to the
+ * resource the application names, see mad_record_uav_tex_clear). */
 struct mad_uavtex { UINT64 id; struct mad_resource *res; UINT level, sl0, nsl; DXGI_FORMAT fmt; };
 #define MAD_UAVTEX_CAP 8192u
 static struct mad_uavtex g_uavtex[MAD_UAVTEX_CAP];
@@ -8652,7 +8741,7 @@ static void mad_uavtex_put(UINT64 id, struct mad_resource *r, UINT level, UINT s
     if (!id) return;
     AcquireSRWLockExclusive(&g_uavtex_lock);
     for (k = 0; k < 8; k++) { u = &g_uavtex[(h + k) & (MAD_UAVTEX_CAP - 1)]; if (!u->id || u->id == id) break; }
-    if (k == 8) k = 0;
+    if (k == 8) k = 0;   /* full neighbourhood: replace the home slot */
     u = &g_uavtex[(h + k) & (MAD_UAVTEX_CAP - 1)];
     u->id = id; u->res = r; u->level = level; u->sl0 = sl0; u->nsl = nsl; u->fmt = fmt;
     ReleaseSRWLockExclusive(&g_uavtex_lock);
@@ -8669,13 +8758,41 @@ static int mad_uavtex_get(UINT64 id, struct mad_uavtex *out) {
     ReleaseSRWLockShared(&g_uavtex_lock);
     return found;
 }
-/* madeira-bcd: UAV counters (append/consume buffers, IncrementCounter) for
- * the DXBC backend. Its tables carry the counter's address in the word after
- * the buffer's (DXMT's layout); it was always 0 -- "the shader reads zero" --
- * so a shader that bumps its counter wrote through a null pointer: a GPU page
- * fault, and every command buffer after it ignored (Ghost of Tsushima,
- * first gameplay frames). A descriptor has no room for a third address, so
- * the counter is remembered by the view's buffer address. */
+/* A released resource's ids keep their slot (the probe chain stays intact)
+ * but no longer name it. */
+static void mad_uavtex_forget(const struct mad_resource *r, UINT64 id) {
+    unsigned h = mad_uavtex_home(id), k;
+    if (!id) return;
+    AcquireSRWLockExclusive(&g_uavtex_lock);
+    for (k = 0; k < 8; k++) {
+        struct mad_uavtex *u = &g_uavtex[(h + k) & (MAD_UAVTEX_CAP - 1)];
+        if (u->id == id) { if (u->res == r) u->res = NULL; break; }
+        if (!u->id) break;
+    }
+    ReleaseSRWLockExclusive(&g_uavtex_lock);
+}
+
+static void STDMETHODCALLTYPE device_CreateConstantBufferView(ID3D12Device *This,
+        const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
+    if (!e) return;
+    if (g_sd_state > 0) mad_dg_write(e, 1, "CreateConstantBufferView");   /* madeira-bcd: desc-guard */
+    if (!desc || !desc->BufferLocation) {   /* a null view: defined to read as zeros (ml1049) */
+        struct mad_device *nd = (struct mad_device *)This;
+        memset(e, 0, sizeof *e);
+        if (nd && nd->null_gpu) { e->gpu_va = nd->null_gpu; e->metadata = 65536; }
+        return;
+    }
+    mad_set_buffer_descriptor(e, desc->BufferLocation, desc->SizeInBytes);
+}
+
+/* UAV counters (append/consume buffers, IncrementCounter) for the DXBC
+ * backend. Its tables carry the counter's address in the word after the
+ * buffer's (DXMT's layout); it was always 0, so a shader that bumps its
+ * counter wrote through a null pointer: a GPU page fault, and every command
+ * buffer after it ignored (Ghost of Tsushima, first gameplay frames). A
+ * descriptor has no room for a third address, so the counter is remembered by
+ * the view's buffer address in a small bounded table. */
 struct mad_uavctr { UINT64 va, counter_va; };
 #define MAD_UAVCTR_CAP 4096u
 static struct mad_uavctr g_uavctr[MAD_UAVCTR_CAP];
@@ -8713,7 +8830,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
     if (g_sd_state > 0) mad_dg_write(e, 1, "CreateUnorderedAccessView");   /* madeira-bcd: desc-guard */
     if (!r) { memset(e, 0, sizeof *e); return; }                                /* a null view */
     if (counter && !said_counter++)
-        d3d12_log("[madeira-d3d12] CreateUnorderedAccessView: counter resources are bound (madeira-bcd)\n");
+        d3d12_log("[madeira-d3d12] CreateUnorderedAccessView: counter resources are bound\n");
     if (r->buffer) {
         UINT64 stride = 4, first = 0, num = r->size / 4;
         if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
@@ -8727,7 +8844,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
             }
         }
         mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
-        {   /* madeira-bcd: remember this view's counter (or forget a stale one) */
+        {   /* remember this view's counter (or forget a stale one) */
             struct mad_resource *cr = (struct mad_resource *)counter;
             UINT64 cva = 0;
             if (cr && cr->buffer && cr->gpu_address && desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER &&
@@ -8737,8 +8854,8 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
             /* DXIL (Metal Shader Converter): the counter is an R32Uint texture-
              * buffer view named by the descriptor's texture id, its element
              * offset in metadata bits 32..39 (IRRuntimeCreateAppendBufferView /
-             * IRDescriptorTableGetBufferMetadata). The converter's shaders did
-             * their counter atomics on texture id 0. */
+             * IRDescriptorTableGetBufferMetadata). The descriptor carried
+             * texture id 0, so the converter's counter atomics hit nothing. */
             if (cva) {
                 struct mad_descriptor cd;
                 static unsigned said_ctr;
@@ -8761,7 +8878,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
     mad_view_list_add((struct mad_device *)This, 1, r);
     if (r->texture) {
         UINT64 view_id = r->gpu_resource_id;
-        UINT clr_level = 0, clr_sl0 = 0, clr_nsl = ~0u;   /* madeira-bcd: for texture UAV clears */
+        UINT clr_level = 0, clr_sl0 = 0, clr_nsl = ~0u;   /* for texture UAV clears (mad_uavtex) */
         DXGI_FORMAT clr_fmt = (desc && desc->Format != DXGI_FORMAT_UNKNOWN) ? desc->Format : r->desc.Format;
         if (desc) {   /* ml913: one mip, the named slices, the named dimension */
             enum WMTTextureType want = r->tex_type; UINT lvl0 = 0, sl0 = 0, nsl = ~0u;
@@ -8809,7 +8926,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
             }
             clr_level = lvl0; clr_sl0 = sl0; clr_nsl = nsl;
         }
-        mad_uavtex_put(view_id, r, clr_level, clr_sl0, clr_nsl, clr_fmt);   /* madeira-bcd */
+        mad_uavtex_put(view_id, r, clr_level, clr_sl0, clr_nsl, clr_fmt);
         e->gpu_va = 0; e->texture_view_id = view_id; e->metadata = 0;
         return;
     }
@@ -9307,6 +9424,11 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
             if (r->texture && !r->borrowed) mad_vmap_del_locked(vd, r->gpu_resource_id);   /* ml1053 */
             LeaveCriticalSection(&vd->view_lock);
         }
+        if (r->texture) {   /* texture UAV clears must not reach a freed resource */
+            unsigned k;
+            mad_uavtex_forget(r, r->gpu_resource_id);
+            for (k = 0; k < r->nxview; k++) mad_uavtex_forget(r, r->xview[k].id);
+        }
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
         { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
         if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
@@ -9317,6 +9439,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->xview); }
         if (r->buffer) NSObject_release(r->buffer);
         if (r->texture && !r->borrowed) NSObject_release(r->texture);
+        if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
         if (r->placed_heap) { mad_pl_del(r->placed_heap, r); ID3D12Heap_Release((ID3D12Heap *)r->placed_heap); }   /* ml1145 */
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
@@ -10004,7 +10127,7 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         if (p->ps_lib) NSObject_release(p->ps_lib);
         if (p->si_lib) NSObject_release(p->si_lib);   /* ml927 */
         if (p->gs_lib) NSObject_release(p->gs_lib);
-        if (p->hs_lib) NSObject_release(p->hs_lib);   /* madeira-bcd */
+        if (p->hs_lib) NSObject_release(p->hs_lib);   /* DXIL tessellation */
         if (p->dsso) NSObject_release(p->dsso);
         if (p->cps) NSObject_release(p->cps);
         free(p->air);   /* ml1010 */
@@ -11236,8 +11359,8 @@ static const char *mad_ir_status_name(uint32_t st) {
 /* Convert one stage and build its MTLFunction. The metallib buffer is sized by
  * asking first, so a shader larger than any fixed guess still works. */
 #define MAD_LOC_MAX 64
-/* madeira-bcd: what a DXIL hull or domain shader converted for the converter's
- * tessellation emulation reports (madeira_ir_convert_args ret_hs_* / ret_ds_*). */
+/* What a DXIL hull or domain shader converted for the converter's tessellation
+ * emulation reports (madeira_ir_convert_args ret_hs_* / ret_ds_*). */
 struct mad_dtess_refl {
     UINT hs_patches_per_tg, hs_threads_per_patch, hs_input_cps, hs_output_cps, hs_output_cp_size, hs_patch_const_size, hs_out_prim;
     float hs_max_factor;
@@ -11249,10 +11372,10 @@ struct mad_dtess_refl {
  * reflection reports back. */
 struct mad_convert_opts {
     int gs_emulation; UINT topology;
-    /* madeira-bcd: DXIL tessellation. lib_only: the LIBRARY is the result --
-     * the emulated hull and domain functions take function constants and are
-     * looked up by their fixed names when the pipeline is built; dtess receives
-     * the hull/domain reflection. */
+    /* DXIL tessellation. lib_only: the LIBRARY is the result (returned and in
+     * *lib_out, one reference) -- the emulated object, hull and domain
+     * functions take function constants and are looked up by their names when
+     * the pipeline is built; dtess receives the hull/domain reflection. */
     int lib_only; struct mad_dtess_refl *dtess;
     const struct madeira_ir_input_layout *layout;
     obj_handle_t *lib2_out;            /* the stage-in library (vertex stage with a layout) */
@@ -11437,7 +11560,8 @@ static int mad_sc_init(void) {
              * sampler LOD bias (the MSC compatibility flags). */
             n = GetEnvironmentVariableA("MADEIRA_IR_NO_BOUNDS_CHECK", v, sizeof v);
             nobc = (n && n < sizeof v && v[0] == '1') ||
-                   (mad_cfg_str_pe("env.MADEIRA_IR_NO_BOUNDS_CHECK", v, sizeof v) && v[0] == '1');
+                   (mad_cfg_str_pe("env.MADEIRA_IR_NO_BOUNDS_CHECK", v, sizeof v) && v[0] == '1') ||
+                   !mad_cfg_int_pe("msc-bounds-check", 1);   /* 0: shaders converted without D3D12's robust buffer access (bounds check), as env MADEIRA_IR_NO_BOUNDS_CHECK=1 */
             agsrt = GetEnvironmentVariableA("MADEIRA_AGS_ROUNDTRIP_ONLY", v, sizeof v) != 0 ||
                     mad_cfg_str_pe("env.MADEIRA_AGS_ROUNDTRIP_ONLY", v, sizeof v);
             snprintf(g_sc_rt, sizeof g_sc_rt, "vsps-fill %d, no-bounds-check %d, ags-roundtrip %d, msc %d%d%d%d%d",
@@ -11762,14 +11886,36 @@ struct mad_libshare { UINT64 k0, k1; obj_handle_t lib, fn; };
 static struct mad_libshare *g_libshare; static SIZE_T g_libshare_cap, g_libshare_n;
 static SRWLOCK g_libshare_lock = SRWLOCK_INIT;
 static volatile LONG g_libshare_hits;
+static void mad_libshare_key(const void *bytes, SIZE_T len, const char *name, UINT64 *k0, UINT64 *k1) {
+    const unsigned char *c = bytes;
+    SIZE_T nlen = strlen(name) + 1, i;
+    UINT64 a = 0x6a09e667f3bcc908ull, b = 0xbb67ae8584caa73bull;
+    for (i = 0; i < len + nlen; i++) {
+        unsigned char x = i < len ? c[i] : (unsigned char)name[i - len];
+        a = (a ^ x) * 0x100000001b3ull;
+        b = (b + x + 1) * 0x9e3779b97f4a7c15ull; b ^= b >> 31;
+    }
+    a ^= (UINT64)len; a *= 0xff51afd7ed558ccdull;
+    *k0 = a; *k1 = b;
+}
 static struct mad_libshare *mad_libshare_slot(UINT64 k0, UINT64 k1) {
     SIZE_T i;
     if (!g_libshare_cap) return NULL;
     for (i = (SIZE_T)(k0 & (g_libshare_cap - 1));; i = (i + 1) & (g_libshare_cap - 1))
         if (!g_libshare[i].lib || (g_libshare[i].k0 == k0 && g_libshare[i].k1 == k1)) return &g_libshare[i];
 }
+/* madeira.cfg pso-share-libs (default 1): identical converted libraries share one
+ * MTLLibrary. 0 keeps one per pipeline (the table is never trimmed, so this is the
+ * switch to compare memory with). */
+static int mad_libshare_on(void) {
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("pso-share-libs", 1) ? 1 : 0;
+                  d3d12_log("[madeira-d3d12] identical shader libraries are %s (madeira.cfg pso-share-libs)\n", on ? "shared" : "kept per pipeline"); }
+    return on;
+}
 static int mad_libshare_find(UINT64 k0, UINT64 k1, obj_handle_t *lib, obj_handle_t *fn) {
     struct mad_libshare *e; int ok = 0;
+    if (!mad_libshare_on()) return 0;
     AcquireSRWLockShared(&g_libshare_lock);
     e = mad_libshare_slot(k0, k1);
     if (e && e->lib) { NSObject_retain(e->lib); NSObject_retain(e->fn); *lib = e->lib; *fn = e->fn; ok = 1; }
@@ -11783,8 +11929,9 @@ static int mad_libshare_find(UINT64 k0, UINT64 k1, obj_handle_t *lib, obj_handle
 }
 static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_t fn) {
     struct mad_libshare *e;
+    if (!mad_libshare_on()) return;
     AcquireSRWLockExclusive(&g_libshare_lock);
-    if ((g_libshare_n + 1) * 10 >= g_libshare_cap * 7) {
+    if ((g_libshare_n + 1) * 10 >= g_libshare_cap * 7) {   /* grow at 70 % load; the capacity stays a power of two */
         SIZE_T ncap = g_libshare_cap ? g_libshare_cap * 2 : 4096, i, oldcap = g_libshare_cap;
         struct mad_libshare *old = g_libshare, *nw = calloc(ncap, sizeof *nw);
         if (nw) {
@@ -11793,7 +11940,7 @@ static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_
             free(old);
         }
     }
-    e = mad_libshare_slot(k0, k1);
+    e = (g_libshare_n + 1) * 10 < g_libshare_cap * 9 ? mad_libshare_slot(k0, k1) : NULL;   /* never fill the table */
     if (e && !e->lib) {
         NSObject_retain(lib); NSObject_retain(fn);
         e->k0 = k0; e->k1 = k1; e->lib = lib; e->fn = fn; g_libshare_n++;
@@ -12009,7 +12156,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     if (vsin_n) *vsin_n = a.ret_vs_input_count < vsin_cap ? a.ret_vs_input_count : vsin_cap;
     if (nlocs) *nlocs = a.ret_loc_count < MAD_LOC_MAX ? a.ret_loc_count : MAD_LOC_MAX;
     if (tg_out) { tg_out[0] = a.ret_tg_size[0]; tg_out[1] = a.ret_tg_size[1]; tg_out[2] = a.ret_tg_size[2]; }
-    if (o && o->dtess) {   /* madeira-bcd: DXIL tessellation */
+    if (o && o->dtess) {   /* DXIL tessellation */
         struct mad_dtess_refl *t = o->dtess;
         if (a.ret_hs_patches_per_tg) {
             t->hs_patches_per_tg = a.ret_hs_patches_per_tg; t->hs_threads_per_patch = a.ret_hs_threads_per_patch;
@@ -12024,34 +12171,15 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     }
     obj_handle_t fn = 0, err = 0, lib = 0;
     UINT64 share_k0, share_k1;
-    if (o && o->lib_only) {   /* madeira-bcd: DXIL tessellation -- the library alone, never shared */
-        obj_handle_t dd = DispatchData_alloc_init((uint64_t)(uintptr_t)buf, (uint64_t)a.ret_len);
-        if (dd) {
-            lib = MTLDevice_newLibrary(d->mtl_device, dd, &err);
-            NSObject_release(dd);
-            if (lib) { InterlockedExchangeAdd64(&g_lib_bytes, (LONG64)a.ret_len); InterlockedIncrement(&g_lib_count); }
-        }
-        if (err) mad_log_nserror("library", err);
-        free(buf);
-        if (!lib) { d3d12_log("[madeira-d3d12] %s: the backend rejected the converted library (%u bytes)\n", tag, (unsigned)a.ret_len); return 0; }
-        d3d12_log("[madeira-d3d12] %s converted at runtime: %u bytes of DXIL -> %u bytes of metallib, entry '%s'\n",
-                  tag, (unsigned)dxil_len, (unsigned)a.ret_len, name);
-        if (o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);
+    mad_libshare_key(buf, (SIZE_T)a.ret_len, name, &share_k0, &share_k1);
+    /* Not for a DXIL tessellation conversion (lib_only): its result is the library
+     * itself, and a shared entry would hand back the function instead. */
+    if (!(o && o->lib_only) && mad_libshare_find(share_k0, share_k1, &lib, &fn)) {   /* an identical library already exists */
+        snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
+        if (o && o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);   /* ml927b */
         *lib_out = lib;
-        return lib;
-    }
-    {   /* madeira-bcd: an identical library already exists -- share it */
-        struct mad_sc_hash sh = { 0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull };
-        mad_sc_feed(&sh, buf, (SIZE_T)a.ret_len);
-        mad_sc_feed(&sh, name, strlen(name) + 1);
-        share_k0 = sh.a; share_k1 = sh.b;
-        if (mad_libshare_find(share_k0, share_k1, &lib, &fn)) {
-            snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
-            if (o && o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);   /* ml927b */
-            *lib_out = lib;
-            free(buf);
-            return fn;
-        }
+        free(buf);
+        return fn;
     }
     LONG64 lib_t0 = mad_qpc();   /* madeira-bcd: timed, with the function lookup below */
     obj_handle_t dd = DispatchData_alloc_init((uint64_t)(uintptr_t)buf, (uint64_t)a.ret_len);
@@ -12066,6 +12194,14 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
                   tag, (unsigned)a.ret_len);
         free(buf);
         return 0;
+    }
+    if (o && o->lib_only) {   /* DXIL tessellation: the library is the result */
+        d3d12_log("[madeira-d3d12] %s converted at runtime: %u bytes of DXIL -> %u bytes of metallib, entry '%s'\n",
+                  tag, (unsigned)dxil_len, (unsigned)a.ret_len, name);
+        if (o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);
+        *lib_out = lib;
+        free(buf);
+        return lib;
     }
     /* The converter RENAMES entry points, so the function is looked up by the
      * name reflection reported, never by the D3D-side name. */
@@ -12094,7 +12230,7 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
             d3d12_log("[dxil-hex] end\n");
         }
     }
-    mad_libshare_add(share_k0, share_k1, lib, fn);   /* madeira-bcd */
+    mad_libshare_add(share_k0, share_k1, lib, fn);
     *lib_out = lib;
     free(buf);
     return fn;
@@ -12531,15 +12667,18 @@ fail:
     return 0;
 }
 
-/* madeira-bcd: DXIL TESSELLATION through the Metal Shader Converter's own
- * emulation (IRRuntimeNewGeometryTessellationEmulationPipeline): the vertex
- * shader becomes the object function with tessellation on, the hull shader two
+/* DXIL TESSELLATION through the Metal Shader Converter's own emulation
+ * (IRRuntimeNewGeometryTessellationEmulationPipeline): the vertex shader
+ * becomes the object function with tessellation on, the hull shader two
  * functions linked into it (hull and tessellator), the domain shader a function
- * linked into the mesh stage, whose mesh function is the converter's passthrough
- * geometry shader for the tessellator's output primitive. Ghost of Tsushima
- * draws its water this way; those 23 pipelines were placeholders, so the water
- * was missing. The DXBC path (ml1083) is DXMT's own emulation and unchanged.
- * madeira.cfg dxil-tess = 0 keeps DXIL hull/domain pipelines placeholders. */
+ * linked into the mesh stage, whose mesh function is the converter's
+ * passthrough geometry shader for the tessellator's output primitive. Ghost of
+ * Tsushima draws its water this way; without it those pipelines failed and the
+ * water was missing. The DXBC path (ml1083) is DXMT's own emulation and
+ * unchanged. Indirect draws on these pipelines go through the helper kernel
+ * that turns their argument records into mesh dispatch arguments (madeira-bcd,
+ * mad_kernels.metal; skipped without it). madeira.cfg dxil-tess = 0 keeps DXIL
+ * hull/domain pipelines placeholders. */
 static int mad_dtess_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -12609,6 +12748,8 @@ static void mad_dtess_convert(struct mad_device *d, struct mad_rootsig *rs, stru
         dok = mad_convert_stage_opts(d, rs, desc->DS.pShaderBytecode, desc->DS.BytecodeLength, NULL, &p->gs_lib, "DS(dxil tess)",
                                      NULL, 0, NULL, NULL, locs, &nl, &od);
     if (dok) mad_apply_reflected_layout(p, rs, locs, nl, "DS");
+    /* The checks of IRRuntimeValidateTessellationPipeline, plus the limits of
+     * the draw info's 16-bit fields. */
     overlap = r.hs_out_prim == 1 ? 0 : r.hs_out_prim == 2 ? 1 : 2;
     if (!p->vs_fn) why = "vertex shader";
     else if (!hok) why = "hull shader";
@@ -12717,7 +12858,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             !mad_bc_is_dxbc(desc->VS.pShaderBytecode, desc->VS.BytecodeLength) &&
             !mad_bc_is_dxbc(desc->HS.pShaderBytecode, desc->HS.BytecodeLength) &&
             !mad_bc_is_dxbc(desc->DS.pShaderBytecode, desc->DS.BytecodeLength) && mad_dtess_on())
-            mad_dtess_convert(d, rs, p, desc, vsin, &nvsin);   /* madeira-bcd: DXIL tessellation */
+            mad_dtess_convert(d, rs, p, desc, vsin, &nvsin);   /* DXIL tessellation; sets gs_emu = 2 when usable */
         if (desc->GS.pShaderBytecode && !mad_bc_is_dxbc(desc->GS.pShaderBytecode, desc->GS.BytecodeLength)) {   /* ml927: geometry-shader pipeline -> converter mesh emulation; ml1147: DXIL only */
             struct madeira_ir_input_layout *L = calloc(1, sizeof *L);
             struct mad_convert_opts ov, og;
@@ -13035,7 +13176,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         snprintf(ge.geometry_function, sizeof ge.geometry_function, "%s", p->gs_name);
         if (p->ps_fn) snprintf(ge.fragment_function, sizeof ge.fragment_function, "%s", p->ps_name);
         ge.gs_vertex_size_bytes = p->gs_vertex_size; ge.gs_max_input_primitives = p->gs_max_prims;
-        if (p->gs_emu == 2) {   /* madeira-bcd: DXIL tessellation (tools/patch-dxmt-dxil-tess.py) */
+        if (p->gs_emu == 2) {   /* DXIL tessellation: winemetal builds the tessellation variant */
             ge.hull_library = p->hs_lib; ge.domain_library = p->gs_lib;
             ge.max_tessellation_factor = p->dt.max_factor; ge.tessellation = 1;
             ge.gs_max_input_primitives = p->dt.mesh_prims;
@@ -13045,7 +13186,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         { static unsigned said; if (said++ < 8) d3d12_log("[madeira-d3d12] geometry pipeline %s: vs '%s' gs '%s' ps '%s' (vertex %u B, %u prims/tg, %u targets)\n",
                                                         p->rps ? "created" : "FAILED", ge.vertex_function, ge.geometry_function, ge.fragment_function,
                                                         p->gs_vertex_size, p->gs_max_prims, desc->NumRenderTargets); }
-        if (!p->rps && p->gs_emu == 2) {   /* madeira-bcd: the placeholder below takes it */
+        if (!p->rps && p->gs_emu == 2) {   /* the placeholder below takes it */
             static unsigned said; if (said++ < 8) d3d12_log("[madeira-d3d12] DXIL tessellation pipeline: Metal refused it (vs '%s' ps '%s')\n", p->vs_name, p->ps_name);
             p->gs_emu = 0;
         } else if (!p->rps) { p->gs_emu = 0; d3d12_log("[madeira-d3d12] geometry pipeline: falling back to a plain vertex pipeline (geometry shader DROPPED)\n"); }
@@ -13302,7 +13443,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     if (!p->tg[0]) { p->tg[0] = 1; }
     if (!p->tg[1]) { p->tg[1] = 1; }
     if (!p->tg[2]) { p->tg[2] = 1; }
-    if (mad_pso_lazy_on()) {   /* madeira-bcd: built at the first dispatch (mad_cpso_realize) */
+    if (mad_pso_lazy_on()) {   /* built at its first dispatch (mad_cpso_realize) */
         p->lazy_cs = 1; p->device_handle = d->mtl_device;
         hr = pso_QI((ID3D12PipelineState *)p, riid, out);
         pso_Release((ID3D12PipelineState *)p);
@@ -13332,11 +13473,11 @@ static void mad_subresource(const struct mad_resource *r, UINT sub, UINT *level,
     UINT mips = r->desc.MipLevels ? r->desc.MipLevels : 1;
     *level = sub % mips; *slice = sub / mips;
 }
-/* madeira-bcd: D3D12 numbers a depth-stencil resource's STENCIL plane after
- * all of its depth subresources (sub = mip + slice*mips + plane*mips*layers).
- * Read as an array slice, subresource 1 of a one-layer D32S8 texture became
- * "slice 1" and the copy wrote past the texture, across its depth and stencil
- * memory -- Ghost of Tsushima's black squares and green blocks. */
+/* D3D12 numbers a depth-stencil resource's STENCIL plane after all of its
+ * depth subresources (sub = mip + slice * mips + plane * mips * layers). Read
+ * as an array slice, subresource 1 of a one-layer D32S8 texture became
+ * "slice 1" and a copy into it wrote past the texture, across its depth and
+ * stencil memory. */
 static void mad_subresource_plane(const struct mad_resource *r, UINT sub, UINT *level, UINT *slice, UINT *plane) {
     UINT mips = r->desc.MipLevels ? r->desc.MipLevels : 1;
     UINT layers = r->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (r->desc.DepthOrArraySize ? r->desc.DepthOrArraySize : 1);
@@ -13440,7 +13581,7 @@ static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstant(ID3D12GraphicsCom
 /* ml892: UAV clears for BUFFER views through the blit fill. The CPU handle
  * points at our descriptor entry, whose address+size name the range; the
  * resource is found by address. Metal fills bytes, so a value whose four
- * bytes are equal is exact. Texture UAV clears are not implemented yet.
+ * bytes are equal is exact. Texture UAV clears: mad_record_uav_tex_clear.
  *
  * ml1151: anything else used to be approximated by its low byte -- a clear to
  * 1 wrote 0x01010101 into every element (ph-valley09: UE 5.0 clears Nanite /
@@ -13448,8 +13589,8 @@ static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstant(ID3D12GraphicsCom
  * buffer holding it repeated, kept per device for the few distinct values a
  * title uses. D3D12 clears raw and structured views with Values[0] per dword,
  * which is also exact for the R32 typed views these clears target. */
-/* madeira-bcd: the buffer repeats a 16-byte period, so it also holds whole
- * 8- and 16-byte texels (an RGBA32 clear to (-1, 1e8, 0, 0) was skipped). */
+/* The buffer repeats a 16-byte period, so it also holds whole 8- and 16-byte
+ * texels for texture clears (an RGBA32 clear to (-1, 1e8, 0, 0)). */
 static obj_handle_t mad_fill_pattern16(struct mad_device *d, const UINT32 v[4]) {
     obj_handle_t buf = 0; unsigned i;
     AcquireSRWLockExclusive(&d->fillpat_lock);
@@ -13474,7 +13615,7 @@ static obj_handle_t mad_fill_pattern(struct mad_device *d, UINT32 v) {
     UINT32 k[4] = { v, v, v, v };
     return mad_fill_pattern16(d, k);
 }
-/* madeira-bcd: one texel of a UAV clear in the view's format. Uint clears
+/* One texel of a texture UAV clear in the view's format. Uint clears
  * copy each value's low bits into its channel (no conversion); float clears
  * convert. Returns the texel size, 0 for a format this does not pack. */
 static USHORT mad_f32_to_f16(float f) {
@@ -13579,13 +13720,12 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
     struct mad_uavtex u; unsigned char px[16]; UINT bpp, rbytes = 0, rblock = 0; UINT32 pat, w[4], per[4];
     obj_handle_t pattern; struct mad_cmd *c;
     {
-        /* madeira-bcd: a view we did not record, or one recorded for another
-         * resource (its id reused after a free, or an alias), used to be
-         * skipped -- a buffer the game clears every frame then kept stale data
-         * (Ghost of Tsushima: 4 such clears, blocky haze and dark specks near
-         * the bridge). The application names the resource: clear that, with
-         * the recorded view's sub-range when there is one, else the whole of a
-         * single-mip texture in its own format. */
+        /* A view we did not record, or one recorded for another resource
+         * (its id reused after a free, or an alias): the application names
+         * the resource, so clear that, with the recorded view's sub-range
+         * when there is one, else the whole of a single-mip texture in its own
+         * format. Skipping it left a texture the game clears every frame with
+         * stale data (Ghost of Tsushima: blocky haze and dark specks). */
         int known = mad_uavtex_get(view_id, &u) && u.res && u.res->texture;
         struct mad_resource *app = res && res->texture ? res : NULL;
         const char *why = NULL;
@@ -13641,7 +13781,7 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
     struct mad_cmd *c;
     static unsigned said_tex, said_approx;
     if (!e || !l) return;
-    if (!e->gpu_va) {   /* madeira-bcd: a texture view */
+    if (!e->gpu_va) {   /* a texture view */
         if (e->texture_view_id) mad_record_uav_tex_clear(l, e->texture_view_id, (struct mad_resource *)res, v, is_float, what);
         else if (said_tex++ < 2) d3d12_log("[madeira-d3d12] %s on a null view; skipped\n", what);
         return;
@@ -13990,6 +14130,36 @@ static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *
     }
     list_CopyBufferRegion(This, dst->pResource, 0, src->pResource, 0, s->size < d->size ? s->size : d->size);
 }
+/* A multisampled source resolves through a render pass (exec_resolve); a
+ * single-sampled one is a plain copy, which is what D3D12 does with it too.
+ * The format argument only matters for typeless resources, which are created
+ * here with a concrete Metal format already. */
+static void STDMETHODCALLTYPE list_ResolveSubresource(ID3D12GraphicsCommandList *This, ID3D12Resource *dst, UINT dst_sub,
+        ID3D12Resource *src, UINT src_sub, DXGI_FORMAT format) {
+    struct mad_list *l = (struct mad_list *)This;
+    struct mad_resource *d = (struct mad_resource *)dst, *s = (struct mad_resource *)src;
+    struct mad_cmd *c;
+    static unsigned said;
+    if (!d || !s || !d->texture || !s->texture) return;
+    if (said++ < 4)
+        d3d12_log("[madeira-d3d12] ResolveSubresource: %ux%u x%u samples, format %u -> %ux%u x%u, format %u (as %u)\n",
+                  (unsigned)s->width, (unsigned)s->height, (unsigned)s->samples, (unsigned)s->desc.Format,
+                  (unsigned)d->width, (unsigned)d->height, (unsigned)d->samples, (unsigned)d->desc.Format, (unsigned)format);
+    if (s->samples <= 1) {
+        D3D12_TEXTURE_COPY_LOCATION a, b;
+        memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
+        a.pResource = dst; a.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; a.SubresourceIndex = dst_sub;
+        b.pResource = src; b.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; b.SubresourceIndex = src_sub;
+        list_CopyTextureRegion(This, &a, 0, 0, 0, &b, NULL);
+        return;
+    }
+    c = mad_list_push(l, MC_RESOLVE);
+    if (!c) return;
+    mad_subresource(d, dst_sub, &c->u.tt.dlevel, &c->u.tt.dslice);
+    mad_subresource(s, src_sub, &c->u.tt.slevel, &c->u.tt.sslice);
+    c->u.tt.dst = d; c->u.tt.src = s;
+}
+
 static void STDMETHODCALLTYPE list_CopyResource(ID3D12GraphicsCommandList *This, ID3D12Resource *dst, ID3D12Resource *src) {
     struct mad_resource *d = (struct mad_resource *)dst, *s = (struct mad_resource *)src;
     if (!d || !s) return;
@@ -14051,39 +14221,34 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource3(ID3D12Device10 
     return device_CreateCommittedResource((ID3D12Device *)This, hp, hf, &d, D3D12_RESOURCE_STATE_COMMON, clear, riid, out);
 }
 
-/* ---- madeira-bcd: TILED RESOURCES (opt-in, d3d12-tiled-resources = 1) ----
- * GTA V Enhanced refuses the device (ERR_GFX_D3D_NOD3D12, "feature level
- * 12_0") after its CheckFeatureSupport survey, and that survey contradicts
- * 12_0 in two answers: OPTIONS.TiledResourcesTier 0 (12_0 requires Tier 2 on
- * Windows) and OPTIONS.MaxGPUVirtualAddressBitsPerResource 0 (while
- * GPU_VIRTUAL_ADDRESS_SUPPORT says 40), plus FORMAT_SUPPORT failing for the
- * R32G32B32 formats that every 11_0+ device has as vertex formats
- * (docs/gta5-d3d12-caps.md). With the key set:
+/* ---- TILED RESOURCES (opt-in, madeira.cfg d3d12-tiled-resources = 1) -----
+ * Feature level 12_0 requires TiledResourcesTier 2 on Windows. An engine that
+ * checks its feature-level survey for consistency (GTA V Enhanced, "feature
+ * level 12_0" in its ERR_GFX_D3D_NOD3D12 box) refuses a device that claims
+ * 12_0 but answers OPTIONS.TiledResourcesTier 0,
+ * OPTIONS.MaxGPUVirtualAddressBitsPerResource 0 (while
+ * GPU_VIRTUAL_ADDRESS_SUPPORT says 40) and fails FORMAT_SUPPORT for the
+ * R32G32B32 vertex formats. With the key set:
  *   - OPTIONS reports TiledResourcesTier 2 and 40 address bits per resource,
- *     FORMAT_SUPPORT gives R32G32B32_FLOAT/UINT/SINT IA_VERTEX_BUFFER (the
- *     only use Metal has for them: float3/uint3/int3 vertex attributes);
- *   - CreateReservedResource(1,2) create the resource FULLY BACKED, exactly
- *     as a committed resource in a DEFAULT heap, so every tile is "mapped" to
- *     memory of its own; d3d12-reserved-max-mb (default 1024) refuses larger
- *     ones with E_OUTOFMEMORY instead of running into jetsam;
- *   - GetResourceTiling answers D3D12's standard tiling (64 KB tiles,
- *     standard shapes, Tier 2 mip packing, per-slice packed mips);
- *   - UpdateTileMappings / CopyTileMappings are counted no-ops.
+ *     FORMAT_SUPPORT gives R32G32B32_FLOAT/UINT/SINT IA_VERTEX_BUFFER;
+ *   - CreateReservedResource(1,2) create the resource FULLY BACKED, exactly as
+ *     a committed resource in a DEFAULT heap, so every tile has memory of its
+ *     own; d3d12-reserved-max-mb (default 1024) refuses larger ones with
+ *     E_OUTOFMEMORY before anything is allocated;
+ *   - GetResourceTiling answers D3D12's standard tiling (64 KB tiles, standard
+ *     shapes, Tier 2 mip packing, per-slice packed mips);
+ *   - UpdateTileMappings / CopyTileMappings are no-ops.
  * Deviation from Tier 2: a tile the application never mapped reads what the
  * backing holds, not zeros, and writes to it are kept. Without the key every
- * method here behaves as before (the generated stubs, E_NOTIMPL / no-op), and
- * the answers above are unchanged.
- * Later: real residency could come from Metal sparse textures
- * (MTLHeapTypeSparse, 64 KB sparse pages, mapping updates on a resource state
- * encoder) or, closer to D3D12's heap + tile model, Metal 4 placement sparse
- * resources (iOS 26+), whose mapping operations take tiles of a placement
- * heap -- UpdateTileMappings would then become real. */
+ * method here is the generated stub and every answer above is unchanged.
+ * Real residency could later come from Metal sparse textures or Metal 4
+ * placement sparse resources, whose mappings take tiles of a heap. */
 static int g_tiled = -1;
 static UINT64 g_tiled_cap = 1024ull << 20;
 static int mad_tiled_on(void) {
     if (g_tiled < 0) {
         long long cap = mad_cfg_int_pe("d3d12-reserved-max-mb", 1024);   /* d3d12-tiled-resources: largest reserved resource backed in full, in MB (larger ones are refused with E_OUTOFMEMORY) */
-        int on = mad_cfg_int_pe("d3d12-tiled-resources", 0) ? 1 : 0;   /* opt-in: TiledResourcesTier 2, 40 VA bits per resource, R32G32B32 vertex formats, fully backed reserved resources (GTA V Enhanced's feature-level 12_0 check) */
+        int on = mad_cfg_int_pe("d3d12-tiled-resources", 0) ? 1 : 0;   /* opt-in: TiledResourcesTier 2, 40 VA bits per resource, R32G32B32 vertex formats, fully backed reserved resources */
         g_tiled_cap = (UINT64)(cap < 1 ? 1 : cap) << 20;
         if (on)
             d3d12_log("[d3d12-caps] madeira-bcd tiled-resources=1 (opt-in): TiledResourcesTier 2, MaxGPUVirtualAddressBitsPerResource 40, "
@@ -14816,6 +14981,7 @@ static void build_vtables(void) {
     g_list_vtbl.IASetPrimitiveTopology  = (void *)list_IASetPrimitiveTopology;
     g_list_vtbl.DrawInstanced           = (void *)list_DrawInstanced;
     g_list_vtbl.CopyTextureRegion       = (void *)list_CopyTextureRegion;
+    g_list_vtbl.ResolveSubresource      = (void *)list_ResolveSubresource;
     g_list_vtbl.IASetIndexBuffer        = (void *)list_IASetIndexBuffer;
     g_list_vtbl.DrawIndexedInstanced    = (void *)list_DrawIndexedInstanced;
     g_list_vtbl.ClearDepthStencilView   = (void *)list_ClearDepthStencilView;
@@ -14900,9 +15066,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     if (!d) return E_OUTOFMEMORY;
     d->vtbl = &g_device_vtbl; d->refs = 1; d->iid = &IID_ID3D12Device; d->name = "Device";
     g_last_device = d;
-    {   /* madeira-bcd: the adapter's LUID, for GetAdapterLuid. Engines match the
-         * device to its DXGI adapter by it (Nixxes ports); a zero LUID matches
-         * nothing. */
+    {   /* the adapter's LUID, for GetAdapterLuid */
         IDXGIAdapter *a = NULL;
         if (adapter && SUCCEEDED(IUnknown_QueryInterface(adapter, &IID_IDXGIAdapter, (void **)&a)) && a) {
             DXGI_ADAPTER_DESC desc;
@@ -14937,7 +15101,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     }
     if (devices) NSObject_release(devices);
     InitializeCriticalSection(&d->live_lock);
-    InitializeSRWLock(&d->list_lock);           /* madeira-bcd */
+    InitializeSRWLock(&d->list_lock);
     InitializeCriticalSection(&d->view_lock);   /* ml1049 */
     InitializeCriticalSection(&d->ring_lock);   /* ml1061 */
     InitializeCriticalSection(&d->vis_lock);    /* ml1088 */
@@ -15014,7 +15178,7 @@ struct mad_swapchain {
     UINT max_latency;
     HANDLE latency_event;
     UINT64 present_serial[8];   /* ml1070: GPU serial the frame presented N ago must have passed */
-    /* madeira-bcd: MetalFX spatial upscaling (madeira.cfg metalfx-upscale = factor) */
+    /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
 };
@@ -15029,31 +15193,22 @@ static void mad_swap_release_fx(struct mad_swapchain *s) {
     s->fx_w = s->fx_h = 0;
 }
 
-static void mad_swap_release_buffers(struct mad_swapchain *s) {
-    UINT i;
-    mad_swap_release_fx(s);
-    for (i = 0; i < s->nbuf; i++)
-        if (s->buffers[i]) { res_Release((ID3D12Resource *)s->buffers[i]); s->buffers[i] = NULL; }
-    s->nbuf = 0;
-}
-
-/* madeira-bcd: MetalFX spatial upscaling of the presented image. The game
- * renders at its own resolution (the virtual monitor size); Present scales the
- * back buffer by `metalfx-upscale` (madeira.cfg or the game's settings, 1.1-3)
- * with Apple's spatial scaler before the copy into the drawable, so a game run
- * at 960x540 or 1280x720 for frame rate reaches the panel sharpened instead of
- * bilinear-stretched by Core Animation. Everything here is optional: any
- * failure leaves the plain copy path. The scaler reads a 2D view of the back
- * buffer (they are 2D arrays, ml932) and writes a private 2D texture that the
- * present blit then copies. */
+/* MetalFX spatial upscaling. The game renders at its own resolution (the
+ * virtual monitor's size); Present scales the back buffer by `metalfx-upscale`
+ * (madeira.cfg or the game's own lines, 1.1-2) with Apple's spatial scaler
+ * before the copy into the drawable, so a game run at 960x540 or 1280x720 for
+ * frame rate reaches the panel sharpened instead of bilinear-stretched by Core
+ * Animation. Everything here is optional: any failure leaves the plain copy.
+ * The scaler reads a 2D view of the back buffer (they are 2D arrays, ml932)
+ * and writes a private 2D texture that the present blit then copies. */
 static void mad_swap_make_fx(struct mad_swapchain *s) {
-    char v[32]; double f = 0; UINT i, ow, oh;
+    char v[32]; double f; UINT i, ow, oh;
     struct WMTFXSpatialScalerInfo si; struct WMTTextureInfo ti; struct WMTTextureSwizzleChannels sw;
     static LONG said;
     if (!mad_cfg_str_pe("metalfx-upscale", v, sizeof v) || !v[0]) return;
     f = strtod(v, NULL);
     if (!(f >= 1.1)) return;
-    if (f > 3.0) f = 3.0;
+    if (f > 2.0) f = 2.0;   /* as DXMT's D3D11 MetalFX swapchain, which takes 1 to 2 */
     ow = ((UINT)(s->desc.Width * f + 0.5)) & ~1u;
     oh = ((UINT)(s->desc.Height * f + 0.5)) & ~1u;
     if (ow > 8192 || oh > 8192 || ow <= s->desc.Width) return;
@@ -15089,19 +15244,24 @@ static void mad_swap_make_fx(struct mad_swapchain *s) {
     d3d12_log("[madeira-d3d12] metalfx-upscale %s: %ux%u -> %ux%u (MetalFX spatial)\n", v, s->desc.Width, s->desc.Height, ow, oh);
 }
 
-/* madeira-bcd: in game mode every swapchain gets the SAME CAMetalLayer (the
- * fullscreen singleton, app/Madeira/IOSDisplayShim.m my_view_create_metal_view),
- * whatever its HWND. GTA V Enhanced's Social Club renderer creates a probe
- * device + swapchain on "RGSC D3D12 Temp Window" (124x73, format 28) right
- * after the intro videos and destroys it after 0 presents; its
+static void mad_swap_release_buffers(struct mad_swapchain *s) {
+    UINT i;
+    mad_swap_release_fx(s);
+    for (i = 0; i < s->nbuf; i++)
+        if (s->buffers[i]) { res_Release((ID3D12Resource *)s->buffers[i]); s->buffers[i] = NULL; }
+    s->nbuf = 0;
+}
+
+/* In game mode every swapchain gets the SAME CAMetalLayer (the fullscreen
+ * singleton, IOSDisplayShim.m my_view_create_metal_view), whatever its HWND.
+ * GTA V Enhanced's Social Club renderer creates a 124x73 probe swapchain on a
+ * temporary window after the intro videos and destroys it unpresented; its
  * mad_swap_make_buffers set the shared layer to a 124x73 drawable, and the
- * game's 1920x1080 swapchain kept presenting into it -- a 124x73 corner of the
- * frame (and the Metal HUD drawn at 124x73) stretched over the whole screen
- * (owner's screenshot + log PlayGTAV.exe 2026-10-02 15:30:20). The swapchain
- * that last configured a layer is remembered (pointer compare only, never
- * dereferenced); a Present on a swapchain whose layer was reconfigured by
- * another one applies its own drawable size / format again first. Distinct
- * layers (desktop mode) never trigger it. */
+ * game's 1920x1080 swapchain kept presenting into it (one corner of the frame
+ * stretched over the screen). The swapchain that last configured the layer is
+ * remembered (pointer compare only, never dereferenced); a Present on a
+ * swapchain whose layer another one reconfigured applies its own drawable
+ * size and format again first. Distinct layers (desktop mode) never trigger it. */
 static obj_handle_t g_layer_cfg_layer;
 static const void *g_layer_cfg_owner;
 static void mad_swap_apply_layer(struct mad_swapchain *s) {
@@ -15109,6 +15269,7 @@ static void mad_swap_apply_layer(struct mad_swapchain *s) {
     memset(&props, 0, sizeof props);
     MetalLayer_getProps(s->layer, &props);
     props.device = s->dev->mtl_device;
+    /* MetalFX upscaling: the drawable is the scaled size (fx_w x fx_h). */
     props.drawable_width = s->fx_w ? s->fx_w : s->desc.Width;
     props.drawable_height = s->fx_h ? s->fx_h : s->desc.Height;
     props.pixel_format = s->pf;
@@ -15146,7 +15307,7 @@ static HRESULT mad_swap_make_buffers(struct mad_swapchain *s) {
     }
     s->nbuf = n;
     s->index = 0;
-    mad_swap_make_fx(s);   /* madeira-bcd: optional MetalFX upscaling */
+    mad_swap_make_fx(s);   /* optional MetalFX upscaling: the drawable takes its output size */
     /* The layer takes the same pixel format so the presenting blit is a plain
      * copy. framebuffer_only must be off: a framebuffer-only drawable cannot
      * be a blit destination. */
@@ -15177,7 +15338,7 @@ static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
     if (n == 0) { mad_pd_purge(T);   /* ml1143 */
         if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1121: queued presents name this swapchain */
         mad_swap_release_buffers(s);
-        if (g_layer_cfg_owner == s) g_layer_cfg_owner = NULL;   /* madeira-bcd: the next Present re-applies its own layer settings */
+        if (g_layer_cfg_owner == s) g_layer_cfg_owner = NULL;   /* the next Present re-applies its own layer settings */
         if (s->view) ReleaseMetalView(s->view);
         if (s->latency_event) CloseHandle(s->latency_event);
         if (s->factory) IDXGIFactory1_Release(s->factory);
@@ -15376,9 +15537,9 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     if (cb && tex) {
         obj_handle_t copy_src = src->texture;
         UINT copy_w = src->width, copy_h = src->height;
-        if (s->fx_scaler && s->fx_out && s->fx_view[idx]) {   /* madeira-bcd: MetalFX spatial, then the copy below */
-            /* Under fence-chain 6 the scaler waits for the frame's batches on the
-             * device fence and updates it, so the blit's wait below orders after it. */
+        if (s->fx_scaler && s->fx_out && s->fx_view[idx]) {   /* MetalFX spatial, then the copy below */
+            /* After fence-chain 6 work the scaler waits for the frame's batches on
+             * the device fence and updates it, so the blit's wait below orders after it. */
             obj_handle_t ff = (g_f6_used && s->queue->device->enc_fence) ? s->queue->device->enc_fence : 0;
             MTLCommandBuffer_encodeSpatialScale(cb, s->fx_scaler, s->fx_view[idx], s->fx_out, ff);
             copy_src = s->fx_out; copy_w = s->fx_w; copy_h = s->fx_h;
@@ -15764,12 +15925,10 @@ __declspec(dllexport) void MadeiraD3D12PresenterPresent(void *ph, ID3D12CommandQ
     struct mad_presenter *p = (struct mad_presenter *)ph;
     struct mad_queue *q = (struct mad_queue *)queue;
     if (!p || !q || !p->drawable) return;
-    /* madeira-bcd: commit the frame's batch FIRST, as swap_Present does (ml884).
-     * Lists accumulate in the queue's open command buffer and are committed only
-     * at a flush or a fence Signal, so without this the present buffer below was
-     * committed ahead of the rendering it shows. On an iPhone 17 Pro Max the
-     * d3d12-cube test then showed a grey, strobing layer at 60 FPS: most frames
-     * presented a drawable nothing had drawn into yet. */
+    /* Commit the frame's batch first, as swap_Present does (ml884). Lists
+     * accumulate in the queue's open command buffer until a flush or a fence
+     * Signal, so the present buffer below was committed ahead of the rendering
+     * it shows: the d3d12-cube test showed a grey, strobing layer at 60 FPS. */
     mad_device_flush_all(q->device);
     /* Presentation rides its own command buffer, submitted after the frame's
      * work is already on the queue, so ordering comes from the queue itself. */
@@ -15789,16 +15948,16 @@ __declspec(dllexport) void MadeiraD3D12PresenterDestroy(void *ph) {
     free(p);
 }
 
-/* madeira-bcd: madeira.cfg d3d12-core-dll (default 0). Since the Agility SDK,
- * Windows' d3d12.dll is a loader and D3D12Core.dll the runtime exporting
- * D3D12SDKVersion; vkd3d-proton 2.9+ ships the same split because games
- * assume it, and some check D3D12Core's version. In a working Proton run GTA V
- * Enhanced loads d3d12core.dll right after D3D12.DLL (owner's PROTONLOG,
- * 2026-10-02). 1 loads build/d3d12core's DLL (version 618, every function
- * forwarded back here) as this DLL attaches, the way vkd3d-proton's import
- * does; a value above 1 is the version it reports instead (614, 616, ...). */
+/* madeira.cfg d3d12-core-dll (default 0). Since the Agility SDK, Windows'
+ * d3d12.dll is a loader and D3D12Core.dll the runtime that exports
+ * D3D12SDKVersion; vkd3d-proton 2.9+ ships the same split because games assume
+ * it, and some check D3D12Core's version (GTA V Enhanced loads d3d12core.dll
+ * right after D3D12.DLL under Proton). 1 loads d3d12core.dll (d3d12core.c:
+ * version 618, every function forwarded back here) as this DLL attaches, the way
+ * vkd3d-proton's import does; a value above 1 is the version it reports
+ * instead (614, 616, ...). */
 static void mad_load_d3d12core(void) {
-    long long v = mad_cfg_int_pe("d3d12-core-dll", 0);
+    long long v = mad_cfg_int_pe("d3d12-core-dll", 0);   /* 1: load d3d12core.dll (Agility SDK layout); >1: also its D3D12SDKVersion */
     HMODULE m; UINT *ver;
     if (v <= 0) return;
     m = LoadLibraryW(L"d3d12core.dll");

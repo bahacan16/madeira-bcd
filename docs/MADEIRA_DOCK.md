@@ -29,7 +29,7 @@ them.
 ## Source and licence
 
 - Source: the `madeira-dock` submodule
-  (`https://github.com/125hz/madeira-dock`, pinned at `0c5bbd1`), about 1,850 lines of
+  (`https://github.com/125hz/madeira-dock`, pinned at `e1bf62f`), about 1,850 lines of
   C. Copyright 2026 125hz, **GPL-3.0-or-later with the Madeira
   Converter Exception** (the owner open-sourced it on 2026-09-27; it used to
   be a closed executable).
@@ -47,6 +47,22 @@ them.
   unit tests. Without a built `dockhost.exe`, Madeira shows no Dock button.
 
 ## Using it
+
+Dock reads Steam's launch configuration before handing its sign-in to Valve's
+client. It selects the installed Windows game entry (default first, excluding
+DLC-only and tool entries) and preserves its original `config.launch` key, which
+need not be 0. Old caches without keys are fetched again. With missing metadata or
+no eligible installed entry (a launcher started through a `.bat`, say) it uses key
+0, as every Dock start did before; the host then stops at once if Steam names that
+entry missing, instead of waiting for configuration. The host receives that
+key in `MADEIRA_STEAM_HOST_LAUNCH_OPTION` and uses it for every LaunchApp retry.
+Its report exposes only numeric `launch-option-index`, `launch-option-invalid`
+and `launch-option-missing` fields; a confirmed missing entry ends the config
+wait. Rebuild the Dock host together with the app for this change.
+
+The Steam/Dock Swift and C sanitizer regressions passed, and a tester confirmed
+startup of a previously failing game on an M2 iPad using a rebuilt Debug IPA.
+This verifies startup for that device test, not extended gameplay coverage.
 
 The developer interface has a **Madeira Dock** button (when `dockhost.exe`
 is built; `env.MADEIRA_DOCK = 0` hides it). In the library the same sheet is
@@ -130,7 +146,9 @@ arguments are not supported.
    Wine's default (off).
 4. The session is the normal Wine session: `explorer.exe
    /desktop=madeira,<W>x<H> C:\windows\system32\dockhost.exe`. The size comes
-   from `desktop-size` in madeira.cfg, else 1280x720. When the game has
+   from `desktop-size` in madeira.cfg, else the device's own default size
+   (the library's default Resolution: 1408x648 on a 19.5:9 iPhone, 1152x800 on
+   an 11-inch iPad). When the game has
    one-time installs to run, it is `... C:\windows\system32\cmd.exe /c call
    C:\madeira-dock-installers.cmd & C:\windows\system32\dockhost.exe`: the
    installers first, then the host, in the same session.
@@ -160,6 +178,44 @@ arguments are not supported.
    (`launch-session-wait`, `launch-session-gave-up`). The sheet shows the wait;
    only Valve's own later success starts the game, and a session that is
    really playing elsewhere still fails with its own message.
+
+## Offline play
+
+Valve's client can sign an account in without a connection, with an offline logon
+ticket that Steam issues to it during an online sign-in and that the client stores
+itself (desktop Steam's Offline Mode). The Dock uses that mechanism as it is
+(`madeira-dock/docs/OFFLINE.md`); Madeira stores no ticket and decides nothing
+about ownership.
+
+- **Online starts are unchanged.** Once Valve's client has confirmed the game's
+  license, the host asks it whether the account can log on offline and reports the
+  answer (`session-offline-ready`). When it is 1, the app notes that the ACCOUNT can
+  sign in offline (`DockOffline`: one date for the account and the games started
+  online since, in the app's preferences; removed with the sign-in). Steam's offline
+  sign-in is per account: with it, Valve's client answers the license question for
+  any installed game from its cached list, started online before or not.
+- **A start with no network path** (`NWPathMonitor`) sets `MADEIRA_DOCK_OFFLINE=1`
+  for the host, which hands over the sign-in as usual, asks Valve's client whether
+  it can log on offline, and only then asks it to. The client answers the license
+  question from what it cached and starts the game through the same launch call.
+  A network that fails after the start falls back the same way 20 s in.
+- **Game details** shows a small line under the title for games the Dock starts:
+  "Can be played offline" (green check) once the account is saved; "Start a game
+  online to play offline" before that; and "Start once online to play offline" for
+  a game with per-user executables that has not started online yet (Steam prepares
+  those over the network on the first start). Tapping it explains. The mark is a
+  note of the last online start; whether an offline start goes ahead is always
+  Steam's decision at that moment, and Steam's offline sign-in expires on Steam's
+  own schedule.
+- A refusal ends the start with its own message: nothing saved to sign in offline
+  (50), offline sign-in refused (51), game not in what Steam saved (52).
+
+`[dock-offline]` logs the request and the save; `[dock-report] session-offline-*`
+carries the host's numbers. Steam Cloud cannot be checked without a connection, so
+the existing "could not be checked" question still appears before an offline start.
+Device-run once (2026-10-04, iPhone 18,3 / iOS 27.0, no network path): the offline
+request, Steam's offline sign-in, the license from its cache and the game's window
+8 s after the host started; the refusals and the fallback have not been exercised.
 
 ## Starting screen
 
@@ -312,6 +368,7 @@ never asks. The preparation is Valve's; Dock does not touch the files.
 | `MADEIRA_DOCK_CLIENT_202601` | on | read by the host: `0` disables its January 2026 client adapter |
 | `MADEIRA_DOCK_HANDOFF_DIAGNOSTICS` | on | read by the host: `0` drops its numeric transfer diagnostics |
 | `MADEIRA_DOCK_SESSION_WAIT` | on | read by the host: `0` fails a launch refused with 35 (another session playing) at once instead of asking again for up to three minutes |
+| `MADEIRA_DOCK_OFFLINE_LOGON` | on | `0`: no offline starts. The app never asks for one and hides the Game details mark; read by the host too, which then does not look up Valve's offline-logon methods |
 | `MADEIRA_DOCK_INSTALLERS` | on | `0`: no one-time installs (nothing read, run or shown) |
 | `MADEIRA_INSTALL_DEFAULT_KEY` | on | `0`: install-script entries without a `HasRunKey` are ignored |
 | `MADEIRA_DOCK_INSTALL_CHOICE` | on | `0`: no per-game choice; every start runs whatever is pending |

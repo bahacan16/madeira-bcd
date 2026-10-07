@@ -24,6 +24,7 @@ mapping = native[first:native.index('\n};', first) + 3]
 functions = ''.join(function(native, signature) for signature in (
     'void ios_jit_set_text_section(',
     'static int ios_jit_code_bounds(',
+    'static unsigned short ios_jit_mapping_machine(',   # upstream aa70ae1 moved the ml349 read here
     'void *ios_jit_translate_addr_for_owner(',
     'static int ios_va_is_x86_code(',
     'int ios_jit_guest_code_window(',
@@ -137,8 +138,14 @@ static int sync_slots(uint64_t *slots, size_t count, void *sync_owner)
     uint64_t *p = slots, *end_p = slots + count;
     int x86skip = 0, execskip = 0, fixup_count = 0, region_is_exec = 0;
     uint64_t x86_first = 0, exec_first = 0;
+    /* upstream ed332b6 (ml1199): the loop leaves file constants alone through a
+     * keep bitmap built before it; off here, as in a region without relocations. */
+    char *jit_rw_dest = (char *)slots;
+    int keep_ok = 0;
+    static unsigned char ios_sync_keep[1];
+    unsigned long keep_hits = 0;
 ''' + loop + r'''
-    (void)x86_first; (void)exec_first;
+    (void)x86_first; (void)exec_first; (void)keep_hits; (void)jit_rw_dest;
     return fixup_count;
 }
 static void map(unsigned i, void *pe, void *copy, void *owner, unsigned machine)

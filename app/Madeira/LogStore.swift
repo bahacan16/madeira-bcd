@@ -146,9 +146,10 @@ final class LogStore: ObservableObject {
     ///
     /// A hard link, not a copy: Wine, wineserver and the app all append to
     /// madeira-log.txt through their own descriptors right up to a crash, and
-    /// both names see every line. The next launch rotates madeira-log.txt to a
-    /// new file, which leaves this name holding the finished run. Keeps the
-    /// newest `keep` runs.
+    /// both names see every line. The next app launch rotates madeira-log.txt
+    /// to a new file, which leaves this name holding the finished run. Keeps
+    /// the newest `keep` runs. A Steam game started through Madeira Dock is
+    /// named by ntdll instead (process_ios.c, madeira_steam_session_log).
     func startSessionLog(program: String, keep: Int = 40) {
         let fm = FileManager.default
         let dir = logFileURL.deletingLastPathComponent().appendingPathComponent("logs")
@@ -173,6 +174,8 @@ final class LogStore: ObservableObject {
         for old in runs.dropFirst(keep) { try? fm.removeItem(at: old) }
     }
 
+    /// Once Wine points stderr at madeira-log.txt, the app's own log lines are
+    /// written through stderr too (appendToFile); 0 keeps a per-call file handle.
     private static let viaStderr = MadeiraConfig.flag("MADEIRA_LOG_VIA_STDERR")
 
     /// Is fd 2 the log file itself (same device and inode)?

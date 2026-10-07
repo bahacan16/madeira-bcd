@@ -21,6 +21,12 @@ marker = "madeira-bcd: NVAPI entry points"
 if marker in src:
     print("already patched")
     sys.exit(0)
+# willfaust/dxmt#11 (37ec901, dxmt db546ee): these entry points are upstream
+# (FindDevice instead of madeira_gpu_exists). Adding them again would define
+# every function twice and repeat its QueryInterface case.
+if "FindDevice(uint64_t registry_id)" in src and "NvAPI_GetLogicalGPUFromPhysicalGPU(" in src:
+    print("NVAPI entry points are upstream (willfaust/dxmt#11); nothing to do")
+    sys.exit(0)
 
 funcs = r'''
 /* madeira-bcd: NVAPI entry points Nixxes ports call (tools/patch-dxmt-nvapi.py). */

@@ -57,6 +57,10 @@ def main():
     if MARKER in s:
         print("winemetal_unix.c: buffer->texture aspect option already present")
         return 0
+    if "b2t_plane_option(" in s:
+        # willfaust/dxmt#4 (45ce600), which also validates the option value
+        print("winemetal_unix.c: buffer->texture aspect option is upstream (willfaust/dxmt#4); nothing to do")
+        return 0
     if s.count(OLD) != 1:
         print(f"::error::{PATH}: buffer->texture blit anchor not found once -- dxmt moved, review this patch")
         return 1

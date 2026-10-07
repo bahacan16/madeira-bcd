@@ -23,6 +23,7 @@ reused (the committed 64-bit PE d3d11.dll keeps its own version).
 Idempotent; fails by name if an anchor moves. Run from the repository root.
 """
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path("dxmt/src")
@@ -143,7 +144,10 @@ edit("airconv/dxbc_signature.cpp", [
           if (ctx.ia_layout) {"""),
 ])
 
-edit("dxmt/dxmt_shader_cache.hpp", [
-    ("constexpr int kDXMTShaderCacheVersion = 15;",
-     "constexpr int kDXMTShaderCacheVersion = 16; /* madeira-bcd: vertex fetch bounds */"),
-])
+# One past the pin's own version, whatever it is: 15 -> 16 on dxmt a5e0cd3,
+# 16 -> 17 on db546ee (willfaust/dxmt#8 took 16 for its bounds checks).
+_cache = (ROOT / "dxmt/dxmt_shader_cache.hpp").read_text()
+_m = re.search(r"constexpr int kDXMTShaderCacheVersion = (\d+);\n", _cache)
+_old = _m.group(0)[:-1] if _m else "constexpr int kDXMTShaderCacheVersion = <pin's own version>;"
+_new = "constexpr int kDXMTShaderCacheVersion = %d; /* madeira-bcd: vertex fetch bounds */" % (int(_m.group(1)) + 1 if _m else 0)
+edit("dxmt/dxmt_shader_cache.hpp", [(_old, _new)])

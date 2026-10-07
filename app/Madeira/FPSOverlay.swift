@@ -11,7 +11,8 @@ import os
 /// The tick itself does nothing.
 ///
 /// Default (as on main): armed only outside the 60 and 30 caps, i.e. for
-/// MAX and RAW, where the game is meant to run above 60.
+/// MAX and RAW, where the game is meant to run above 60, and for the 40 cap,
+/// whose 25ms spacing needs the 120Hz grid (at 60Hz it would land on 33.3ms).
 ///
 /// Opt-in `env.MADEIRA_PROMOTE = 1` (Settings > Display > Hold the display
 /// at its maximum rate) also arms it in the 60 cap. The panel rate is the
@@ -42,6 +43,21 @@ final class ProMotionIntent {
         return madeira_dxmt_has_display_pacing() != 0
     }()
 
+    /// Whether the 40 FPS cap (vsync mode 4) is offered: DXMT must have it
+    /// (madeira_dxmt_has_40_cap; without it mode 4 would present uncapped) and
+    /// the panel must reach 120 Hz, because 25 ms is three refreshes at 120 Hz
+    /// but rounds to 33 ms at 60 Hz. maxHz(for:) holds the panel at its maximum
+    /// while it runs.
+    static var has40Cap: Bool { madeira_dxmt_has_40_cap() != 0 && panelMaxFPS >= 120 }
+
+    /// The pacing mode a saved FPS limit runs as: 30 and 40 run as 60 when
+    /// they are not offered.
+    static func supportedMode(_ mode: Int) -> Int32 {
+        if mode == 3 && !has30Cap { return 1 }
+        if mode == 4 && !has40Cap { return 1 }
+        return Int32(mode)
+    }
+
     /// `maxHz` 0 means "tear it down".
     func setActive(_ active: Bool, maxHz: Int = ProMotionIntent.panelMaxFPS) {
         let want = Float(max(maxHz, 0))
@@ -70,7 +86,7 @@ final class ProMotionIntent {
     static func maxHz(for mode: Int32) -> Int {
         if mode == 3 { return holdMaximum ? min(60, panelMaxFPS) : 0 }   // 30 cap
         if mode == 1 { return holdMaximum ? panelMaxFPS : 0 }            // 60 cap
-        return panelMaxFPS                                                // MAX, RAW
+        return panelMaxFPS                                                // MAX, RAW, 40 cap
     }
 
     /// Arms or releases the link for `mode` and publishes the rates to DXMT.
@@ -107,7 +123,8 @@ struct FPSOverlay: View {
     /// 1 = locked 60, 0 = display max (120 ProMotion), 2 = raw (frame-skip
     /// mailbox — game unthrottled, panel shows ≤ display rate), 3 = locked 30
     /// (added 2026-09-15, same afterMinimumDuration mechanism as 60 — see
-    /// winemetal_unix.c's _MTLCommandBuffer_presentDrawable).
+    /// winemetal_unix.c's _MTLCommandBuffer_presentDrawable), 4 = locked 40
+    /// (willfaust/dxmt#14; offered on 120Hz panels only).
     @State private var vsyncMode: Int32 = 1
     /// Ring buffer of (timestamp, count) pairs, 100ms cadence, 5s window.
     @State private var samples: [(t: CFAbsoluteTime, c: UInt64)] = []
@@ -226,7 +243,7 @@ struct FPSOverlay: View {
         .onDisappear { stopTimers() }
     }
 
-    /// Pacing pill, cycles 60 → MAX(n) → RAW → 30 → 60. Shared by the wide
+    /// Pacing pill, cycles 60 → MAX(n) → RAW → 30 → 40 → 60. Shared by the wide
     /// (portrait) and compact (landscape bar) overlay variants.
     ///   60: presents paced to exactly 60Hz.
     ///   MAX(n): free-run to display refresh; n = current cap
@@ -238,6 +255,8 @@ struct FPSOverlay: View {
     ///     rather than reordering the existing three so a saved/expected
     ///     cycle position never silently changes meaning. Offered only when
     ///     DXMT has the 30 cap (ProMotionIntent.has30Cap); else RAW → 60.
+    ///   40: presents paced to 40Hz on a 120Hz panel, offered only when DXMT
+    ///     has the 40 cap (ProMotionIntent.has40Cap).
     private var pacingPill: some View {
         Text(pillLabel)
             .foregroundColor(pillColor)
@@ -280,8 +299,8 @@ struct FPSOverlay: View {
         switch mode {
         case 1: return 0    // 60 -> MAX
         case 0: return 2    // MAX -> RAW
-        case 2: return ProMotionIntent.has30Cap ? 3 : 1   // RAW -> 30 (when DXMT has it) or 60
-        case 3: return 4    // madeira-bcd: 30 -> 40 (tools/patch-dxmt-frame-limits.py)
+        case 2: return ProMotionIntent.has30Cap ? 3 : ProMotionIntent.has40Cap ? 4 : 1   // RAW -> 30, 40 or 60
+        case 3: return ProMotionIntent.has40Cap ? 4 : 1   // 30 -> 40 (when offered) or 60
         default: return 1   // 40 -> 60
         }
     }

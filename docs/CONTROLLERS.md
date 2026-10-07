@@ -37,11 +37,26 @@ connected identity. UIKit handles independent fingers and cancellation, so
 releasing one of two controls mapped to the same button leaves the other held.
 The pinch recognizer is enabled only during editing.
 
+Once the touch pad has connected, the Session menu (including opening the
+software keyboard) and control editor keep that identity connected with neutral
+input. Late touches are ignored while gameplay controls are suppressed; closing
+the menu accepts fresh input without an XInput disconnect/reconnect. This does
+not connect a pad early while the game is loading. Actually hiding or removing
+all controller mappings still disconnects it, unless the session reservation
+described below is enabled.
+
 Touch and physical buttons combine; triggers use the larger value. A physical
 stick outside its standard XInput dead zone takes priority over touch on that
 stick. Otherwise a deflected touch stick takes priority; resting touch preserves
 the physical value. Touch updates are event-driven and require no polling timer.
 Keyboard/mouse mappings and the existing layout format are retained.
+
+While such a layout shows at least one controller mapping, a touch on the game
+view that misses every control is not sent to the program as a mouse. Some
+games (Dark Souls Remastered) switch to keyboard and mouse prompts on any mouse
+event and then ignore the controller. Touch used as a
+trackpad and a hardware mouse are not affected. `env.MADEIRA_TOUCH_MOUSE = 1`
+always sends such touches, as before; `0` never does.
 
 ## Layouts
 
@@ -112,6 +127,196 @@ physical input takes it over. Hiding the controls or disconnecting the pad then
 leaves player 1 connected at rest until the app exits. Without the switch,
 slot 0 connects only when a real source appears, as before.
 
+## A controller as keyboard and mouse
+
+For a game without controller support (or with it switched off), Game details
+and the in-game Session menu offer **Controller: Keyboard and mouse**. Steam
+Input does this for desktop players; Madeira Dock runs Valve's client headless,
+so Madeira does it itself (`PadKeyboardMouse.swift`). The default, **Game's own
+support**, is XInput as before.
+
+In keyboard-and-mouse mode the physical pad is not published to XInput at all
+(the game sees no controller; touch controller mappings still connect player 1),
+and every pad input becomes what the touch controls already produce, through
+the same posting paths:
+
+| Pad input | Default |
+| --- | --- |
+| Left stick | WASD (the same eight sectors as a touch key stick) |
+| Right stick | Mouse motion (the pointer settings' relative sensitivity) |
+| RT / LT | Left / right mouse button (half press) |
+| D-pad | Arrow keys |
+| A, B, X, Y | Space, Ctrl, E, R |
+| LB, RB, L3, R3 | Q, F, Shift, C |
+| Start, Select | Escape, Tab |
+
+The game's **Controller binds** page (the Session menu while the mode is on, and
+Game details) lists every input with a menu of what it does: a mouse button, a
+key, Show keyboard or Nothing; the sticks choose between WASD, the arrow keys
+and (right stick) the mouse. Rows the player has not changed show the layout's
+or the template's action and are not stored; "Default" in a row's menu and
+the page's Reset clear them. The table is saved with the game
+(`LibraryEntry.controllerBinds`) and the driver takes each change at once.
+While the right stick is the mouse, the page also has its **Vertical speed**
+(`LibraryEntry.padMouseVertical`, 25–150 % of the horizontal speed): games
+scale the camera's pitch and yaw differently from a mouse, and a stick cannot
+be compensated by hand the way a wrist does.
+
+The Controller picker's second choice, **XInput and DirectInput**, is for games
+older than XInput: it exports `MADEIRA_DINPUT_PAD=1` for that launch only (the
+DirectInput device below), since a game reading both APIs may list two
+controllers. The game's choice wins over `env.MADEIRA_DINPUT_PAD` in madeira.cfg
+and is cleared when the session ends (ml1240); the cfg value still applies to
+games left on the other choices. Chosen from the Session menu, it takes effect at
+the next launch.
+
+A layout can also bind an input: in the control editor, a touch control with
+a key or mouse action has a **Controller button for this action** row, and a
+key stick (WASD or Arrows) can name LS or RS. The named input then does what
+that control does (`TouchControl.padBinding`, an optional field, so older
+layouts load unchanged); a key stick bound to RS takes the right stick away from
+the mouse. The bindings follow the layout on screen and are rebuilt when it
+changes. The choice is saved with the game. While the Session menu is open, or
+when the app resigns active, everything the mode holds is released.
+
+`MADEIRA_PAD_KBM=0` removes the choice; `[pad-kbm]` logs the mode switching on
+and off and its releases.
+
+## Player 1 as a HID controller (DualSense, DirectInput)
+
+XInput stays the default and is unchanged. A game can instead see player 1 as
+what it is, a HID game controller, the way CrossOver shows a DualSense on a
+Mac: `env.MADEIRA_PAD_MODE = hid` in madeira.cfg (Settings > All settings >
+Controllers > Controller API). `dualsense` or `generic` force the identity.
+
+The mode is read once, when the Wine session starts (`GamepadInput.beginPadSession`
+exports `MADEIRA_HIDPAD` before the wineserver starts): the device must exist
+before the game enumerates, and a launch runs one Wine session, so a change
+applies at the next start.
+
+What the game gets, with `hid`:
+
+- A PlayStation pad as player 1 (or no pad paired yet): a wired **DualSense**,
+  Sony 054C:0CE6, USB interface 3 (`\\?\HID#VID_054C&PID_0CE6&MI_03#...`),
+  "Sony Interactive Entertainment" / "DualSense Wireless Controller", with the
+  controller's own 273-byte report descriptor (CFI-ZCT1W, byte-identical to
+  the dump in github.com/nondebug/dualsense). Input report 0x01 (64 bytes) and
+  output report 0x02 (48 bytes) follow Linux hid-playstation.c and SDL's
+  SDL_hidapi_ps5.c; feature reports 0x05 (calibration: 16 units per deg/s,
+  8192 per g), 0x09 (pairing address) and 0x20 (firmware 0x0224) answer, the
+  others read as zeros. Sony's libScePad (God of War, other Sony PC ports)
+  and SDL's HIDAPI driver see a PS5 pad; DirectInput shows it as Windows does
+  (X/Y left stick, Z/Rz right stick, Rx/Ry the triggers, a hat, 15 buttons).
+- Any other pad: a **generic HID gamepad**, pid.codes 1209:4D47, with the
+  object set of the opt-in DirectInput pad below: X/Y and Rx/Ry sticks, Z =
+  LT - RT, an 8-way hat, buttons A B X Y LB RB Back Start L3 R3 Guide.
+
+Readers: hid.dll and setupapi (HidD_*/HidP_*, ReadFile/WriteFile, feature
+reports), DirectInput 8 through Wine's HID joystick, windows.gaming.input's
+raw game controllers, and the raw input device list. Not yet: WM_INPUT for
+the pad (no raw input reports are generated).
+
+XInput in HID mode: player 1 leaves XInput, as a DualSense on Windows is not
+an XInput pad (without Steam Input), so a game that reads both APIs -- God of
+War reads XInput and libScePad -- sees one controller, not two; players 2-4
+stay XInput. Wine's xinput only adopts WINEXINPUT devices, never this one.
+`env.MADEIRA_HIDPAD_XINPUT = 1` keeps player 1 on XInput too (two views of
+one pad). In XInput mode there is no HID device at all: no device object, no
+registry entry.
+
+With the per-game **Controller** choice (Game details and the Session menu,
+above), HID mode is the madeira.cfg setting the picker builds on, for every
+game:
+
+- **Game's own support**: player 1 is the HID controller, as configured.
+- **XInput and DirectInput**: nothing extra. DirectInput already lists the HID
+  controller through Wine's HID joystick, and the opt-in "Madeira Gamepad"
+  (`MADEIRA_DINPUT_PAD`, below) reads XInput slot 0, which player 1 has left,
+  so it stays hidden and the game sees one controller. With
+  `env.MADEIRA_HIDPAD_XINPUT = 1` it would list both.
+- **Keyboard and mouse**: the physical pad presses keys and moves the mouse as
+  above. The HID controller still exists (it is created at session start) but
+  gets none of the pad's input: it reports a pad at rest, or the touch
+  controller when that connects player 1, as XInput does in this mode.
+
+Mapping (from the same sample as XInput, touch merge included): cross/circle/
+square/triangle = A/B/X/Y, L1/R1, L2/R2 analogue plus their digital bits above
+25/255, Create = buttonOptions, Options = buttonMenu, L3/R3, PS = buttonHome
+(when iOS does not keep it for itself; the same as XInput's Guide), touchpad
+click from GCDualSenseGamepad/GCDualShockGamepad. GameController exposes no
+microphone (mute) button, so that bit never sets. Battery level and charging
+come from GCDeviceBattery once a second. Sensors report the pad lying flat,
+the touchpad reports no finger.
+
+Output (ml2106/ml2107): the game's output reports (0x02 over WriteFile or
+IOCTL_HID_SET_OUTPUT_REPORT) are decoded in the wineserver and applied to
+player 1's pad by `app/Madeira/PadOutput.m`: the rumble pair through
+CoreHaptics on the left and right handle, each trigger effect as the closest
+`GCDualSenseAdaptiveTrigger` mode (`Winios/WiniosPadEffects.h`), the light bar
+through `GCDeviceLight`, the player LEDs through `playerIndex`. All three
+rumble flags count (Linux's compatible vibration and haptics select, and the
+firmware-2.24 "improved rumble" flag libScePad and SDL use), as does the motor
+power reduction byte. When the game closes its last handle the motors stop
+and the triggers are released; while the app is inactive the motors stop and
+the triggers go off. `env.MADEIRA_PAD_OUTPUT = 0` keeps the pad as it is.
+
+What iOS allows at all: an app never sees the DualSense's HID reports, its
+USB interfaces or its audio channels; it gets GameController's view only --
+GCDualSenseGamepad state, GCDualSenseAdaptiveTrigger modes (off, feedback,
+weapon, vibration, and the positional variants), GCDeviceLight (light bar
+colour), GCController.playerIndex (four fixed player-LED patterns), GCMotion,
+and CoreHaptics engines from GCDeviceHaptics. So the output side is mapped
+best effort: the classic rumble pair to CoreHaptics intensities, a game's
+trigger effect to the closest Apple trigger mode (bow becomes weapon,
+galloping and machine become vibration), the light bar colour to
+GCDeviceLight. Not reproducible on iOS: the DualSense's audio-driven
+("advanced") haptics -- PC games send those as a sound stream to the pad's
+USB audio interface, which this virtual device does not have, so such games
+fall back to the rumble pair -- the speaker, headset and microphone, the
+microphone LED, arbitrary player-LED patterns, light bar brightness/fade
+settings. CoreHaptics on a game controller only takes plain pattern players
+(the advanced player breaks the engine's connection to gamecontrollerd), so
+each handle plays one continuous event (30 s long) whose intensity follows the
+motor. The event is restarted on the first change of level after 25 s, so a
+level held unchanged for over 30 s goes quiet until the game changes it; there
+is no timer that re-arms it, which after a crash would keep the pad buzzing. A
+failed engine set-up backs off and retries.
+
+Why the wineserver serves it: on desktop Wine a pad reaches hid.dll through
+plugplay/winedevice loading winebus.sys, winehid, hidclass and hidparse. A
+Madeira session runs no winedevice (winebus, winehid and PlugPlay are disabled
+in the prefix template) and ships no .sys file, so
+`build/wineserver/hidpad_ios.c` creates `\Device\MadeiraHidPad0` and its
+`\??\HID#...` link and answers reads, writes and ioctls with hidclass's
+contract, as the server already does for ConDrv and named pipes. The preparsed
+data comes from Wine's own hidparse.sys parser compiled into the wineserver
+(`build/hidpad/hidparse_ios.c`), so it is exactly what the shipped hid.dll
+expects. `build/ntdll-unix/server_ios.c` writes the volatile registry entries
+setupapi lists (Enum\HID\..., DeviceClasses\{4d1e55b2-...}\##?#HID#...),
+level by level and only for the link that exists. Reports are built on
+demand from the newest sample: a read completes when the handle had no report
+for 4 ms (a wired DualSense's rate) or a new sample is 1 ms old; a 4 ms timer
+runs only while a read is pending. hid.dll, setupapi and dinput are the
+shipped builtins, unchanged.
+
+Logs: `[hid-pad] ml2100 session mode=... kind=...` (app), `[hid-pad] ml2101
+device dualsense 054c:0ce6 ...` (wineserver), `[hid-pad] ml2102 ... registered
+(4/4 keys)` (first Wine process), then `ml2101 open #n`, `first input report`,
+`feature report 0x.. read`, `[hidpad-out] ml2106 #n via write|ioctl ...`
+(the decoded output report; then a tally at 100, 1000, ... reports), `ml2104
+... refused` and `unsupported ioctl` (each limited to a few lines); the app
+logs what it applied as `[hidpad-out] ml2107 ...` (`haptics ready on ...`,
+`slot n rumble`, `L2:`/`R2:` trigger modes, `lightbar`).
+
+`tests/host/check-hidpad.py` (needs the wine submodule or `WINE_SRC`)
+runs both descriptors through Wine's hidparse.sys and hid.dll and checks every
+report field, the feature and output reports, the snapshot transport, and the
+registry entries against a fake registry with Wine 11's rules.
+`tests/host/check-pad-output.py` runs the output decoder (USB and Bluetooth
+reports, CRC), the trigger-effect mapping against a transcription of Nielk1's
+TriggerEffectGenerator, the rumble levels and player LEDs, and checks the
+PadOutput/Xcode/GamepadInput/win32u wiring.
+
 ## Audio route with wired controllers
 
 Some controllers enumerate as a USB audio output when wired. iOS then routes all
@@ -136,6 +341,9 @@ user sees are opt-in (only `1` enables); the others are on unless set to `0`:
 | `MADEIRA_CONTROLS_EDITOR_DONE` | on | `0`: the checkmark and show/hide glyph while editing |
 | `MADEIRA_CONTROLS_XBOX_DEFAULT` | **off** | `1`: a user with no controls file gets the built-in once |
 | `MADEIRA_PAD_EARLY_SLOT` | **off** | `1`: player 1 is reserved at session start (see above) |
+| `MADEIRA_PAD_MODE` | XInput | `hid` / `dualsense` / `generic`: player 1 as a HID controller (see above) |
+| `MADEIRA_HIDPAD_XINPUT` | **off** | `1`: in HID mode, player 1 stays an XInput pad as well |
+| `MADEIRA_PAD_OUTPUT` | on | `0`: no rumble/trigger/lightbar output to the pad; `hid` / `xinput`: only that half |
 
 `[controls-layout] ml1970` logs layout loads, saves, creation and deletion
 (never layout names); `[xinput] ml1990` logs the session slot reservation.
@@ -148,9 +356,28 @@ query. It is hidden unless `env.MADEIRA_DINPUT_PAD = 1` is in madeira.cfg
 otherwise see two controllers. `MADEIRA_DINPUT_TRACE=1` adds a rate-limited
 state trace.
 
-Vibration, battery telemetry, controller-driven navigation of the app itself,
-binding physical buttons to keyboard/mouse controls, shaped (non-round) controls,
-a layout-wide size slider and a movable top bar remain outside this contribution.
+XInput vibration (ml2106): XInputSetState's two motors play on the pad in
+that slot through CoreHaptics, and XInputGetCapabilities reports motors, when
+`MADEIRA_PAD_OUTPUT` allows it. It needs the companion Wine xinput change
+(XInputSetState, XInputEnable and process detach forward the motors through
+`NtUserGamepadOp_SetVibration`) and rebuilt xinput1_1-1_4 DLLs; with the
+current prebuilt xinput the motors are not forwarded.
+
+Battery telemetry, controller-driven navigation of the app itself,
+shaped (non-round) controls, a layout-wide size slider and a movable top bar
+remain outside this contribution. Binding physical buttons to keyboard/mouse
+controls is the keyboard-and-mouse mode above.
+
+## Foreground window
+
+Nothing on iOS activates a window, so a game whose windows are shown with
+`SWP_NOACTIVATE` is never the foreground window. A game that ignores input
+unless `GetForegroundWindow()` is its own window (Dark Souls Remastered) then
+reads the controller and drops it. While a process polls XInput and the
+foreground window is not one of its own, win32u makes the process's largest
+top-level window foreground and active, checking at most once a second; a
+window of the same process already in front is left alone. `[fg]` logs the first
+activations. `env.MADEIRA_FOREGROUND_FIX = 0` turns this off.
 
 ## Integration prerequisite
 
@@ -173,6 +400,8 @@ Run on a POSIX host with a C compiler and Swift installed:
 python3 tests/host/check-gamepad.py
 python3 tests/host/check-touch-gamepad.py
 python3 tests/host/check-control-presets.py
+python3 tests/host/check-hidpad.py      # needs the wine submodule or WINE_SRC
+python3 tests/host/check-pad-output.py
 ```
 
 The first compiles production snapshot/query code and checks packets, ranges,

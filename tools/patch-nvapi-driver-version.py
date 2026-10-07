@@ -20,6 +20,9 @@ marker = "madeira-bcd: NVIDIA driver 581.57"
 if marker in src:
     print("already patched")
     sys.exit(0)
+if "kDriverVersion = 58157;" in src and 'kDriverBranch = "r580_00";' in src:   # willfaust/dxmt#11
+    print("NVIDIA driver 581.57 / r580_00 is upstream (willfaust/dxmt#11); nothing to do")
+    sys.exit(0)
 
 for old, new, n in (
     ('std::string build_str = std::format("r{}_000", NVAPI_SDK_VERSION);',

@@ -28,6 +28,12 @@ marker = "madeira-bcd: no implicit TLS for IRCapRIP"
 if marker in src:
     print("already patched")
     sys.exit(0)
+# willfaust/FEX#7 (307fb4f, FEX 3bec2ac): upstream drops the WOW64-only
+# condition itself ("Not thread_local in either Windows module").
+if ("#if defined(FEX_IOS_HOST) && defined(_WIN32)\n// Not thread_local in either Windows module" in src
+        and "std::atomic<uint64_t> IRCapRIP" in src):
+    print("PassManager.cpp: IRCapRIP is already a process-wide atomic upstream (willfaust/FEX#7); nothing to do")
+    sys.exit(0)
 
 old = "#if defined(FEX_IOS_HOST) && defined(_WIN32) && !defined(ARCHITECTURE_arm64ec)\n// Not thread_local in the WOW64 module"
 if src.count(old) != 1:
