@@ -1217,6 +1217,7 @@ struct SteamEntrySection: View {
                         Text("Run at next start").tag(true)
                         Text("Skip").tag(false)
                     }.pickerStyle(.menu)
+                    DockInstallRequestRows(dock: dock, appID: appID, name: entry.title)
                 }
             }
             if let download {

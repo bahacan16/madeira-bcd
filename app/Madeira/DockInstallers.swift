@@ -179,17 +179,58 @@ enum SteamInstallScripts {
         return (lines.joined(separator: "\n"), changed)
     }
 
+    /// The .reg text without the runs' values (both views), and how many lines were removed.
+    /// Only the value named after each entry goes; the key and its other values stay.
+    static func unmark(_ runs: [SteamInstallRun], in text: String) -> (text: String, removed: Int) {
+        var lines = text.components(separatedBy: "\n")
+        var removed = 0
+        for run in runs {
+            let valueName = ("\"" + escape(run.name) + "\"=").lowercased()
+            for key in keys(run) {
+                let header = ("[" + escape(key) + "]").lowercased()
+                guard let start = lines.firstIndex(where: { $0.lowercased().hasPrefix(header) }) else { continue }
+                var index = start + 1
+                while index < lines.count, !lines[index].hasPrefix("[") {
+                    if lines[index].lowercased().hasPrefix(valueName) { lines.remove(at: index); removed += 1 } else { index += 1 }
+                }
+            }
+        }
+        return (lines.joined(separator: "\n"), removed)
+    }
+
     /// Records the runs in the prefix's system.reg and user.reg (a .madeira-bak copy is kept
     /// once). Returns the number of values written. Only while no session runs.
     @discardableResult
     static func mark(_ runs: [SteamInstallRun], prefix: URL) throws -> Int {
+        let now = Int(Date().timeIntervalSince1970)
+        return try rewrite(runs, prefix: prefix) { selected, text in
+            let result = mark(selected, in: text, now: now)
+            return (result.text, result.changed)
+        }
+    }
+
+    /// Removes the runs' records from the prefix's system.reg and user.reg (the same
+    /// .madeira-bak copy is kept once). Returns the number of values removed. Only while no
+    /// session runs.
+    @discardableResult
+    static func unmark(_ runs: [SteamInstallRun], prefix: URL) throws -> Int {
+        try rewrite(runs, prefix: prefix) { selected, text in
+            let result = unmark(selected, in: text)
+            return (result.text, result.removed)
+        }
+    }
+
+    /// Applies `change` (new text, values changed) to each hive file that holds some of the
+    /// runs and writes the files it changed. Returns the total of values changed.
+    private static func rewrite(_ runs: [SteamInstallRun], prefix: URL,
+                                _ change: ([SteamInstallRun], String) -> (String, Int)) throws -> Int {
         var total = 0
         for (hive, file) in [(SteamInstallRun.Hive.machine, "system.reg"), (.user, "user.reg")] {
             let selected = runs.filter { $0.hive == hive }
             guard !selected.isEmpty else { continue }
             let registry = prefix.appendingPathComponent(file)
             guard let contents = try? Data(contentsOf: registry), !contents.isEmpty else { continue }   // a prefix not seeded yet
-            let (updated, changed) = mark(selected, in: String(decoding: contents, as: UTF8.self), now: Int(Date().timeIntervalSince1970))
+            let (updated, changed) = change(selected, String(decoding: contents, as: UTF8.self))
             guard changed > 0 else { continue }
             let backup = registry.appendingPathExtension("madeira-bak")
             if !FileManager.default.fileExists(atPath: backup.path) { try? FileManager.default.copyItem(at: registry, to: backup) }
@@ -422,6 +463,17 @@ enum DockInstallScripts {
     }
 }
 
+/// A request for one game's one-time installs, saved from the app at any time and applied
+/// at that game's next Dock start, while no session runs (the registry is on disk then).
+enum DockInstallRequest: String, Sendable {
+    /// Record the game's own install-script programs as done: for an installer that did its
+    /// work but never closed, so its batch never saw an exit status.
+    case record
+    /// Forget the game's own recorded programs and choose Run at next start, so they run
+    /// again (for a clean reinstall). Files the installers wrote stay where they are.
+    case reset
+}
+
 /// Kept next to the prefix's registry files, one small JSON file: the programs the last
 /// batch runs, in its order (result lines refer to them by index), and each game's
 /// One-time installs choice.
@@ -432,6 +484,13 @@ struct DockInstallLedger: Codable, Equatable, Sendable {
     /// App ID -> false: the game's next Dock start skips its one-time installs (Skip).
     /// Absent or true: the next start runs the pending ones ("Run at next start").
     var runNext: [String: Bool] = [:]
+    /// App ID -> entry names the game's last batch started but never saw exit (an installer
+    /// window that stayed open, a session ended early). Optional, like `requests`, so files
+    /// written before these fields existed still load.
+    var unfinished: [String: [String]]? = nil
+    /// App ID -> the request its next Dock start applies (DockInstallers.applyRequest), by raw
+    /// value: a value this build does not know reads as no request instead of a damaged file.
+    var requests: [String: String]? = nil
 
     static func load(prefix: URL) -> DockInstallLedger {
         let file = prefix.appendingPathComponent(fileName)
@@ -444,6 +503,25 @@ struct DockInstallLedger: Codable, Equatable, Sendable {
         try encoder.encode(self).write(to: prefix.appendingPathComponent(Self.fileName), options: .atomic)
     }
     func runsNext(_ appID: Int) -> Bool { runNext[String(appID)] != false }
+    func request(_ appID: Int) -> DockInstallRequest? {
+        guard let raw = requests?[String(appID)] else { return nil }
+        return DockInstallRequest(rawValue: raw)
+    }
+    func unfinishedRuns(_ appID: Int) -> [String] { unfinished?[String(appID)] ?? [] }
+
+    /// Sets or clears a game's request; an empty map is stored as absent.
+    mutating func setRequest(_ appID: Int, _ request: DockInstallRequest?) {
+        var map = requests ?? [:]
+        map[String(appID)] = request?.rawValue
+        requests = map.isEmpty ? nil : map
+    }
+
+    /// Sets or clears a game's unfinished entries; an empty map is stored as absent.
+    mutating func setUnfinished(_ appID: Int, _ names: [String]) {
+        var map = unfinished ?? [:]
+        map[String(appID)] = names.isEmpty ? nil : names
+        unfinished = map.isEmpty ? nil : map
+    }
 }
 
 // MARK: - A Dock start's one-time installs
@@ -476,6 +554,11 @@ enum DockInstallers {
     /// for a start without installs.
     private(set) static var finishedAt: Date?
     private static var logged: Set<String> = []
+    /// The program poll last saw running and when it first saw it (the stall notice).
+    private static var runningSince: (index: Int, at: Date)?
+    /// After this long on one program, poll logs a notice and the status names the
+    /// minutes. Nothing is stopped: an installer may legitimately take long.
+    static let stallSeconds = 600
 
     nonisolated static func flag(_ name: String) -> Bool { SteamSignIn.flag(name, default: true) }
     nonisolated static var enabled: Bool { flag("MADEIRA_DOCK_INSTALLERS") }
@@ -589,6 +672,67 @@ enum DockInstallers {
         LogStore.shared.log("[dock-installers] app=\(appID) choice=\(run ? "run" : "skip")")
     }
 
+    /// Saves (or with nil cancels) a game's Record as done / Reset request. Nothing changes in
+    /// the prefix now: the game's next Dock start applies it before planning (applyRequest).
+    static func setRequest(_ appID: Int, _ request: DockInstallRequest?, prefix: URL) {
+        var ledger = DockInstallLedger.load(prefix: prefix)
+        ledger.setRequest(appID, request)
+        do { try ledger.save(prefix: prefix) }
+        catch { LogStore.shared.log("[dock-installers] app=\(appID) request not saved: \(error.localizedDescription)", level: .error); return }
+        LogStore.shared.log("[dock-installers] app=\(appID) request=\(request?.rawValue ?? "none"); applied at the next Dock start")
+    }
+
+    /// The runs of the game's own install-script programs (under its install folder): what
+    /// Record as done and Reset act on. Shared Steamworks redistributables serve every game
+    /// and are left as they are.
+    nonisolated static func own(_ found: [SteamInstallProcess], game: DockGame) -> [SteamInstallRun] {
+        let folder = game.windowsInstallPath.lowercased() + "\\"
+        var runs: [SteamInstallRun] = []
+        for process in found where process.executable.lowercased().hasPrefix(folder) && !runs.contains(process.run) {
+            runs.append(process.run)
+        }
+        return runs
+    }
+
+    /// Applies the game's saved request, if any, while no session runs: `.record` writes the
+    /// own programs' records (as a finished run would), `.reset` removes them and sets the
+    /// choice to Run at next start. The request is cleared either way, and with it the game's
+    /// unfinished entries. Returns the request applied.
+    @discardableResult
+    static func applyRequest(_ game: DockGame, found: [SteamInstallProcess], prefix: URL) -> DockInstallRequest? {
+        var ledger = DockInstallLedger.load(prefix: prefix)
+        let app = game.id
+        guard ledger.requests?[String(app)] != nil else { return nil }
+        let request = ledger.request(app)
+        ledger.setRequest(app, nil)
+        let runs = own(found, game: game)
+        let names = runs.map { DockInstallScripts.label($0) }.joined(separator: ",")
+        let shared = Set(found.map(\.run)).subtracting(runs).count
+        var changed = 0
+        var failure: String?
+        switch request {
+        case .record?:
+            do { changed = try SteamInstallScripts.mark(runs, prefix: prefix) } catch { failure = error.localizedDescription }
+        case .reset?:
+            do { changed = try SteamInstallScripts.unmark(runs, prefix: prefix) } catch { failure = error.localizedDescription }
+            if failure == nil { ledger.runNext[String(app)] = nil }
+        case nil:
+            failure = "unknown request"
+        }
+        if failure == nil { ledger.setUnfinished(app, []) }
+        do { try ledger.save(prefix: prefix) }
+        catch { LogStore.shared.log("[dock-installers] app=\(app) ledger not saved: \(error.localizedDescription)", level: .error) }
+        let tag = request == .reset ? "[dock-reset]" : "[dock-installers]"
+        let what = request == .reset ? "reset: records removed, choice=run; installed files left in place"
+                                     : "record-as-done: records written"
+        if let failure {
+            LogStore.shared.log("\(tag) app=\(app) request=\(request?.rawValue ?? "?") failed: \(failure)", level: .error)
+        } else {
+            LogStore.shared.log("\(tag) app=\(app) \(what) programs=\(names.isEmpty ? "-" : names) values=\(changed) shared-kept=\(shared)")
+        }
+        return failure == nil ? request : nil
+    }
+
     // MARK: A start
 
     /// Called right before a Dock start, while no session runs (the registry is on disk).
@@ -596,7 +740,7 @@ enum DockInstallers {
     static func prepare(_ game: DockGame, drive: URL, prefix: URL,
                         has32Bit: Bool = DockInstallers.bundleHas32Bit, hasMsiexec: Bool = DockInstallers.bundleHasMsiexec,
                         fusionSource: URL? = Bundle.main.resourceURL?.appendingPathComponent("i386-windows/fusion.dll")) {
-        script = nil; serverSync = false; note = nil; finishedAt = nil; logged = []
+        script = nil; serverSync = false; note = nil; finishedAt = nil; logged = []; runningSince = nil
         let app = game.id
         let batchFile = drive.appendingPathComponent(scriptName)
         try? FileManager.default.removeItem(at: batchFile)
@@ -607,6 +751,9 @@ enum DockInstallers {
         }
         let defaultKey = flag("MADEIRA_INSTALL_DEFAULT_KEY")
         let (found, scripts) = Self.found(game, drive: drive, defaultKey: defaultKey)
+        // A Record as done / Reset request saved since the last start, before the plan reads
+        // the registry.
+        applyRequest(game, found: found, prefix: prefix)
         guard !found.isEmpty else {
             LogStore.shared.log("[dock-installers] app=\(app) scripts=\(scripts) programs=0"); return
         }
@@ -619,6 +766,8 @@ enum DockInstallers {
                                             runnable: { runnable($0, drive: drive, has32Bit: has32Bit, hasMsiexec: hasMsiexec) })
         var pending = items.filter { $0.status == .pending }.map(\.process)
         var ledger = DockInstallLedger.load(prefix: prefix)
+        // Programs the game's last batch started but never saw exit (absorbResults).
+        let unfinished = Set(ledger.unfinishedRuns(app))
         // The game's One-time installs choice: absent or "Run at next start" runs the pending
         // programs at this start, after which the choice becomes Skip (unless some wait for a
         // later start); Skip starts the game without them. MADEIRA_DOCK_INSTALL_CHOICE=0 ignores it.
@@ -659,9 +808,10 @@ enum DockInstallers {
             let run = item.process.run
             let recorded = DockInstallScripts.recorded(run, in: registry[run.hive] ?? "").map { String($0) } ?? "-"
             let file = item.process.executable.split(separator: "\\").last.map(String.init) ?? ""
+            let lastRun: String = item.status != .done && unfinished.contains(run.name) ? " last-run=unfinished" : ""
             LogStore.shared.log("[dock-installers] app=\(app) program=\(DockInstallScripts.label(run)) file=\(file) " +
                                 "status=\(item.status.rawValue)\(item.reason.map { " reason=" + $0.replacingOccurrences(of: " ", with: "-") } ?? "") " +
-                                "key=\(run.hive == .machine ? "HKLM" : "HKCU")\\\(run.key) recorded=\(recorded) minimum=\(run.value)")
+                                "key=\(run.hive == .machine ? "HKLM" : "HKCU")\\\(run.key) recorded=\(recorded) minimum=\(run.value)\(lastRun)")
         }
         if skipped {
             note = "One-time installs skipped. To run them, choose Run at next start under One-time installs."
@@ -670,6 +820,17 @@ enum DockInstallers {
             if serverSync && madsyncConfigured {
                 note = (note.map { $0 + " " } ?? "") + "This start uses Wine's standard synchronization instead of madsync; the next start uses madsync again."
             }
+        }
+        // Those still not recorded and not run again now are named in the note, so an
+        // installer that did its work but never closed can be recorded with Record as done.
+        let stillUnfinished = items.filter { item in
+            item.status != .done && unfinished.contains(item.process.run.name) && !pending.contains(item.process)
+        }.map { DockInstallScripts.label($0.process.run) }
+        if !stillUnfinished.isEmpty {
+            let names = stillUnfinished.joined(separator: ", ")
+            let words = "Last run did not finish: \(names) (its installer never closed). If it installed, choose Record as done under One-time installs."
+            note = (note.map { $0 + " " } ?? "") + words
+            LogStore.shared.log("[dock-installers] app=\(app) unfinished=\(stillUnfinished.joined(separator: ",")): the last batch started it and saw no exit status")
         }
         if script != nil && flag("MADEIRA_DOTNET_FUSION") {
             LogStore.shared.log("[dock-installers] app=\(app) dotnet-fusion=\(placeDotNetFusion(drive: drive, source: fusionSource))")
@@ -710,15 +871,20 @@ enum DockInstallers {
             let results = DockInstallScripts.results(String(decoding: contents, as: UTF8.self))
             var succeeded: [SteamInstallRun] = []
             var statuses: [String] = []
+            var unfinished: [String] = []
             for (offset, run) in ledger.session.enumerated() {
                 let index = offset + 1, text = DockInstallScripts.label(run)
                 if let status = results.exits[index] {
                     if DockInstallScripts.Results.succeeded(status) { succeeded.append(run) }
                     statuses.append("\(text)=\(status)")
                 } else {
+                    if results.started[index] != nil { unfinished.append(run.name) }
                     statuses.append("\(text)=\(results.started[index] != nil ? "unfinished" : "not-started")")
                 }
             }
+            // Kept until the game's next batch or request: the Dock note names them, and
+            // Record as done can record one whose installer did its work but never closed.
+            ledger.setUnfinished(app, unfinished)
             var written = 0
             do { written = try SteamInstallScripts.mark(succeeded, prefix: prefix) }
             catch { LogStore.shared.log("[dock-installers] app=\(app) results not recorded: \(error.localizedDescription)", level: .error) }
@@ -736,8 +902,10 @@ enum DockInstallers {
 
     /// The batch's progress from its result file, for the Dock sheet and the starting
     /// screen. New start and exit lines, and the end, are logged once; the text names the
-    /// program running now and any that failed, and at the end how many succeeded.
-    static func poll(drive: URL) -> String? {
+    /// program running now and any that failed, and at the end how many succeeded. A program
+    /// that runs `stallSeconds` or longer (counted from when poll first saw it) gets its
+    /// minutes in the text and one log line; nothing is stopped.
+    static func poll(drive: URL, now: Date = Date()) -> String? {
         guard script != nil else { return nil }
         let file = drive.appendingPathComponent(resultName)
         guard let contents = try? Data(contentsOf: file), contents.count <= 16384 else { return "Starting this game's one-time installs…" }
@@ -758,7 +926,19 @@ enum DockInstallers {
         }
         let failures = failed.isEmpty ? "" : "\nFailed: " + failed.joined(separator: ", ")
         if let running = results.running {
-            return "Running one-time install \(running) of \(max(results.total, running)): \(results.started[running] ?? "")…" + failures
+            if runningSince?.index != running { runningSince = (running, now) }
+            let seconds = max(0, Int(now.timeIntervalSince(runningSince?.at ?? now)))
+            let program = results.started[running] ?? ""
+            var text = "Running one-time install \(running) of \(max(results.total, running)): \(program)…"
+            if seconds >= stallSeconds {
+                let hint = "If its window no longer changes, it may have finished without closing. Ending the session leaves it unrecorded; Record as done under One-time installs records it."
+                text += " (\(seconds / 60) min)\n" + hint
+                if logged.insert("stall\(running)").inserted {
+                    let line = "[dock-installers] still running \(running)/\(results.total) program=\(program) after \(seconds) s; the host waits for it (an installer window that never closes keeps the batch here)"
+                    LogStore.shared.log(line, level: .error)
+                }
+            }
+            return text + failures
         }
         guard results.ended else { return "Running this game's one-time installs…" + failures }
         let total = max(results.total, results.exits.count), succeeded = results.exits.count - failed.count

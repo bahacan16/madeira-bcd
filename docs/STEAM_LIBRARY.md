@@ -53,7 +53,8 @@ The page has, in this order:
   under Madeira Dock, **Smaller JIT pool (512 MB) for this launch** (Dock's
   per-launch choice) and **One-time installs**, **Run at next start** or
   **Skip** (Dock's choice for the game's Steam install scripts, when it has
-  any); under The game, **Program**; an update's progress with **Pause update** / **Resume update**,
+  any), with **Record as done…** and **Reset one-time installs…** (applied at
+  the game's next Dock start; docs/MADEIRA_DOCK.md); under The game, **Program**; an update's progress with **Pause update** / **Resume update**,
   or **Update available — download**; **Repair installed files**; App ID; free
   space; the last Dock result; **Uninstall** (with a confirmation);
 - **Display**, **Compatibility & performance** (reduced-precision x87,

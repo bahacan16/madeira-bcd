@@ -46,6 +46,7 @@ dock = (app / 'MadeiraDock.swift').read_text(encoding='utf-8')
 installers = (app / 'DockInstallers.swift').read_text(encoding='utf-8')
 content = (app / 'ContentView.swift').read_text(encoding='utf-8')
 view = (app / 'MadeiraDockView.swift').read_text(encoding='utf-8')
+steam_games = (app / 'SteamGames.swift').read_text(encoding='utf-8')
 madsync = (root / 'build/madsync/madsync.c').read_text(encoding='utf-8')
 
 # ------------------------------------------------------------------ static rules
@@ -70,6 +71,19 @@ require('installers: DockInstallers.script' in body, 'the planned batch goes int
 require('DockInstallers.poll(drive: MadeiraDock.drive)' in view and 'Picker(game.name' in view and
         'Text("Run at next start").tag(true)' in view and 'Text("Skip").tag(false)' in view, 'the Dock sheet shows the choice and progress')
 require('Copyright 2026 125hz' in installers.split('\n', 3)[1], 'new file carries the owner copyright')
+# Record as done / Reset: saved from the app, applied by prepare() before it reads the registry.
+prep = installers[installers.index('    static func prepare('):]
+prep = prep[:prep.index('\n    }\n')]
+require(prep.index('absorbResults(') < prep.index('applyRequest(game, found: found, prefix: prefix)') < prep.index('let registry = '),
+        'a saved request is applied after the last results and before the plan reads the registry')
+require('var unfinished: [String: [String]]? = nil' in installers and 'var requests: [String: String]? = nil' in installers,
+        'new ledger fields are optional (older files still load) and requests are stored by raw value')
+require('DockInstallRequestRows(dock: dock, appID: game.id, name: game.name)' in view and
+        'DockInstallRequestRows(dock: dock, appID: appID, name: entry.title)' in steam_games and
+        'Button("Record as done…")' in view and 'Button("Reset one-time installs…", role: .destructive)' in view and
+        view.count('.confirmationDialog(') == 2, 'the Dock sheet and the game page offer Record as done and Reset, each confirmed')
+require('[dock-reset]' in installers and 'still running' in installers and 'last-run=unfinished' in installers,
+        'reset, stall and unfinished log tags')
 
 # ------------------------------------------------------------------ compiled Swift
 game_src = dock[dock.index('/// A game Steam\'s client has installed'):dock.index('/// Madeira Dock: a small headless host')]
@@ -184,6 +198,11 @@ func pe(_ url: URL, machine: UInt16) throws {
         let (marked, changed) = SteamInstallScripts.mark([tool.run], in: record, now: 1)
         require(changed == 2 && DockInstallScripts.recorded(tool.run, in: marked) == 81017 && DockInstallScripts.marked(tool.run, in: marked), "mark raises both views")
         require(SteamInstallScripts.mark([tool.run], in: marked, now: 2).changed == 0, "marking again changes nothing")
+        let (unmarked, removedValues) = SteamInstallScripts.unmark([tool.run], in: marked)
+        require(removedValues == 2 && DockInstallScripts.recorded(tool.run, in: unmarked) == nil &&
+                unmarked.contains("[SOFTWARE\\\\Fixture Tool]") && DockInstallScripts.marked(runtime.run, in: unmarked),
+                "unmark removes the entry's value from both views; keys and other entries stay")
+        require(SteamInstallScripts.unmark([tool.run], in: unmarked).removed == 0, "unmarking again removes nothing")
 
         // ---- plan and note
         let none: (SteamInstallRun) -> Bool = { _ in false }
@@ -239,6 +258,18 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(DockInstallLedger.load(prefix: prefix) == ledger && !ledger.runsNext(7000), "JSON round trip")
         try write(prefix.appendingPathComponent(DockInstallLedger.fileName), "{not json")
         require(DockInstallLedger.load(prefix: prefix) == DockInstallLedger(), "a damaged file reads as empty")
+        // A file written before the unfinished/requests fields existed still loads.
+        try write(prefix.appendingPathComponent(DockInstallLedger.fileName), "{\"runNext\":{\"7000\":false},\"session\":[],\"sessionApp\":0}")
+        let older = DockInstallLedger.load(prefix: prefix)
+        require(!older.runsNext(7000) && older.requests == nil && older.unfinished == nil, "an older ledger file keeps its choice")
+        try write(prefix.appendingPathComponent(DockInstallLedger.fileName), "{\"runNext\":{\"7000\":false},\"session\":[],\"sessionApp\":0,\"requests\":{\"7000\":\"later\"}}")
+        let unknown = DockInstallLedger.load(prefix: prefix)
+        require(!unknown.runsNext(7000) && unknown.request(7000) == nil, "an unknown request value reads as none, the choice stays")
+        var requested = DockInstallLedger()
+        requested.setRequest(7000, .record); requested.setUnfinished(7000, ["tool"])
+        require(requested.request(7000) == .record && requested.unfinishedRuns(7000) == ["tool"], "request and unfinished entries kept per game")
+        requested.setRequest(7000, nil); requested.setUnfinished(7000, [])
+        require(requested == DockInstallLedger(), "cleared entries are stored as absent")
 
         // ---- paths and what this build can run
         let game = DockGame(id: 7000, name: "Fixture", installDir: "Fixture Game", library: "Program Files (x86)/Steam/steamapps",
@@ -395,6 +426,58 @@ func pe(_ url: URL, machine: UInt16) throws {
         require(DockInstallLedger.load(prefix: prefix).session.count == 8 && DockInstallLedger.load(prefix: prefix).runsNext(7001) &&
                 (DockInstallers.note ?? "").contains("Next start: p9"), "over the limit: 8 run, the rest next start, choice stays Run")
 
+        // ---- an installer that never closes: the stall notice, its unfinished record, Record as done, Reset
+        let solo = DockGame(id: 7002, name: "Solo", installDir: "Solo", library: "Program Files (x86)/Steam/steamapps", installed: true, customExecutables: false)
+        try write(common.appendingPathComponent("Solo/installscript.vdf"),
+                  "\"installscript\" { \"run process\" { \"Setup\" { \"HasRunKey\" \"HKEY_LOCAL_MACHINE\\\\Software\\\\Solo\" \"process 1\" \"%INSTALLDIR%\\\\setup.exe\" } } }")
+        try pe(common.appendingPathComponent("Solo/setup.exe"), machine: 0x8664)
+        let soloFound = DockInstallers.found(solo, drive: drive, defaultKey: true).processes
+        let setupRun = soloFound.first(where: { $0.run.name == "setup" })!.run
+        let sharedRun = soloFound.first(where: { $0.run.name == "shared runtime" })!.run
+        require(DockInstallers.own(soloFound, game: solo) == [setupRun], "Record as done / Reset act on the game's own programs, not shared redistributables")
+        DockInstallers.prepare(solo, drive: drive, prefix: prefix, has32Bit: true, hasMsiexec: true, fusionSource: nil)
+        require(DockInstallers.script != nil && !DockInstallLedger.load(prefix: prefix).runsNext(7002), "first start runs the game's installer")
+        try write(drive.appendingPathComponent("madeira-dock-installers.result"), "begin 1 \r\nservices started\r\nstart 1 setup \r\n")
+        let t0 = Date()
+        require(DockInstallers.poll(drive: drive, now: t0) == "Running one-time install 1 of 1: setup…", "a fresh run: no stall words")
+        let stalled = DockInstallers.poll(drive: drive, now: t0.addingTimeInterval(601)) ?? ""
+        require(stalled.hasPrefix("Running one-time install 1 of 1: setup… (10 min)\nIf its window no longer changes") && stalled.contains("Record as done"),
+                "after 10 minutes on one program the text names the minutes and the way out (\(stalled))")
+        _ = DockInstallers.poll(drive: drive, now: t0.addingTimeInterval(900))
+        require(LogStore.shared.lines.filter({ $0.contains("[dock-installers] still running 1/1 program=setup after 601 s") }).count == 1 &&
+                !logged("after 900 s"), "the stall is logged once per program")
+        // The session ended with the installer still open: the next start keeps it unfinished.
+        DockInstallers.prepare(solo, drive: drive, prefix: prefix, has32Bit: true, hasMsiexec: true, fusionSource: nil)
+        require(logged("statuses=setup=unfinished") && DockInstallLedger.load(prefix: prefix).unfinishedRuns(7002) == ["setup"], "an unfinished program is remembered")
+        require(DockInstallers.script == nil && logged("program=setup file=setup.exe status=pending") && logged("last-run=unfinished") &&
+                logged("app=7002 unfinished=setup") && (DockInstallers.note ?? "").contains("Last run did not finish: setup") &&
+                (DockInstallers.note ?? "").contains("Record as done"), "Skip: the log and the note name the unfinished program (\(DockInstallers.note ?? ""))")
+        // Record as done: saved now, applied at the next start.
+        DockInstallers.setRequest(7002, .record, prefix: prefix)
+        var soloSystem = (try? String(contentsOf: prefix.appendingPathComponent("system.reg"), encoding: .utf8)) ?? ""
+        require(DockInstallLedger.load(prefix: prefix).request(7002) == .record && !DockInstallScripts.marked(setupRun, in: soloSystem),
+                "a request changes nothing in the prefix until the next start")
+        DockInstallers.setRequest(7002, nil, prefix: prefix)
+        require(DockInstallLedger.load(prefix: prefix).requests == nil, "a request can be cancelled")
+        DockInstallers.setRequest(7002, .record, prefix: prefix)
+        DockInstallers.prepare(solo, drive: drive, prefix: prefix, has32Bit: true, hasMsiexec: true, fusionSource: nil)
+        soloSystem = (try? String(contentsOf: prefix.appendingPathComponent("system.reg"), encoding: .utf8)) ?? ""
+        require(logged("[dock-installers] app=7002 record-as-done: records written programs=setup values=2 shared-kept=1") &&
+                DockInstallScripts.marked(setupRun, in: soloSystem) && DockInstallers.script == nil && DockInstallers.note == nil,
+                "Record as done: recorded in both views before the plan, nothing runs")
+        ledger = DockInstallLedger.load(prefix: prefix)
+        require(ledger.request(7002) == nil && ledger.unfinishedRuns(7002).isEmpty, "the request and the unfinished entry are cleared")
+        // Reset: the records go, the choice turns to Run, and the installer runs at that start.
+        DockInstallers.setRequest(7002, .reset, prefix: prefix)
+        DockInstallers.prepare(solo, drive: drive, prefix: prefix, has32Bit: true, hasMsiexec: true, fusionSource: nil)
+        soloSystem = (try? String(contentsOf: prefix.appendingPathComponent("system.reg"), encoding: .utf8)) ?? ""
+        let rerun = (try? String(contentsOf: drive.appendingPathComponent("madeira-dock-installers.cmd"), encoding: .utf8)) ?? ""
+        require(logged("[dock-reset] app=7002 reset: records removed, choice=run; installed files left in place programs=setup values=2 shared-kept=1") &&
+                DockInstallScripts.recorded(setupRun, in: soloSystem) == nil && DockInstallScripts.marked(sharedRun, in: soloSystem),
+                "Reset removes only the game's own records; the shared redistributable stays recorded")
+        require(DockInstallers.script != nil && rerun.contains("echo start 1 setup") && !DockInstallLedger.load(prefix: prefix).runsNext(7002) &&
+                DockInstallLedger.load(prefix: prefix).requests == nil, "after Reset the installer runs at that start, then the choice is Skip again")
+
         // Fixture batch for the optional real cmd.exe run: stand-in programs under @DIR@.
         func fixture(_ name: String, _ file: String) -> SteamInstallProcess {
             SteamInstallProcess(run: SteamInstallRun(name: name, hive: .machine, key: "Software\\Fixture\\" + name, value: 1),
@@ -419,11 +502,20 @@ with tempfile.TemporaryDirectory(prefix='madeira-dock-installers-') as tmp:
     (tmp / 'stubs.swift').write_text(stubs + launch_src, encoding='utf-8')
     (tmp / 'checks.swift').write_text(checks, encoding='utf-8')
     exe = tmp / 'check'
-    build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe),
-                            str(tmp / 'stubs.swift'), str(tmp / 'checks.swift'), str(app / 'DockInstallers.swift')])
-    require(build.returncode == 0, 'production installer Swift compiles on the host')
     batch_text = ''
-    if build.returncode == 0:
+    if not Path(SWIFTC).exists() and not shutil.which(SWIFTC):
+        # The compiled checks need a Swift toolchain; without one only the static rules and
+        # the C part run. --require-swift turns a missing compiler into a failure.
+        if '--require-swift' in sys.argv:
+            require(False, 'Swift compiler available (--require-swift)')
+        else:
+            print('SKIP: Swift compiler unavailable; the compiled installer checks did not run')
+        build = None
+    else:
+        build = subprocess.run([SWIFTC, '-parse-as-library', '-swift-version', '5', '-sanitize=address', '-o', str(exe),
+                                str(tmp / 'stubs.swift'), str(tmp / 'checks.swift'), str(app / 'DockInstallers.swift')])
+        require(build.returncode == 0, 'production installer Swift compiles on the host')
+    if build is not None and build.returncode == 0:
         run = subprocess.run([str(exe), str(tmp / 'fixture.cmd')], env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0'))
         require(run.returncode == 0, 'installer checks pass under AddressSanitizer')
         batch_text = (tmp / 'fixture.cmd').read_text() if (tmp / 'fixture.cmd').exists() else ''

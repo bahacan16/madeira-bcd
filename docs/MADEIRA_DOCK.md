@@ -342,6 +342,22 @@ tasks, before the step Dock asks it for, so on the Dock route nothing ran them.
    runs installers, Wine's own builtin 32-bit `fusion.dll`
    (`i386-windows/fusion.dll`) is copied there if the file is missing. A
    bundle without 32-bit Windows DLLs has nothing to copy (`no-source`).
+8. **Unfinished programs.** A program the batch started but never saw exit
+   (an installer window that stays open after its work, a session ended
+   early) is kept per game in `madeira-dock-installs.json` until the game's
+   next batch or request. Later starts log it (`last-run=unfinished`,
+   `unfinished=`) and the Dock note names it. While a program runs, the
+   status names the minutes after 10 minutes and one `still running` line is
+   logged; nothing is stopped.
+9. **Record as done / Reset.** Under each game's choice, in the Dock sheet
+   and the game's Steam section. Each is confirmed, saved in
+   `madeira-dock-installs.json`, can be cancelled until the game's next Dock
+   start, and is applied by that start before it plans, while no session
+   runs. Both act only on the game's own programs (under its install folder);
+   shared Steamworks redistributables are left as they are. Record as done
+   writes their records as a finished run would. Reset removes them (log
+   `[dock-reset]`) and sets the choice to "Run at next start", so they run
+   again at that start; files the installers wrote stay in place.
 
 The plan, each program's fate and the results are logged as
 `[dock-installers]`; the Dock sheet's status and the starting screen show the
