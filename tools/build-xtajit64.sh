@@ -149,8 +149,11 @@ python3 "$R/tools/patch-fex-ios-alias-retire-jit.py" "$R/FEX/Source/Windows/ARM6
 python3 "$R/tools/patch-fex-ios-rpmalloc-span8.py" "$R/FEX/External/rpmalloc/rpmalloc/rpmalloc.c" --span-mb 4
 python3 "$R/tools/patch-fex-ios-branch-history.py" "$R/FEX"
 python3 "$R/tools/patch-fex-ios-launcher-smc.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
+# Each thread reserved 16 MiB of call-return stack in the 12 GB FEX arena; the
+# JIT only ever touches [2 MiB, 6 MiB) of it (licensed GTA V ran out, 434/436).
+python3 "$R/tools/patch-fex-ios-callret-8mb.py" "$R/FEX"
 build
-git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def
+git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/include/FEXCore/Debug/InternalThreadState.h FEXCore/Source/Interface/Core/Core.cpp Source/Windows/Common/CallRetStack.h FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c
 cp "$B/Bin/libarm64ecfex.dll" "$SHIP"
 cp "$B/Bin/libarm64ecfex.dll" "$AVX"
