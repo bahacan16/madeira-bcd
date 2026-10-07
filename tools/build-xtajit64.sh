@@ -135,6 +135,11 @@ fi
 #  - patch-fex-ios-avx.py: AVX/AVX2 only when MADEIRA_FEX_AVX=1 at launch, so
 #    the same module serves both; xtajit64-avx.dll is kept as a copy for the
 #    bridge's existing switch.
+#  - patch-fex-ios-smc-store-fastpath.py: on the SMC path, plain stores and
+#    stores already backpatched to DMB + STR are decided without the
+#    backpatch lock (two Mach-emulated stores per fault) and without the
+#    "Unhandled JIT SIGBUS" line; same Pc result. MADEIRA_FEX_SMC_FASTPATH=0
+#    restores the locked path.
 echo "=== with the map-notification, IntervalsLock and IRCapRIP fixes and the AVX opt-in ==="
 python3 "$R/tools/patch-fex-ios-mapview-selfshared.py" "$R/FEX/Source/Windows/ARM64EC/Module.cpp"
 python3 "$R/tools/patch-fex-ios-intervals-reentry.py" "$R/FEX/Source/Windows/Common"
@@ -152,6 +157,7 @@ python3 "$R/tools/patch-fex-ios-launcher-smc.py" "$R/FEX/Source/Windows/ARM64EC/
 # Each thread reserved 16 MiB of call-return stack in the 12 GB FEX arena; the
 # JIT only ever touches [2 MiB, 6 MiB) of it (licensed GTA V ran out, 434/436).
 python3 "$R/tools/patch-fex-ios-callret-8mb.py" "$R/FEX"
+python3 "$R/tools/patch-fex-ios-smc-store-fastpath.py" "$R/FEX"
 build
 git -C FEX checkout -- "$CPUF" Source/Windows/ARM64EC/Module.cpp Source/Windows/Common/InvalidationTracker.h Source/Windows/Common/InvalidationTracker.cpp FEXCore/Source/Interface/IR/PassManager.cpp Source/Windows/Common/Priv.h FEXCore/Source/Interface/Core/CPUID.cpp Source/Windows/ARM64EC/IosJitAlias.cpp FEXCore/include/FEXCore/Core/CoreState.h FEXCore/Source/Interface/Core/JIT/BranchOps.cpp Source/Windows/ARM64EC/libarm64ecfex.def FEXCore/include/FEXCore/Debug/InternalThreadState.h FEXCore/Source/Interface/Core/Core.cpp Source/Windows/Common/CallRetStack.h FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
 git -C FEX/External/rpmalloc checkout -- rpmalloc/rpmalloc.c

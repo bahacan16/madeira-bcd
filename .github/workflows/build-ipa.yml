@@ -405,6 +405,15 @@ jobs:
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
+      # Self-modifying-code fault storms (RockstarService, builds 435-437):
+      # the ARM64EC SMC path decides plain and backpatched stores without
+      # FEX's backpatch lock, and the PE ntdll's uncapped "[rtcs] pre" line is
+      # kept to 10 per second per thread (MADEIRA_RTCS_LOG=all|N).
+      - name: Check the SMC store fast path and the [rtcs] log cap
+        run: |
+          python3 tests/host/check-smc-store-fastpath.py
+          python3 tests/host/check-rtcs-cap.py
+
       - name: Build ntdll-unix
         # Keep going so one run reports every broken stage (and caches FEX and
         # LLVM). "Verify all linked archives exist" still fails the job before
@@ -1222,6 +1231,8 @@ jobs:
               raise SystemExit('Required ARM64EC branch-history module was not built; refusing the fallback IPA')
           if b'launcher-smc-v1 madeira-bcd' not in module:
               raise SystemExit('Required ARM64EC Launcher SMC module was not built; refusing the fallback IPA')
+          if b'smc-store-fastpath-v1 madeira-bcd' not in module:
+              raise SystemExit('Required ARM64EC SMC store fast-path module was not built; refusing the fallback IPA')
           print('ARM64EC rpmalloc: span4 build marker verified')
           PYEOF
           # Verify the linked x64 entries; never silently ship a fallback DLL
