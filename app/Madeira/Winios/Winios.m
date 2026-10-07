@@ -1282,6 +1282,66 @@ static void winios_place_metal_layer(NSNumber *key) {
     winios_desktop_fit(key, ml, c);
 }
 
+/* madeira-bcd: A HIDDEN WINDOW PRESENTS SLOWLY. A desktop window's swapchain
+ * keeps presenting after Wine hides the window: the Rockstar Games
+ * Launcher's Chromium layer (hwnd 0x100f6, hidden when GTA V Enhanced
+ * started) presented 44-60 frames a second for the whole game (log
+ * 2026-10-07 22:06, build 435, DXMT [gpu-perf] up to 27% GPU busy), and its
+ * GPU, renderer and compositor threads took ~0.4 of a core from a game
+ * that was CPU-bound at 17 fps. Nobody sees a hidden layer, so its
+ * nextDrawable waits until 1/N s after the previous one: the swapchain's
+ * Present slows down and the program renders less. The window's own state
+ * comes from winios_sync_metal_hidden (main thread); a shown window is not
+ * paced. MADEIRA_HIDDEN_LAYER_FPS=N (default 10), 0 turns it off. */
+static unsigned long long winios_hidden_present_interval_ns(void) {
+    static long long ns = -1;
+    if (ns < 0) {
+        const char *e = getenv("MADEIRA_HIDDEN_LAYER_FPS");  /* frames a second a hidden desktop window's Metal layer may present (default 10); 0 = no limit */
+        long fps = e && *e ? strtol(e, NULL, 10) : 10;
+        ns = fps > 0 ? 1000000000LL / fps : 0;
+    }
+    return (unsigned long long)ns;
+}
+
+@interface MadeiraWindowMetalLayer : CAMetalLayer
+@property (nonatomic) uintptr_t madeiraHwnd;
+- (void)madeiraSetWindowHidden:(BOOL)hidden;
+@end
+
+@implementation MadeiraWindowMetalLayer {
+    int _windowHidden;                /* __atomic: set on the main thread, read on DXMT's */
+    unsigned long long _lastDrawableNs;
+}
+- (void)madeiraSetWindowHidden:(BOOL)hidden {
+    __atomic_store_n(&_windowHidden, hidden ? 1 : 0, __ATOMIC_RELAXED);
+}
+- (nullable id<CAMetalDrawable>)nextDrawable {
+    unsigned long long interval = winios_hidden_present_interval_ns();
+    if (interval && __atomic_load_n(&_windowHidden, __ATOMIC_RELAXED)) {
+        unsigned long long now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        unsigned long long last = __atomic_load_n(&_lastDrawableNs, __ATOMIC_RELAXED);
+        if (last && now - last < interval) {
+            static _Atomic unsigned said;
+            if (atomic_fetch_add_explicit(&said, 1, memory_order_relaxed) < 8)
+                fprintf(stderr, "[hidden-present] hwnd=0x%llx is hidden: its Metal layer presents at "
+                                "%llu fps at most (MADEIRA_HIDDEN_LAYER_FPS=0 disables)\n",
+                        (unsigned long long)self.madeiraHwnd, 1000000000ULL / interval);
+            usleep((useconds_t)((interval - (now - last)) / 1000));
+            now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        }
+        __atomic_store_n(&_lastDrawableNs, now, __ATOMIC_RELAXED);
+    }
+    return [super nextDrawable];
+}
+@end
+
+/* main thread: the window layer of `key` was just shown or hidden */
+static void winios_sync_metal_hidden(NSNumber *key, CALayer *l) {
+    CAMetalLayer *ml = g_metal_layers[key];
+    if ([ml isKindOfClass:[MadeiraWindowMetalLayer class]])
+        [(MadeiraWindowMetalLayer *)ml madeiraSetWindowHidden:l.hidden];
+}
+
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
  * view for an HWND in desktop mode. Returns the (unretained) CAMetalLayer;
  * the shim CFRetains it for DXMT's lifetime handling. */
@@ -1295,7 +1355,10 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
         CAMetalLayer *ml = g_metal_layers[key];
         if (!ml) {
             CALayer *win = winios_layer_for(hwnd, true);
-            ml = [CAMetalLayer layer];
+            MadeiraWindowMetalLayer *wml = [MadeiraWindowMetalLayer layer];
+            wml.madeiraHwnd = (uintptr_t)hwnd;
+            [wml madeiraSetWindowHidden:win.hidden];
+            ml = wml;
             ml.anchorPoint = CGPointMake(0, 0);
             ml.device = MTLCreateSystemDefaultDevice();
             ml.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -1330,6 +1393,7 @@ void winios_window_visibility(HWND hwnd, int visible) {
         [CATransaction setDisableActions:YES];
         l.hidden = hidden;
         [CATransaction commit];
+        winios_sync_metal_hidden(@((uintptr_t)hwnd), l);
         static unsigned n;
         if (++n <= 64 || (n % 128) == 0) {
             fprintf(stderr, "[winios] inherited visibility hwnd=%p visible=%d\n", hwnd, !hidden);
@@ -1392,6 +1456,7 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_apply_contents_rect(key, l);
         winios_place_metal_layer(key);
         [CATransaction commit];
+        winios_sync_metal_hidden(key, l);
     });
 }
 
@@ -1838,7 +1903,7 @@ int winios_surface_present(HWND hwnd, int dx, int dy, int dw, int dh,
             NSNumber *key = @((uintptr_t)hwnd);
             l.opaque = !pixelAlpha;
             l.contents = (__bridge id)img;
-            if (pending) l.hidden = YES;   /* winios_window_frame decides */
+            if (pending) { l.hidden = YES; winios_sync_metal_hidden(key, l); }   /* winios_window_frame decides */
             else atomic_fetch_add_explicit(&g_surface_present_count, 1, memory_order_relaxed);
             g_surf_sizes[key] = [NSValue valueWithCGSize:CGSizeMake(sw, sh)];
             if (!pending && CGRectIsEmpty(l.frame)) {
