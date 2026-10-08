@@ -1370,9 +1370,11 @@ static unsigned long long winios_hidden_present_interval_ns(void) {
  * the HUD may show even while Developer settings has it off. Main thread
  * only. */
 static int winios_metal_hud_main_enabled(void) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("MADEIRA_METAL_HUD_MAIN"); on = e && e[0] == '1'; }   /* 1: Apple's Metal HUD only on the largest shown desktop window's Metal layer (its main layer), off on the other layers; default: Apple's own choice */
-    return on;
+    /* Read on every call, not once: the first pick runs at session reset, before
+     * WineProcessBridge applies the game's env lines (log 2026-10-08 12:58:50,
+     * build 451: the switch was in GTA's config and never took effect). */
+    const char *e = getenv("MADEIRA_METAL_HUD_MAIN");   /* 1: Apple's Metal HUD only on the largest shown desktop window's Metal layer (its main layer), off on the other layers; default: Apple's own choice */
+    return e && e[0] == '1';
 }
 
 /* IOSDisplayShim.m: the window-level layer (MetalHostView) */
@@ -1384,7 +1386,16 @@ static void winios_metal_hud_set(CAMetalLayer *ml, NSDictionary *want) {
 }
 
 static void winios_metal_hud_pick(void) {
-    if (!winios_metal_hud_main_enabled()) return;
+    static BOOL applied;   /* modes were set by an earlier pick; a session without the switch gets Apple's default back */
+    if (!winios_metal_hud_main_enabled()) {
+        if (applied) {
+            for (NSNumber *key in g_metal_layers) winios_metal_hud_set(g_metal_layers[key], nil);
+            winios_metal_hud_set(madeira_display_layer(), nil);
+            applied = NO;
+        }
+        return;
+    }
+    applied = YES;
     NSDictionary *off = @{ @"mode": @"disabled" };
     NSNumber *main_key = nil;
     CGFloat main_area = 0;
