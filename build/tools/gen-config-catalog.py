@@ -62,6 +62,14 @@ OVERLAY = {
                         "image, as 32-bit programs already do, and its executable protections are applied without "
                         "EXEC. Frees the pool for hybrid DLL copies and code buffers. Hybrid images keep their "
                         "copy. Set it in the game's own file; restart the session after changing it."},
+    "env.MADEIRA_FIXED_BASE_GUARD": {"category": "Memory & JIT pool", "title": "Keep 0x140000000 for a fixed-base game",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a resource-only image view (a version or resource query, e.g. the Rockstar "
+                        "Games Launcher reading Social-Club-Setup.exe) never takes the reserved executable window at "
+                        "0x140000000; it is mapped elsewhere. The window then stays free for a game exe without "
+                        "relocations that can only run there (Red Dead Redemption 2). It moves other programs' "
+                        "images (licensed GTA V Enhanced), so set it only in such a game's own file; read at "
+                        "session start."},
     "env.MADEIRA_EC_HOOK_TRACE": {"category": "Debugging / logs", "title": "Log code patches the emulated copy misses",
                 "kind": "bool", "default": "1",
                 "note": "Default on, logging only. Compare executable PE sections and their pool copies before "

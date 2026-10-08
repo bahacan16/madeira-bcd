@@ -9168,6 +9168,38 @@ static int ios_exe_win_small_fixed(void)
     return enabled;
 }
 
+/* madeira-bcd: the image view virtual_map_section is placing right now is
+ * resource-only: no execute access and not the loader's (no
+ * ArbitraryUserPointer), i.e. LOAD_LIBRARY_AS_IMAGE_RESOURCE for a version or
+ * resource query. Set and cleared there around virtual_map_image; thread-local
+ * for the reason above.
+ *
+ * A licensed Rockstar session reads Social-Club-Setup.exe's version that way
+ * when the launcher starts (GTA V Enhanced, build 456, 18:47:27: a 0x7a7d000
+ * view at its ImageBase 0x140000000). Being over the 64 MB floor, it took the
+ * window; the view was gone a moment later, and SocialClubHelper.exe
+ * (0x141c00000), its CPU area and its stack then filled [0x140000000,
+ * 0x148000000), so every later map at 0x140000000 was REFUSED c0000018.
+ * GTA5_Enhanced.exe moved high, but an image without relocations (RDR2.exe,
+ * 0x7528000) runs nowhere else. With env.MADEIRA_FIXED_BASE_GUARD = 1 such a
+ * view takes neither the window nor an interval held for the next generation;
+ * it is mapped elsewhere, where a resource query works the same. Off by
+ * default: in a licensed GTA session it would move GTA5_Enhanced.exe to its
+ * preferred base and SocialClubHelper.exe out of the window. */
+static __thread int ios_exe_win_resource_request;
+
+static int ios_fixed_base_guard(void)
+{
+    static int on = -1;
+
+    if (on < 0)
+    {
+        const char *e = getenv( "MADEIRA_FIXED_BASE_GUARD" );
+        on = e && e[0] == '1' && !e[1];
+    }
+    return on;
+}
+
 /* Returns 1 if the reservation was released for this request. */
 static int ios_exe_win_claim( const void *addr, size_t size )
 {
@@ -9194,6 +9226,16 @@ static int ios_exe_win_claim( const void *addr, size_t size )
             dprintf( 2, "ml977: NOT releasing the window for %p+%#lx (under the 64MB floor) -- "
                      "a relocatable image sharing the default ImageBase must not starve the "
                      "fixed-base one\n", addr, (unsigned long)size );
+        return 0;
+    }
+    if (ios_exe_win_resource_request && ios_fixed_base_guard())
+    {
+        static int guard_n;
+        if (guard_n++ < 8)
+            dprintf( 2, "[exe-window] guard: %p+%#lx is a resource-only image view (no execute access, "
+                     "not the loader: a version or resource query); it does not take the fixed-base "
+                     "window and is mapped elsewhere (MADEIRA_FIXED_BASE_GUARD)\n",
+                     addr, (unsigned long)size );
         return 0;
     }
     if (ios_exe_win_state != 1)
@@ -22486,11 +22528,15 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
              * view; it gets no pool copy (ios_map_resource_view). */
             ios_map_resource_view = !(access & SECTION_MAP_EXECUTE) &&
                                     !NtCurrentTeb()->Tib.ArbitraryUserPointer && ios_resource_map_nocopy();
+            /* the fixed-base window's guard (ios_exe_win_resource_request) */
+            ios_exe_win_resource_request = !(access & SECTION_MAP_EXECUTE) &&
+                                           !NtCurrentTeb()->Tib.ArbitraryUserPointer;
 #endif
             res = virtual_map_image( handle, addr_ptr, size_ptr, shared_file, limit_low, limit_high,
                                      alloc_type, machine, image_info, &nt_name, FALSE, offset.QuadPart );
 #ifdef WINE_IOS
             ios_map_resource_view = 0;
+            ios_exe_win_resource_request = 0;
 #endif
         }
         if (shared_file) NtClose( shared_file );
