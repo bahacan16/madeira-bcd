@@ -36,6 +36,8 @@ final class LogStore: ObservableObject {
 
     // Tail-file reader (background)
     private var tail: LogTail?
+    // madeira-bcd: thermal transitions, logged whether or not the HUD is shown
+    private var thermalObserver: NSObjectProtocol?
     // Signature → index into `entries` so we can update in O(1)
     private var sigToIndex: [String: Int] = [:]
     // Lock for sigToIndex + pending mutations
@@ -136,6 +138,18 @@ final class LogStore: ObservableObject {
             // verdict) previously reached only the UI view, which dies with
             // the app; pulled logs never contained them.
             LogStore.shared.appendToFile(message, level: .info)
+        }
+
+        // madeira-bcd: the HUD logged thermal transitions only while it was on
+        // screen, so build 442's GTA V gameplay at ~34 fps with the P cores at
+        // 1.5-1.7 GHz ([xp] GHz P=, 3.8-4.1 at the start) could not say whether
+        // the phone was throttling. Log every transition, with the time.
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main
+        ) { _ in
+            let process = ProcessInfo.processInfo
+            LogStore.shared.log("[thermal] now \(DeviceLoadDiagnostics.thermalName(process.thermalState)) "
+                                + "(low-power=\(process.isLowPowerModeEnabled ? 1 : 0))")
         }
     }
 
