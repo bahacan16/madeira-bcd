@@ -644,6 +644,7 @@ extern size_t ios_jit_pool_size_global;         /* defined below */
  * pool count. Called periodically, so we see WHEN a slot goes bad, not just
  * that it did. */
 static void ios_bigres_report( const char *why );   /* defined below */
+static void ios_band_census( const char *why );     /* defined below (madeira-bcd, RDR2) */
 
 static void ios_slot_probe( const char *why )
 {
@@ -1119,6 +1120,7 @@ static void *ios_pool_warmer_thread( void *arg )
                     if (ios_layerkit_hi) ios_window_inventory( "layerkit-span", ios_layerkit_lo, ios_layerkit_hi );
                 }
                 ios_bigres_report( "periodic" );
+                ios_band_census( "periodic" );   /* env.MADEIRA_BAND_CENSUS = 1 only */
             }
             /* ml358 FOOTPRINT (every cycle, one line): phys_footprint is the
              * EXACT number jetsam kills on — everything else in this file
@@ -15123,6 +15125,211 @@ static int ios_sc_layout(void)
     return ios_sc_layout_mode;
 }
 
+/* madeira-bcd (RDR2): what each piece of the 64 GB band really uses. Opt-in,
+ * logging only: env.MADEIRA_BAND_CENSUS = 1 (default off).
+ *
+ * RDR2.exe reserves 8960 MB in one block as it starts (upstream: the larger
+ * of 7/8 of the reported memory and 8960 MB). In its first licensed run
+ * (build 457, log 2026-10-08 21:20:59) that failed: only [0x7000000000,
+ * 0x8000000000) has room for a block that size, Social Club's layout 2, the
+ * furniture and the FEX arena fill it, and the largest gap left was 2775 MB.
+ * Layout 2's pieces are sized for GTA V. Whether one of them can give up room
+ * for RDR2 depends on how much of it is used, which nothing measured:
+ * [bigres-use] counts commit calls, not pages, and [slot#N] counts mappings,
+ * which our own PROT_NONE holds fill.
+ *
+ * One mach_vm_region walk over the band; each region is split over the
+ * pieces it touches. Per piece: regions, mapped, used (any access, i.e.
+ * committed), resident and dirty (dirtied + compressed) MB, the highest used
+ * address as an offset into the piece (now and the highest seen this
+ * session), and the largest unmapped gap. Resident and dirty pages count in
+ * the piece where their region starts. Then the band's largest gap, aligned
+ * to 64 KB as Wine places a reserve, and whether 8960 MB fits there. Runs with
+ * the periodic slot probe and at a failed large reserve, 64 times at most. */
+#define IOS_BAND_LO         0x7000000000ULL
+#define IOS_BAND_HI         0x8000000000ULL
+#define IOS_BAND_RDR2_ASK   0x230000000ULL     /* RDR2.exe's 8960 MB */
+#define IOS_BAND_PIECES_MAX 12
+
+struct ios_band_piece
+{
+    uint64_t lo, hi;
+    const char *what;
+    unsigned regions;
+    uint64_t mapped, used, resident, dirty, top, gap;
+};
+
+static int ios_band_census_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        /* 1: log what each piece of [0x7000000000, 0x8000000000) uses (RDR2's 8960 MB reserve); default 0. */
+        const char *e = getenv( "MADEIRA_BAND_CENSUS" );
+        on = e && e[0] == '1' && !e[1];
+    }
+    return on;
+}
+
+/* The pieces in address order, covering the band without gaps. The JIT pool's
+ * RW alias [rw_lo, rw_hi) gets its own piece in layout 2 when it starts at
+ * IOS_SC2_RW_ALIAS and ends below the cage. */
+static int ios_band_pieces( struct ios_band_piece *p, int layout, uint64_t rw_lo, uint64_t rw_hi )
+{
+    int i, n = 0;
+
+    memset( p, 0, sizeof(*p) * IOS_BAND_PIECES_MAX );
+    if (layout == 2)
+    {
+        p[n].lo = IOS_SC2_L_BASE;      p[n++].what = "libcef.dll's pools";
+        p[n].lo = IOS_SC2_FLOOR;       p[n++].what = "furniture";
+        p[n].lo = IOS_SC2_J2_BASE;     p[n++].what = "chrome_elf.dll's metadata";
+        p[n].lo = IOS_SC2_J2L_BASE;    p[n++].what = "libcef.dll's metadata";
+        p[n].lo = IOS_SC2_E_BASE;      p[n++].what = "chrome_elf.dll's pools";
+        if (rw_lo == IOS_SC2_RW_ALIAS && rw_hi > rw_lo && rw_hi < IOS_SC2_CAGE_BASE)
+        {
+            p[n].lo = IOS_SC2_RW_ALIAS; p[n++].what = "JIT pool RW alias";
+            p[n].lo = rw_hi;            p[n++].what = "above the RW alias";
+        }
+        else
+        {
+            p[n].lo = IOS_SC2_RW_ALIAS; p[n++].what = "JIT pool RW alias and above";
+        }
+        p[n].lo = IOS_SC2_CAGE_BASE;   p[n++].what = "V8 cage";
+        p[n].lo = IOS_SC2_OILPAN_BASE; p[n++].what = "Oilpan's cage";
+        p[n].lo = IOS_SC_ARENA_BASE;   p[n++].what = "FEX arena";
+    }
+    else
+    {
+        uint64_t a;
+        for (a = IOS_BAND_LO; a < IOS_BAND_HI; a += 0x400000000ULL) { p[n].lo = a; p[n++].what = "16 GB slot"; }
+    }
+    for (i = 0; i < n; i++) p[i].hi = i + 1 < n ? p[i + 1].lo : IOS_BAND_HI;
+    return n;
+}
+
+/* A region [lo, hi) with protection prot: split over the pieces it touches. */
+static void ios_band_region( struct ios_band_piece *p, int n, uint64_t lo, uint64_t hi, int prot,
+                             uint64_t resident, uint64_t dirty )
+{
+    int i;
+
+    for (i = 0; i < n; i++)
+    {
+        uint64_t a = lo > p[i].lo ? lo : p[i].lo, b = hi < p[i].hi ? hi : p[i].hi;
+        if (a >= b) continue;
+        p[i].regions++;
+        p[i].mapped += b - a;
+        if (prot)
+        {
+            p[i].used += b - a;
+            if (b - p[i].lo > p[i].top) p[i].top = b - p[i].lo;
+        }
+        if (lo >= p[i].lo && lo < p[i].hi) { p[i].resident += resident; p[i].dirty += dirty; }
+    }
+}
+
+/* An unmapped gap [lo, hi): the largest per piece, and the band's largest
+ * after aligning its start to 64 KB. */
+static void ios_band_gap( struct ios_band_piece *p, int n, uint64_t lo, uint64_t hi, uint64_t *gap, uint64_t *gap_at )
+{
+    uint64_t start = (lo + 0xffff) & ~0xffffULL;
+    int i;
+
+    if (lo >= hi) return;
+    for (i = 0; i < n; i++)
+    {
+        uint64_t a = lo > p[i].lo ? lo : p[i].lo, b = hi < p[i].hi ? hi : p[i].hi;
+        if (a < b && b - a > p[i].gap) p[i].gap = b - a;
+    }
+    if (start < hi && hi - start > *gap) { *gap = hi - start; *gap_at = start; }
+}
+
+static void ios_band_census( const char *why )
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t top_max[IOS_BAND_PIECES_MAX];
+    static unsigned count;
+    struct ios_band_piece p[IOS_BAND_PIECES_MAX];
+    uint64_t addr = IOS_BAND_LO, hi = IOS_BAND_HI, gap = 0, gap_at = 0, rw_lo, rw_hi;
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t vcnt = TASK_VM_INFO_COUNT;
+    unsigned walked = 0;
+    struct tm tm;
+    time_t now;
+    int i, n;
+
+    if (!ios_band_census_enabled() || pthread_mutex_trylock( &lock )) return;
+    if (count >= 64) { pthread_mutex_unlock( &lock ); return; }
+    count++;
+    rw_lo = (uint64_t)(uintptr_t)ios_jit_rw_base_global;
+    rw_hi = rw_lo + ios_jit_pool_size_global;
+    if (ios_jit_low_size_global)
+    {
+        uint64_t l = (uint64_t)ios_jit_low_rw_global;
+        if (l < rw_lo) rw_lo = l;
+        if (l + ios_jit_low_size_global > rw_hi) rw_hi = l + ios_jit_low_size_global;
+    }
+    n = ios_band_pieces( p, ios_sc_layout_mode, rw_lo, rw_hi );
+    if (task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vcnt ) == KERN_SUCCESS &&
+        vmi.max_address && (uint64_t)vmi.max_address < hi)
+        hi = (uint64_t)vmi.max_address;
+    if (hi <= IOS_BAND_LO)
+    {
+        dprintf( 2, "[band] census #%u (%s): the task map ends at 0x%llx, below the band\n", count, why,
+                 (unsigned long long)hi );
+        pthread_mutex_unlock( &lock );
+        return;
+    }
+    while (addr < hi)
+    {
+        mach_vm_address_t q = addr;
+        mach_vm_size_t size = 0;
+        vm_region_extended_info_data_t info;
+        mach_msg_type_number_t cnt = VM_REGION_EXTENDED_INFO_COUNT;
+        mach_port_t obj = MACH_PORT_NULL;
+        uint64_t end;
+
+        if (mach_vm_region( mach_task_self(), &q, &size, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info,
+                            &cnt, &obj ) != KERN_SUCCESS || q >= hi || !size)
+        {
+            ios_band_gap( p, n, addr, hi, &gap, &gap_at );
+            break;
+        }
+        if (q > addr) ios_band_gap( p, n, addr, q, &gap, &gap_at );
+        end = q + size > hi ? hi : q + size;
+        ios_band_region( p, n, q > addr ? q : addr, end, info.protection,
+                         (uint64_t)info.pages_resident << 14,
+                         ((uint64_t)info.pages_dirtied + info.pages_swapped_out) << 14 );
+        addr = end;
+        if (++walked >= 1000000)
+        {
+            dprintf( 2, "[band] census #%u: stopped after %u regions at 0x%llx\n", count, walked,
+                     (unsigned long long)addr );
+            break;
+        }
+    }
+    now = time( NULL );
+    localtime_r( &now, &tm );
+    dprintf( 2, "[band] census #%u (%s) %02d:%02d:%02d layout %d, [0x%llx,0x%llx) %u regions: largest gap %llu MB "
+                "at 0x%llx -- RDR2.exe's 8960 MB reserve %s (MADEIRA_BAND_CENSUS)\n",
+             count, why, tm.tm_hour, tm.tm_min, tm.tm_sec, ios_sc_layout_mode, IOS_BAND_LO,
+             (unsigned long long)hi, walked, (unsigned long long)(gap >> 20), (unsigned long long)gap_at,
+             gap >= IOS_BAND_RDR2_ASK ? "fits" : "does not fit" );
+    for (i = 0; i < n; i++)
+    {
+        if (p[i].top > top_max[i]) top_max[i] = p[i].top;
+        dprintf( 2, "[band]   [0x%llx,0x%llx) %s: regions=%u mapped=%llu used=%llu resident=%llu dirty=%llu MB, "
+                    "top +%llu MB (session +%llu MB), gap %llu MB\n",
+                 (unsigned long long)p[i].lo, (unsigned long long)p[i].hi, p[i].what, p[i].regions,
+                 (unsigned long long)(p[i].mapped >> 20), (unsigned long long)(p[i].used >> 20),
+                 (unsigned long long)(p[i].resident >> 20), (unsigned long long)(p[i].dirty >> 20),
+                 (unsigned long long)(p[i].top >> 20), (unsigned long long)(top_max[i] >> 20),
+                 (unsigned long long)(p[i].gap >> 20) );
+    }
+    pthread_mutex_unlock( &lock );
+}
+
 /* Which slot a SocialClubHelper.exe reserve gets in layout 2. `held` has bit k
  * for each slot still held; `e_mine` / `l_mine` / `cage_mine`: this helper
  * already got chrome_elf's block / libcef's block / the V8 cage. NONE leaves
@@ -26996,6 +27203,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
                         }
                     }
                 }
+                ios_band_census( "jumbo reserve failed" );   /* env.MADEIRA_BAND_CENSUS = 1 only */
                 if (probed++ < 2)
                 {
                     ios_va_gap_probe( "jumbo reserve failed" );

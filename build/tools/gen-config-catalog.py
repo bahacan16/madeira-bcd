@@ -70,6 +70,13 @@ OVERLAY = {
                         "relocations that can only run there (Red Dead Redemption 2). It moves other programs' "
                         "images (licensed GTA V Enhanced), so set it only in such a game's own file; read at "
                         "session start."},
+    "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "
+                        "each piece of [0x7000000000, 0x8000000000) uses (Social Club's pools and metadata, the "
+                        "furniture, the V8 and Oilpan cages, the FEX arena), the largest free gap, and whether Red "
+                        "Dead Redemption 2's 8960 MB reserve fits; 64 censuses at most. Logging only, changes no "
+                        "placement; read at session start."},
     "env.MADEIRA_EC_HOOK_TRACE": {"category": "Debugging / logs", "title": "Log code patches the emulated copy misses",
                 "kind": "bool", "default": "1",
                 "note": "Default on, logging only. Compare executable PE sections and their pool copies before "
