@@ -53,6 +53,8 @@ with tempfile.TemporaryDirectory() as tmp:
         conv = (t / "dxmt/src/airconv/nt/dxbc_converter_base.cpp").read_text()
         ctx = (t / "dxmt/src/airconv/airconv_context.cpp").read_text()
         dxc = (t / "dxmt/src/airconv/dxbc_converter.cpp").read_text()
+        ctl = wm[wm.index("static NTSTATUS _madeira_ctl(void *args) {"):]
+        ctl_ops = re.findall(r"^\s*case (\d+):", ctl[:ctl.index("\n}\n")], re.M)
         for what, cond in [
             ("cache salt for every converter experiment",
              all(n in cache for n in ("MADEIRA_TGSM_SYNC", "MADEIRA_SAMPLE_L_BIAS", "MADEIRA_PRECISE_MATH",
@@ -73,6 +75,8 @@ with tempfile.TemporaryDirectory() as tmp:
                                    "madeira_gt_note_texture(ret)", "madeira_gt_end_encoder(params->handle)"))
              and wm.count("madeira_gt_note_pso(params->ret_pso") == 3),
             ("MADEIRA_RP_LOAD and MADEIRA_BORDER experiments", "madeira_rp_load_on()" in wm and "madeira_note_border_sampler(info, sampler_desc)" in wm),
+            # build 452: two scripts each added a case 8 to the MadeiraCtl switch
+            ("every MadeiraCtl op (_madeira_ctl case value) is used once", len(ctl_ops) == len(set(ctl_ops))),
         ]:
             print(("ok   " if cond else "FAIL ") + what)
             ok &= cond

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pipeline cache warm-up for madeira-d3d12 (MadeiraCtl op 8).
+"""Pipeline cache warm-up for madeira-d3d12 (MadeiraCtl op 10).
 
 madeira-d3d12 builds a lazy pipeline at its first draw. Metal keeps what it
 compiled in its on-disk cache across sessions and builds: a pipeline this
@@ -14,11 +14,14 @@ runs on one of N serial utility-QoS queues and the pipeline is released at
 once. Only the compile is kept, in Metal's cache, so the first draw finds it;
 memory stays as lazy creation left it. [pso-warm] lines count compiled ones,
 ones already in the cache and the backlog. Without pso-warm, or in remote mode,
-op 8 answers 0 and madeira-d3d12 turns the warm-up off. The i386 entry does
-not forward op 8 (it carries pointers). Native only. Idempotent; fails by name
-if an anchor moves. Run from the repository root.
+op 10 answers 0 and madeira-d3d12 turns the warm-up off. The i386 entry does
+not forward op 10 (it carries pointers). Native only. Ops 8 and 9 belong to
+tools/patch-dxmt-gpu-fault-info.py (build 452 failed on a second case 8); this
+script stops if case 10 is already taken. Idempotent; fails by name if an
+anchor moves. Run from the repository root.
 """
 import pathlib
+import re
 import sys
 
 PATH = pathlib.Path("dxmt/src/winemetal/unix/winemetal_unix.c")
@@ -26,7 +29,7 @@ MARKER = "madeira-bcd: pipeline cache warm-up"
 
 ANCHOR_FN = "static NTSTATUS _madeira_ctl(void *args) {\n"
 HELPERS = r'''/* madeira-bcd: pipeline cache warm-up (tools/patch-winemetal-pso-warm.py).
- * MadeiraCtl op 8 from madeira-d3d12 (pso-warm = N): compile one lazy pipeline
+ * MadeiraCtl op 10 from madeira-d3d12 (pso-warm = N): compile one lazy pipeline
  * on a utility-QoS queue with DXMT's own builder, release it at once, keep
  * only Metal's cached compile. See the script for the numbers. */
 static dispatch_queue_t madeira_pso_warm_q[4];
@@ -141,7 +144,7 @@ ANCHOR_CASE = """  case 6:     /* ml1136: requested fence-chain mode (0 = none) 
     a->ret = (uint32_t)g_madeira_fence_req;
     break;
 """
-CASE = """  case 8: {   /* madeira-bcd: pipeline cache warm-up (tools/patch-winemetal-pso-warm.py); len = kind
+CASE = """  case 10: {  /* madeira-bcd: pipeline cache warm-up (tools/patch-winemetal-pso-warm.py); len = kind
                * (0 render, 1 render + vertex descriptor, 2 compute), ptr = { device, info, vd } */
     const uint64_t *r = (const uint64_t *)(uintptr_t)a->ptr;
     if (!r || wmtr_enabled() || !madeira_pso_warm_setup()) break;
@@ -161,6 +164,10 @@ def main():
         sys.exit("patch-winemetal-pso-warm: _madeira_ctl anchor not found once")
     if src.count(ANCHOR_CASE) != 1:
         sys.exit("patch-winemetal-pso-warm: _madeira_ctl op 6 anchor not found once")
+    fn_at = src.index(ANCHOR_FN)
+    body = src[fn_at:src.index("\n}\n", fn_at)]
+    if re.search(r"^\s*case 10:", body, re.M):
+        sys.exit("patch-winemetal-pso-warm: _madeira_ctl already has a case 10 (pick a free op)")
     for fn in ("_MTLDevice_newRenderPipelineState(void *obj) {", "_MTLDevice_newRenderPipelineStateVD(void *obj) {",
                "_MTLDevice_newComputePipelineState(void *obj) {"):
         at = src.find(fn)
@@ -169,7 +176,7 @@ def main():
     src = src.replace(ANCHOR_FN, HELPERS + ANCHOR_FN)
     src = src.replace(ANCHOR_CASE, ANCHOR_CASE + CASE)
     PATH.write_text(src)
-    print("patch-winemetal-pso-warm: MadeiraCtl op 8 warms lazy pipelines on utility queues with madeira.cfg pso-warm = N")
+    print("patch-winemetal-pso-warm: MadeiraCtl op 10 warms lazy pipelines on utility queues with madeira.cfg pso-warm = N")
     return 0
 
 

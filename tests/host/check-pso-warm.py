@@ -3,13 +3,14 @@
 winemetal compiles copies of them on its queues; no Metal, no Wine.
 
 madeira-d3d12 (madeira.cfg / a game's config pso-warm = N) sends every lazy
-pipeline to winemetal at creation (MadeiraCtl op 8), and
+pipeline to winemetal at creation (MadeiraCtl op 10), and
 tools/patch-winemetal-pso-warm.py makes winemetal build it with DXMT's own
 builder on one of N utility queues and release it at once, so only Metal's
 cached compile stays (first draws: 35-47 ms new, 0.3-0.5 ms cached; GTA V
 Enhanced, builds 447-451). Checks:
-  - the patch applies once to winemetal_unix.c (idempotent), puts op 8 in
-    _madeira_ctl, and the i386 entry still forwards op 7 only;
+  - the patch applies once to winemetal_unix.c after the GPU fault patch (ops
+    8 and 9; build 452 failed on a second case 8), puts op 10 in _madeira_ctl
+    with no case value twice, and the i386 entry still forwards op 7 only;
   - the patch's own code, compiled against a fake GCD that runs blocks at once:
     off (pso-warm unset) answers 0 and builds nothing; with pso-warm = 2 a
     render, a render + vertex descriptor and a compute request each answer 1,
@@ -18,7 +19,7 @@ Enhanced, builds 447-451). Checks:
     built pipeline, and leave every retain balanced; bad requests answer 0;
     the [pso-warm] line splits compiled ones from cache hits;
   - madeira_d3d12.c sends both lazy kinds (render at its lazy point, compute
-    with the descriptor mad_cpso_realize builds) and stops when op 8 answers 0;
+    with the descriptor mad_cpso_realize builds) and stops when op 10 answers 0;
   - build-ipa.yml runs the patch.
 Needs python3 and a C compiler with -fblocks (clang).
 """
@@ -31,6 +32,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 patch = root / 'tools/patch-winemetal-pso-warm.py'
+fault_patch = root / 'tools/patch-dxmt-gpu-fault-info.py'   # runs earlier in build-ipa.yml
 wm_src = root / 'dxmt/src/winemetal/unix/winemetal_unix.c'
 d3d12 = (root / 'madeira-d3d12/src/pe/madeira_d3d12.c').read_text()
 workflow = (root / '.github/workflows/build-ipa.yml').read_text()
@@ -41,6 +43,8 @@ with tempfile.TemporaryDirectory(prefix='madeira-pso-warm-') as directory:
     target = tree / 'dxmt/src/winemetal/unix/winemetal_unix.c'
     target.parent.mkdir(parents=True)
     shutil.copy(wm_src, target)
+    fault = subprocess.run(['python3', str(fault_patch)], cwd=tree, capture_output=True, text=True)
+    assert fault.returncode == 0, fault.stdout + fault.stderr
     first = subprocess.run(['python3', str(patch)], cwd=tree, capture_output=True, text=True)
     assert first.returncode == 0, first.stdout + first.stderr
     second = subprocess.run(['python3', str(patch)], cwd=tree, capture_output=True, text=True)
@@ -49,15 +53,17 @@ with tempfile.TemporaryDirectory(prefix='madeira-pso-warm-') as directory:
 
 ctl = patched[patched.index('static NTSTATUS _madeira_ctl(void *args) {'):]
 ctl = ctl[:ctl.index('\n}\n') + 3]
-assert '  case 8: {' in ctl and 'madeira_pso_warm_submit(' in ctl, 'op 8 is not in _madeira_ctl'
+assert '  case 10: {' in ctl and 'madeira_pso_warm_submit(' in ctl, 'op 10 is not in _madeira_ctl'
+cases = re.findall(r'^\s*case (\d+):', ctl, re.M)
+assert len(cases) == len(set(cases)), f'_madeira_ctl has a case value twice: {sorted(cases, key=int)}'
 wow = patched[patched.index('static NTSTATUS _madeira_ctl_wow64(void *args) {'):]
 wow = wow[:wow.index('\n}\n') + 3]
-assert 'a->op == 7' in wow and 'op == 8' not in wow, 'the i386 entry must not forward op 8'
-print('PASS: the patch applies once, op 8 lives in _madeira_ctl, the i386 entry forwards op 7 only')
+assert 'a->op == 7' in wow and 'op == 10' not in wow, 'the i386 entry must not forward op 10'
+print('PASS: the patch applies once after the GPU fault patch, op 10 lives in _madeira_ctl, no case twice, the i386 entry forwards op 7 only')
 
 # --- the patch's code, run --------------------------------------------------
 helpers = patched[patched.index('/* madeira-bcd: pipeline cache warm-up'):patched.index('static NTSTATUS _madeira_ctl(void *args) {')]
-case = ctl[ctl.index('  case 8: {'):]
+case = ctl[ctl.index('  case 10: {'):]
 case = case[:case.index('    break;\n  }\n') + len('    break;\n  }\n')]
 # Objective-C -> C for the host: retains and releases are counted, the pool is a block scope.
 c_code = helpers
@@ -133,7 +139,7 @@ static NTSTATUS _MTLDevice_newComputePipelineState(void *obj) {
 static uint32_t op8(unsigned kind, const void *info, const void *vd) {
     struct madeira_ctl_args args; struct madeira_ctl_args *a = &args;
     uint64_t r[3] = { 7, (uint64_t)(uintptr_t)info, (uint64_t)(uintptr_t)vd };
-    memset(a, 0, sizeof *a); a->op = 8; a->len = kind; a->ptr = (uint64_t)(uintptr_t)r;
+    memset(a, 0, sizeof *a); a->op = 10; a->len = kind; a->ptr = (uint64_t)(uintptr_t)r;
     switch (a->op) {
 ''' + case + r'''
     default: break;
@@ -188,7 +194,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-pso-warm-c-') as directory:
         assert r.returncode == 0, r.stderr
     off = subprocess.run([str(exe), '0'], capture_output=True, text=True)
     assert off.returncode == 0 and off.stdout.strip() == 'OFF', off.stdout + off.stderr
-    print('PASS: pso-warm unset: op 8 answers 0, no queue is made, nothing is built')
+    print('PASS: pso-warm unset: op 10 answers 0, no queue is made, nothing is built')
     on = subprocess.run([str(exe), '2'], capture_output=True, text=True)
     assert on.returncode == 0, on.stdout + on.stderr
     sent, done, hits, failed = map(int, on.stdout.split()[1:])
@@ -203,8 +209,8 @@ with tempfile.TemporaryDirectory(prefix='madeira-pso-warm-c-') as directory:
 # --- madeira_d3d12.c --------------------------------------------------------
 warm = d3d12[d3d12.index('static void mad_pso_warm('):]
 warm = warm[:warm.index('\n}\n') + 3]
-assert 'mad_cfg_int_pe("pso-warm", 0)' in warm and 'a.op = 8' in warm
-assert re.search(r'if \(!a\.ret\) \{\s*on = 0;', warm), 'the warm-up must stop when op 8 answers 0'
+assert 'mad_cfg_int_pe("pso-warm", 0)' in warm and 'a.op = 10' in warm
+assert re.search(r'if \(!a\.ret\) \{\s*on = 0;', warm), 'the warm-up must stop when op 10 answers 0'
 assert 'mad_pso_warm(p->device_handle, &p->rp, p->has_vd ? &p->vd : NULL, p->has_vd ? 1 : 0);' in d3d12
 lazy_cs = d3d12[d3d12.index('p->lazy_cs = 1; p->device_handle = d->mtl_device;'):]
 lazy_cs = lazy_cs[:lazy_cs.index('return hr;')]
@@ -213,7 +219,7 @@ realize_cs = d3d12[d3d12.index('static obj_handle_t mad_cpso_realize('):]
 realize_cs = realize_cs[:realize_cs.index('\n}\n')]
 assert 'memset(&ci, 0, sizeof ci);' in realize_cs and 'ci.compute_function = p->vs_fn;' in realize_cs
 print('PASS: madeira_d3d12.c sends render pipelines at their lazy point and compute ones with mad_cpso_realize\'s '
-      'descriptor, and stops when op 8 answers 0')
+      'descriptor, and stops when op 10 answers 0')
 
 steps = re.findall(r'python3 (tools/patch-winemetal-[\w.-]+\.py)', workflow)
 assert 'tools/patch-winemetal-pso-warm.py' in steps, 'build-ipa.yml does not run the patch'

@@ -2751,12 +2751,12 @@ static int mad_pso_lazy_on(void) {   /* madeira-bcd: madeira.cfg pso-lazy (defau
  * builds, so a pipeline this device has built before takes 0.3-0.5 ms there and a
  * new one 35-47 ms (GTA V Enhanced, builds 447-451, where new ones came in bursts
  * that froze the game for 100-400 ms). With the switch on, every lazy pipeline is
- * handed to winemetal when the game creates it (MadeiraCtl op 8,
+ * handed to winemetal when the game creates it (MadeiraCtl op 10,
  * tools/patch-winemetal-pso-warm.py): DXMT's own builder compiles the same
  * descriptor on a utility-QoS queue and releases the pipeline at once, so only
  * the compile is kept, in Metal's cache, and memory stays as lazy creation left
- * it. The game's thread does not wait. A winemetal without op 8 answers 0 and the
- * warm-up turns itself off. */
+ * it. The game's thread does not wait. A winemetal without op 10 answers 0 and
+ * the warm-up turns itself off. */
 struct mad_pso_warm_req { UINT64 device, info, vd; };
 static void mad_pso_warm(obj_handle_t device, const void *info, const void *vd, UINT kind) {
     static int on = -1;
@@ -2766,11 +2766,11 @@ static void mad_pso_warm(obj_handle_t device, const void *info, const void *vd, 
                   if (on) d3d12_log("[madeira-d3d12] pso-warm: lazy pipelines are compiled once in the background when the game creates them (madeira.cfg pso-warm)\n"); }
     if (!on || !device || !info) return;
     r.device = device; r.info = (UINT64)(ULONG_PTR)info; r.vd = (UINT64)(ULONG_PTR)vd;
-    memset(&a, 0, sizeof a); a.op = 8; a.len = kind; a.ptr = (UINT64)(ULONG_PTR)&r;
+    memset(&a, 0, sizeof a); a.op = 10; a.len = kind; a.ptr = (UINT64)(ULONG_PTR)&r;
     MadeiraCtl(&a);   /* winemetal copies the descriptors before it returns */
     if (!a.ret) {
         on = 0;
-        d3d12_log("[madeira-d3d12] pso-warm: winemetal took no warm-up request (no op 8, or remote mode); warm-up off\n");
+        d3d12_log("[madeira-d3d12] pso-warm: winemetal took no warm-up request (no op 10, or remote mode); warm-up off\n");
         return;
     }
     if (InterlockedIncrement(&sent) == 1)
