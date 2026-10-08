@@ -16,6 +16,8 @@ over a scripted map and checks:
   - the session's highest used offset per piece is kept across censuses;
   - an RW alias elsewhere gives one "RW alias and above" piece, another layout
     four 16 GB slots, a task map ending below the band one line;
+  - with MADEIRA_RDR2_VA_HOLD's geometry the pieces follow it and the RDR2
+    hold has its own;
   - at most 64 censuses;
 and textually that the census runs with the periodic slot probe and at a
 failed large reserve after the boot holdback was tried.
@@ -89,6 +91,7 @@ static void add(uint64_t lo, uint64_t hi, int prot, unsigned res, unsigned dirty
 { map[map_n].lo = lo; map[map_n].hi = hi; map[map_n].prot = prot; map[map_n].res = res;
   map[map_n].dirty = dirty; map[map_n].swapped = swapped; map_n++; }
 static int ios_sc_layout_mode = 2;
+static int ios_sc2_rdr2;
 static void *ios_jit_rw_base_global = (void *)0x7900000000ull;
 static size_t ios_jit_pool_size_global = 0x52848000;
 static uintptr_t ios_jit_low_rw_global;
@@ -236,6 +239,23 @@ int main(int argc, char **argv)
         printf("PASS: with pool-low the alias piece covers region C's alias and the pool's\n");
         return 0;
     }
+    if (!strcmp(s, "rdr2"))
+    {
+        /* MADEIRA_RDR2_VA_HOLD: libcef 2 + 2 GB, chrome_elf metadata 7424 MB, the hold below chrome_elf's pools */
+        ios_sc2_rdr2 = 1;
+        ios_band_census("periodic");
+        if (!has("layout 2 with MADEIRA_RDR2_VA_HOLD, [0x7000000000,0x8000000000)")) return fail("the header does not name the variant");
+        if (count("[band]   [") != 11) return fail("the variant does not have eleven pieces");
+        if (!has("[band]   [0x7000000000,0x7080000000) libcef.dll's pools:") ||
+            !has("[band]   [0x7080000000,0x7100000000) libcef.dll's metadata:") ||
+            !has("[band]   [0x7100000000,0x7400000000) furniture:") ||
+            !has("[band]   [0x7400000000,0x75d0000000) chrome_elf.dll's metadata:") ||
+            !has("[band]   [0x75d0000000,0x7800000000) RDR2 hold:") ||
+            !has("[band]   [0x7800000000,0x7900000000) chrome_elf.dll's pools:"))
+            return fail("the variant's pieces are wrong");
+        printf("PASS: with MADEIRA_RDR2_VA_HOLD the census follows its geometry and names the hold\n");
+        return 0;
+    }
     if (!strcmp(s, "layout0"))
     {
         ios_sc_layout_mode = 0;
@@ -276,7 +296,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-band-census-') as directory:
                             '-fsanitize=address,undefined', '-o', str(exe), str(c), '-lpthread'],
                            capture_output=True, text=True)
     assert build.returncode == 0, build.stdout + build.stderr
-    for scenario in ('off', '457', 'fits', 'session', 'alias', 'low', 'layout0', 'ceiling', 'cap'):
+    for scenario in ('off', '457', 'fits', 'session', 'alias', 'low', 'rdr2', 'layout0', 'ceiling', 'cap'):
         env = {k: v for k, v in os.environ.items() if not k.startswith('MADEIRA_')}
         if scenario != 'off':
             env['MADEIRA_BAND_CENSUS'] = '1'

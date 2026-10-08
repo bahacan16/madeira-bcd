@@ -70,6 +70,13 @@ OVERLAY = {
                         "relocations that can only run there (Red Dead Redemption 2). It moves other programs' "
                         "images (licensed GTA V Enhanced), so set it only in such a game's own file; read at "
                         "session start."},
+    "env.MADEIRA_RDR2_VA_HOLD": {"category": "Memory & JIT pool", "title": "Keep 8960 MB free for Red Dead Redemption 2",
+                "kind": "bool", "default": "0",
+                "note": "Default off; only with env.MADEIRA_SC_PA_POOLS = 2. 1: Social Club's layout 2 keeps libcef.dll's "
+                        "PartitionAlloc pools and metadata at 2 GB each and chrome_elf.dll's metadata at 7.25 GB, and "
+                        "holds [0x75d0000000, 0x7800000000) from boot for one 8960 MB reserve, the one Red Dead "
+                        "Redemption 2 makes as it starts. Set it only in that game's own file; GTA V keeps layout 2 as "
+                        "it is. Read at session start."},
     "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "
