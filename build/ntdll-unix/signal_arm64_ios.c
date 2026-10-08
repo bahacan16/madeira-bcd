@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <unistd.h>
 #ifdef WINE_IOS
@@ -1441,6 +1442,33 @@ static int ios_x18_derived_base( uint64_t fault_pc, int rn )
  * ran and hit the 4096MB jetsam limit four seconds later. Pages mincore()
  * reports neither resident nor paged out were never written; they stay holes,
  * so file offsets still equal pool offsets (head copies and tail CodeBuffers). */
+/* madeira-bcd: the dump is opt-in now. A mach UNHANDLED is any fault the handler
+ * passes on to Wine's own exception path, i.e. every guest access violation a game
+ * or the Rockstar Games Launcher catches itself, so the old default fired in every
+ * licensed session long before anything failed (build 460, log 2026-10-08
+ * 23:59:11: the launcher's first one, at start-up) and wrote ~930 MB of pool to
+ * Documents each time, for a file too large to send. */
+static int ios_jit_dump_enabled( void )
+{
+    /* 1: write Documents/fex-jit-dump.bin (the JIT pool, sparse) on the first mach UNHANDLED / SIGILL (ml1242); default 0. */
+    const char *jd = getenv( "MADEIRA_JIT_DUMP" );
+    return jd && jd[0] == '1';
+}
+
+/* Without the switch, remove a dump an earlier session left in Documents. */
+static void ios_jit_dump_remove_stale( void )
+{
+    const char *docs = getenv( "MADEIRA_DOCS_DIR" );
+    char path[512];
+    struct stat st;
+
+    if (ios_jit_dump_enabled() || !docs || !*docs) return;
+    if (snprintf( path, sizeof(path), "%s/fex-jit-dump.bin", docs ) >= (int)sizeof(path)) return;
+    if (stat( path, &st ) || unlink( path )) return;
+    dprintf( 2, "[jit-dump] removed %s (%lld MB) left by an earlier session; MADEIRA_JIT_DUMP=1 writes it again\n",
+             path, (long long)(st.st_size >> 20) );
+}
+
 static void ios_dump_jit_pool( const char *why )
 {
     extern void *ios_jit_rw_base_global;
@@ -1451,10 +1479,7 @@ static void ios_dump_jit_pool( const char *why )
     char path[512], vec[256];   /* one byte per page of a 1MB chunk, down to 4KB pages */
     int fd;
 
-    const char *jd = getenv( "MADEIRA_JIT_DUMP" );
-    /* 0: no Documents/fex-jit-dump.bin; by default the JIT pool is written (sparse) on the
-     * first mach UNHANDLED / SIGILL, and pulled with the log (ml1242) */
-    if ((jd && jd[0] == '0') || !ios_jit_rw_base_global || !total) return;
+    if (!ios_jit_dump_enabled() || !ios_jit_rw_base_global || !total) return;
     docs = getenv( "MADEIRA_DOCS_DIR" );
     snprintf( path, sizeof(path), "%s/fex-jit-dump.bin", docs ? docs : "/tmp" );
     if ((fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0644 )) < 0)
@@ -1500,6 +1525,7 @@ static void *ios_mach_exception_thread( void *arg )
     pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
 
     ios_exc_thread_alive = 1;
+    ios_jit_dump_remove_stale();
 
     for (;;)
     {
