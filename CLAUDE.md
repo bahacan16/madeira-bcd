@@ -15,6 +15,11 @@ assistants: ask the owner for the current notes.
 and what is still open. Append; never delete earlier findings. Findings
 without code changes are recorded too.
 
+**Also mandatory (owner's decision, 2026-10-08):** keep the private
+`notes/OYUN-AYARLARI.md` on the same page: for every build and game, the
+config lines that worked (or failed) in a device test, newest build first,
+nothing deleted.
+
 **Keep progress out of this repository:** no handoff or investigation
 documents in `docs/`, and commit messages stay one short line (no logs,
 evidence or analysis).
