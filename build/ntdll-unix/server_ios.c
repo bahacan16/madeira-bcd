@@ -1872,6 +1872,85 @@ static void ios_xp_name_native( pthread_t pt, uint64_t tid )
     wine_log_write( "[xp-names] m%llu \"%s\"", (unsigned long long)tid, name[0] ? name : "(unnamed)" );
 }
 
+/* madeira-bcd: CPU power governor (opt-in: env.MADEIRA_POWER_GOV_MW = target in mW).
+ * The SoC clamps the CPU once a budget of energy spent above ~2.3 W is used up:
+ * ml1133 (sync.c, above ios_eco_gen) measured ~250 J in six runs within 3 %, and in
+ * builds 442/447 (2026-10-08) GTA V Enhanced was clamped at the start of play to P
+ * 1.31 / E 1.70 GHz and 0.5-0.9 W of process CPU power, 404-462 J into the session,
+ * after loading screens at 3-5 W. Bursting and then running clamped wastes the budget,
+ * so while a game presents this holds the process's CPU power ([xp]'s ri_energy_nj)
+ * at the target on average: a running balance of (power - target) x time turns ECO on
+ * (guest threads at utility QoS: efficiency cores, lower clocks) when it exceeds
+ * +MADEIRA_POWER_GOV_BAND_MJ (default 1000) and off when it falls below -BAND, at most
+ * one switch per 500 ms. When no game presents, ECO goes back to what it was before.
+ * [power-gov] summarises every 10 s. */
+extern void madeira_set_eco( int on );
+extern int madeira_get_eco( void );
+
+static void ios_power_gov_step( uint64_t now, double dt_ms, double mj )
+{
+    static int target_mw = -1, band_mj, base, active;
+    static double balance, sum_mj, sum_ms, eco_ms;
+    static unsigned switches;
+    static uint64_t last_switch, last_report;
+    uint64_t seen;
+    int eco;
+
+    if (target_mw < 0)
+    {
+        const char *e = getenv( "MADEIRA_POWER_GOV_MW" );   /* process CPU power target (mW) while a game presents; unset/0 = off */
+        const char *b = getenv( "MADEIRA_POWER_GOV_BAND_MJ" );   /* energy (mJ) the running balance may drift before ECO switches (1000) */
+        target_mw = e ? atoi( e ) : 0;
+        if (target_mw < 0 || target_mw > 20000) target_mw = 0;
+        band_mj = b ? atoi( b ) : 1000;
+        if (band_mj < 50 || band_mj > 100000) band_mj = 1000;
+        if (target_mw)
+            wine_log_write( "[power-gov] on: process CPU power held at %d mW while a game presents (band %d mJ; "
+                            "MADEIRA_POWER_GOV_MW, MADEIRA_POWER_GOV_BAND_MJ)", target_mw, band_mj );
+    }
+    if (!target_mw || dt_ms <= 0) return;
+    seen = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_ACQUIRE );
+    if (!seen || now - seen >= IOS_BG_QOS_HOLD_NS)
+    {
+        if (active)   /* the game stopped presenting: ECO back to what it was */
+        {
+            active = 0;
+            if (madeira_get_eco() != base) madeira_set_eco( base );
+            wine_log_write( "[power-gov] the game stopped presenting: ECO back %s", base ? "on" : "off" );
+        }
+        return;
+    }
+    eco = madeira_get_eco();   /* re-read: the ECO pill may have moved it */
+    if (!active)
+    {
+        active = 1;
+        base = eco;
+        balance = sum_mj = sum_ms = eco_ms = 0;
+        switches = 0;
+        last_switch = last_report = now;
+    }
+    balance += mj - target_mw * dt_ms / 1000.0;
+    if (balance > 3.0 * band_mj) balance = 3.0 * band_mj;     /* a long burst buys no long ECO stretch */
+    if (balance < -3.0 * band_mj) balance = -3.0 * band_mj;   /* nor a long idle stretch a long burst */
+    sum_mj += mj;
+    sum_ms += dt_ms;
+    if (eco) eco_ms += dt_ms;
+    if (now - last_switch >= 500000000ull && ((!eco && balance > band_mj) || (eco && balance < -band_mj)))
+    {
+        madeira_set_eco( !eco );
+        last_switch = now;
+        switches++;
+    }
+    if (now - last_report >= 10000000000ull && sum_ms > 0)
+    {
+        wine_log_write( "[power-gov] last %.0f s: %.2f W average (target %.2f W), ECO on %.0f%% of the time, %u switches",
+                        sum_ms / 1000.0, sum_mj / sum_ms, target_mw / 1000.0, 100.0 * eco_ms / sum_ms, switches );
+        last_report = now;
+        sum_mj = sum_ms = eco_ms = 0;
+        switches = 0;
+    }
+}
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -1974,6 +2053,7 @@ static void ios_xprobe_main( void )
             double pcy = (double)(ru.ri_pcycles - pru.ri_pcycles), cy = (double)(ru.ri_cycles - pru.ri_cycles);
             double ins = (double)(ru.ri_instructions - pru.ri_instructions);
             double qf = (have_pe && pe.magic == 0x3130305058444d4dLL && pe.qpf) ? 1000.0 / (double)pe.qpf : 0;
+            ios_power_gov_step( ios_bg_now_ns(), dt_ms, (double)(ru.ri_energy_nj - pru.ri_energy_nj) / 1e6 );
             gettimeofday( &tv, NULL ); localtime_r( &tv.tv_sec, &tmv );
             snprintf( wall, sizeof(wall), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)(tv.tv_usec / 1000) );
             n = snprintf( line, sizeof(line),
