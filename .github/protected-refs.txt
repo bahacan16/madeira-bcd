@@ -3,3 +3,4 @@
 # .github/workflows/protect-refs.yml creates each missing tag once and never
 # moves or deletes one.
 build-451 72b504c61f6dad5baebc2c3c00ecd56c4f6f0813   # OTA 0.1.451, owner's known-good backup (2026-10-08)
+build-456 328edf1067cec79220e8d208b16bd2a8623778f9   # OTA 0.1.456, last licensed GTA build that worked before the RDR2 work (2026-10-08)
