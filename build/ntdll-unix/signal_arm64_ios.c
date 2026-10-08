@@ -2360,6 +2360,17 @@ static void *ios_mach_exception_thread( void *arg )
                                     memset( top, 0, sizeof(top) );
                                 }
                             }
+                            /* madeira-bcd: an EC import stub that reached this
+                             * PE address through check_icall gets the copy
+                             * address in its AuxiliaryIAT slot, so its next
+                             * call does not fault (virtual_ios.c aux-IAT heal) */
+                            {
+                                extern int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr,
+                                                                 void *thread_peb, uintptr_t jit_pc );
+                                ios_jit_heal_aux_iat( (uintptr_t)fault_pc,
+                                                      (uintptr_t)__darwin_arm_thread_state64_get_lr(state),
+                                                      fault_owner_peb, (uintptr_t)jit_pc );
+                            }
                             __darwin_arm_thread_state64_set_pc_fptr(state, jit_pc);
                             ios_exc_x18_fixes++;
                             handled = 1;

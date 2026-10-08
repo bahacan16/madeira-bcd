@@ -5456,6 +5456,163 @@ int ios_jit_patch_stale_pointer(unsigned long long stale_va)
     return patched;
 }
 
+/* madeira-bcd: aux-IAT heal (begin). An ARM64EC DLL calls an import through
+ * a linker stub, `adrp x16, slot; ldr x16, [x16, #imm]; br x16`, whose slot is
+ * in the image's AuxiliaryIAT. Windows' loader stores the native target there
+ * when the import is EC code; Wine's never does, so the slot keeps its default,
+ * the stub's own continuation: `adrp x11, iat; ldr x11, [x11, #imm]; adrp x10,
+ * exit_thunk; add x10, ...; b helper`, which calls __os_arm64x_check_icall on
+ * the main IAT value. Where that value is an x64 fast-forward thunk (the slot
+ * kernel32 re-exports to x64 code keeps it, ml943), check_icall decodes it to
+ * the export's PE address, which is not executable here: every call is one
+ * Mach exec fault and a redirect to the image copy. Licensed GTA V Enhanced
+ * (build 437) took ~17,000 a second, 90% of them kernel32!timeGetTime calling
+ * ntdll!RtlQueryPerformanceCounter and RtlQueryPerformanceFrequency in the
+ * Launcher, the game and Social Club, each stalling its thread for a round trip
+ * through the exception thread (20-60% of a core).
+ *
+ * On such a redirect the fault handler hands us the faulting pc, lr and the
+ * thread's process. When lr - 4 is a BL to that stub shape, the stub's slot
+ * still holds the continuation, the continuation's main IAT value is the
+ * target or a thunk that decodes to exactly it, and the caller's copy is used
+ * by this process alone, the slot gets the copy address the redirect itself
+ * uses for this process. The stub then branches there directly: the same
+ * code, arguments and return address, minus the check_icall pass and the
+ * fault. A later re-sync of the page that restores the default is healed again
+ * by the next fault. MADEIRA_AUX_IAT_HEAL=0 leaves the slots alone. */
+static int ios_aux_heal_enabled( void )
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_AUX_IAT_HEAL" );  /* 0: EC import stubs keep the exec-fault redirect */
+        cached = !(e && e[0] == '0' && !e[1]);
+    }
+    return cached;
+}
+
+static uintptr_t ios_aux_adrp_page( uintptr_t pc, uint32_t insn )
+{
+    int64_t imm = (int64_t)((((insn >> 5) & 0x7FFFFu) << 2) | ((insn >> 29) & 3u));
+    imm = (imm << 43) >> 43;   /* sign-extend 21 bits */
+    return (pc & ~(uintptr_t)0xFFF) + (uintptr_t)(imm << 12);
+}
+
+/* index of the mapping whose JIT copy holds `rx`, or of the PE image holding
+ * `pe` (when rx is 0), or -1 */
+static int ios_aux_find_mapping( uintptr_t rx, uintptr_t pe )
+{
+    int i;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b = rx ? (uintptr_t)ios_jit_mappings[i].jit_base : (uintptr_t)ios_jit_mappings[i].pe_base;
+        uintptr_t a = rx ? rx : pe;
+        if (b && a >= b && a < b + ios_jit_mappings[i].size) return i;
+    }
+    return -1;
+}
+
+int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, uintptr_t jit_pc )
+{
+    static const unsigned char ffs[10] = { 0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x5d, 0xe9 };
+    static volatile int healed;
+    uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
+    size_t pool = ios_jit_pool_size_global;
+    uintptr_t call, stub, cont, slot, main_slot, jb, end, pe_cont, text_lo, text_hi;
+    uint32_t bl, s0, s1, s2, c0, c1;
+    uint64_t cur, value;
+    int i, k, n;
+
+    if (!ios_aux_heal_enabled() || !rx || !rw || !pool || !thread_peb) return 0;
+    if ((lr & 3) || lr < rx + 4 || lr >= rx + pool) return 0;
+    if (jit_pc < rx || jit_pc >= rx + pool) return 0;
+    call = lr - 4;
+    if ((i = ios_aux_find_mapping( call, 0 )) < 0) return 0;
+    /* the caller's copy must be this process's alone */
+    if (ios_jit_mappings[i].owner_peb)
+    {
+        if (ios_jit_mappings[i].owner_peb != thread_peb) return 0;
+    }
+    else
+    {
+        if (ios_jit_mappings[i].map_peb != thread_peb) return 0;
+        for (k = 0; k < ios_jit_mapping_count; k++)
+            if (k != i && ios_jit_mappings[k].pe_base == ios_jit_mappings[i].pe_base) return 0;
+    }
+    jb = (uintptr_t)ios_jit_mappings[i].jit_base;
+    end = jb + ios_jit_mappings[i].size;
+    text_lo = jb + ios_jit_mappings[i].text_offset;
+    text_hi = text_lo + ios_jit_mappings[i].text_size;
+
+    bl = *(volatile uint32_t *)call;
+    if ((bl & 0xFC000000u) != 0x94000000u) return 0;                     /* BL imm26 */
+    stub = call + (uintptr_t)((intptr_t)((int32_t)(bl << 6) >> 6) * 4);
+    if ((stub & 3) || stub < jb || stub + 20 > end) return 0;
+    s0 = ((volatile uint32_t *)stub)[0];
+    s1 = ((volatile uint32_t *)stub)[1];
+    s2 = ((volatile uint32_t *)stub)[2];
+    if ((s0 & 0x9F00001Fu) != 0x90000010u) return 0;                     /* ADRP x16 */
+    if ((s1 & 0xFFC003FFu) != 0xF9400210u) return 0;                     /* LDR x16, [x16, #imm] */
+    if (s2 != 0xD61F0200u) return 0;                                      /* BR x16 */
+    cont = stub + 12;
+    c0 = ((volatile uint32_t *)cont)[0];
+    c1 = ((volatile uint32_t *)cont)[1];
+    if ((c0 & 0x9F00001Fu) != 0x9000000Bu) return 0;                     /* ADRP x11 */
+    if ((c1 & 0xFFC003FFu) != 0xF940016Bu) return 0;                     /* LDR x11, [x11, #imm] */
+    slot = ios_aux_adrp_page( stub, s0 ) + ((s1 >> 10) & 0xFFFu) * 8;
+    main_slot = ios_aux_adrp_page( cont, c0 ) + ((c1 >> 10) & 0xFFFu) * 8;
+    if ((slot & 7) || slot < jb || slot + 8 > end) return 0;
+    if ((main_slot & 7) || main_slot < jb || main_slot + 8 > end) return 0;
+    if (ios_jit_mappings[i].text_size && slot + 8 > text_lo && slot < text_hi) return 0;
+    /* a static import: the main slot is in the image's IAT directory (a delay-load
+     * slot, whose DLL may be unloaded again, is not) */
+    {
+        const unsigned char *pe = ios_jit_mappings[i].pe_base;
+        uint32_t lfanew, iat_rva, iat_size, rva = (uint32_t)(main_slot - jb);
+        memcpy( &lfanew, pe + 0x3c, 4 );
+        if (lfanew < 0x40 || lfanew > 0x1000 || memcmp( pe + lfanew, "PE\0\0", 4 )) return 0;
+        if (*(const uint16_t *)(pe + lfanew + 24) != 0x20b) return 0;                 /* PE32+ */
+        memcpy( &iat_rva, pe + lfanew + 24 + 112 + 8 * 12, 4 );                     /* DataDirectory[IAT] */
+        memcpy( &iat_size, pe + lfanew + 24 + 112 + 8 * 12 + 4, 4 );
+        if (rva < iat_rva || rva + 8 > (uint64_t)iat_rva + iat_size) return 0;
+    }
+
+    /* still the default: the continuation, as a copy or a PE address */
+    cur = *(volatile uint64_t *)slot;
+    pe_cont = (uintptr_t)ios_jit_mappings[i].pe_base + (cont - jb);
+    if (cur != cont && cur != pe_cont) return 0;
+
+    /* the continuation's main IAT value is the target, or a thunk to exactly it */
+    value = *(volatile uint64_t *)main_slot;
+    if (value != fault_pc)
+    {
+        int t = ios_aux_find_mapping( 0, (uintptr_t)value );
+        int32_t rel;
+        if (t < 0 || (uintptr_t)value + 14 > (uintptr_t)ios_jit_mappings[t].pe_base + ios_jit_mappings[t].size) return 0;
+        if (memcmp( (const void *)(uintptr_t)value, ffs, sizeof(ffs) )) return 0;
+        memcpy( &rel, (const unsigned char *)(uintptr_t)value + 10, 4 );
+        if ((uintptr_t)value + 14 + (intptr_t)rel != fault_pc) return 0;
+    }
+    /* exactly where the redirect sends this process */
+    if ((uintptr_t)ios_jit_translate_addr_for_owner( (void *)fault_pc, thread_peb ) != jit_pc) return 0;
+
+    __atomic_store_n( (uint64_t *)(rw + (slot - rx)), (uint64_t)jit_pc, __ATOMIC_RELEASE );
+    n = __sync_add_and_fetch( &healed, 1 );
+    if (n <= 32 || !(n % 256))
+    {
+        int t = ios_aux_find_mapping( jit_pc, 0 );
+        fprintf( stderr, "[aux-iat-heal] #%d %s+0x%lx calls %s+0x%lx: AuxiliaryIAT slot +0x%lx now holds %p "
+                 "(was the check_icall continuation) peb=%p (MADEIRA_AUX_IAT_HEAL=0 disables)\n",
+                 n, ios_pe_module_name( ios_jit_mappings[i].pe_base, ios_jit_mappings[i].size ),
+                 (unsigned long)(call - jb),
+                 t >= 0 ? ios_pe_module_name( ios_jit_mappings[t].pe_base, ios_jit_mappings[t].size ) : "?",
+                 t >= 0 ? (unsigned long)(jit_pc - (uintptr_t)ios_jit_mappings[t].jit_base) : 0ul,
+                 (unsigned long)(slot - jb), (void *)jit_pc, thread_peb );
+    }
+    return 1;
+}
+/* madeira-bcd: aux-IAT heal (end) */
+
 /* task #24 [term-stack]: map a guest PE VA to its module base + size so
  * the terminate-time stack dump can self-attribute return addresses. */
 unsigned long long ios_jit_module_base_for_va(unsigned long long va, unsigned long long *size_out)
