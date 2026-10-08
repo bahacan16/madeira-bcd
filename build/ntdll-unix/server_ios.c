@@ -1705,6 +1705,23 @@ static void ios_xp_api_report( const char *wall, double wall_s )
     }
 }
 
+/* madeira-bcd: [xp-t] shows a native thread (no TEB) as m<thread id> only,
+ * and in build 442 two of them were 30-50 ms a sample with nothing to say what
+ * they were. Name each once, the first time it is busy enough to be listed. */
+static void ios_xp_name_native( pthread_t pt, uint64_t tid )
+{
+    static uint64_t named[128];
+    static int n;
+    char name[64] = "";
+    int i;
+
+    for (i = 0; i < n; i++) if (named[i] == tid) return;
+    if (n == (int)(sizeof(named) / sizeof(named[0]))) return;
+    named[n++] = tid;
+    pthread_getname_np( pt, name, sizeof(name) );
+    wine_log_write( "[xp-names] m%llu \"%s\"", (unsigned long long)tid, name[0] ? name : "(unnamed)" );
+}
+
 static void ios_xprobe_main( void )
 {
     static struct ios_xp_row rows[1024];
@@ -1768,6 +1785,7 @@ static void ios_xprobe_main( void )
                                 uint64_t teb = pt_ ? ios_ts_teb( pt_ ) : 0; uint32_t w = 0;
                                 if (teb) ios_ts_read( teb + 0x48, &w, 4 );
                                 r->tid = idi.thread_id; r->wtid = w; r->p_ms = pt; r->e_ms = et;
+                                if (!w && pt_ && pt + et >= 2.0) ios_xp_name_native( pt_, idi.thread_id );
                                 r->p_ghz = pt > 0 ? pcy / (pt * 1e6) : 0; r->e_ghz = et > 0 ? ecy / (et * 1e6) : 0;
                                 r->minst = (double)((cur[0].instr - pv->c[0].instr) + (cur[1].instr - pv->c[1].instr)) / 1e6;
                                 r->role = NULL;

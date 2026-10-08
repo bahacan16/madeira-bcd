@@ -918,6 +918,27 @@ static void ios_window_inventory( const char *why, unsigned long long lo_arg, un
 extern unsigned long long ios_last_footprint_mb;
 extern int ios_fast_footprint;
 
+/* madeira-bcd: how often the warmer's address-space sweeps run, in its ~2 s
+ * cycles. In build 442's GTA V gameplay the [phys-map] walk covered ~182,000
+ * regions in ~1.3 s at 60-70 % of a core every 10 s, and every third of those
+ * also walked the four pool slots ([slot#2] alone ~72,000 regions) and the
+ * furniture window: the warmer's whole cost, in bursts the game's saturated
+ * P cores paid for. Page warming still runs every cycle; the .text sweep keeps
+ * its cadence. MADEIRA_WARMER_SWEEP_CYCLES (default 30, ~1 min; 5 restores the
+ * old 10 s map walk with the inventory every 15). */
+static unsigned ios_warmer_sweep_cycles( void )
+{
+    static unsigned v;
+    if (!v)
+    {
+        /* cycles of ~2 s between the warmer's map walk and slot/window inventory (default 30; 5 = old). */
+        const char *e = getenv( "MADEIRA_WARMER_SWEEP_CYCLES" );
+        unsigned long n = e && *e ? strtoul( e, NULL, 10 ) : 0;
+        v = n >= 1 && n <= 100000 ? (unsigned)n : 30;
+    }
+    return v;
+}
+
 static void *ios_pool_warmer_thread( void *arg )
 {
     unsigned cycle = 0;
@@ -1070,7 +1091,8 @@ static void *ios_pool_warmer_thread( void *arg )
                     dprintf(2, "[pool-rot] clean: %lu .text pages sampled across %u mappings (cycle=%u)\n",
                             (unsigned long)checked, ios_jit_mapping_count, cycle);
             }
-            if (cycle == 1 || (cycle % 15) == 0)
+            if (cycle == 1 || (ios_warmer_sweep_cycles() == 5 ? (cycle % 15) == 0
+                                                               : (cycle % ios_warmer_sweep_cycles()) == 0))
             {
                 /* ml469 (wall #79): one-shot proof of whether TCP loopback
                  * works at all under this port — the webhelper's transport
@@ -1215,7 +1237,7 @@ static void *ios_pool_warmer_thread( void *arg )
              * addresses identify the owner offline (pool = RX base, FEX bands,
              * PA pools, guest heap). Every 5th cycle plus cycle 2, because the
              * walk is tens of thousands of kernel calls. */
-            if (cycle == 2 || (cycle % 5) == 0)
+            if (cycle == 2 || (cycle % ios_warmer_sweep_cycles()) == 0)
             {
                 struct { unsigned long long base, size, dirty, res, swap; unsigned tag; } top[12];
                 unsigned long long dirty_by_tag[256];
@@ -1271,6 +1293,8 @@ static void *ios_pool_warmer_thread( void *arg )
                 memset( swap_by_tag, 0, sizeof(swap_by_tag) );
                 memset( band_dirty, 0, sizeof(band_dirty) );
                 memset( band_res, 0, sizeof(band_res) );
+                struct timespec pm_t0, pm_t1;   /* madeira-bcd: what the walk costs */
+                clock_gettime( CLOCK_MONOTONIC, &pm_t0 );
                 for (;;)
                 {
                     vm_region_submap_info_data_64_t info;
@@ -1374,8 +1398,12 @@ static void *ios_pool_warmer_thread( void *arg )
                     raddr += rsize;
                     if (++regions > 200000) { dprintf(2, "[phys-map] TRUNCATED at %u regions\n", regions); break; }
                 }
-                dprintf(2, "[phys-map] rev=ml359 cycle=%u regions=%u total_dirty=%llu MB\n",
-                        cycle, regions, total_dirty >> 20);
+                clock_gettime( CLOCK_MONOTONIC, &pm_t1 );
+                dprintf(2, "[phys-map] rev=ml359 cycle=%u regions=%u total_dirty=%llu MB (walk %ld ms; next in %u "
+                           "cycles, MADEIRA_WARMER_SWEEP_CYCLES)\n",
+                        cycle, regions, total_dirty >> 20,
+                        (long)((pm_t1.tv_sec - pm_t0.tv_sec) * 1000 + (pm_t1.tv_nsec - pm_t0.tv_nsec) / 1000000),
+                        ios_warmer_sweep_cycles());
                 for (ti = 0; ti < 12; ti++)
                 {
                     if (!top[ti].dirty) continue;
