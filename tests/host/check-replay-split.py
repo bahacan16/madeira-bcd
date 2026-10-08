@@ -86,3 +86,10 @@ pp = src[src.index('static void mad_perf_present(void) {'):]
 pp = pp[:pp.index('\n}\n')]
 assert pp.index('[perf] encode split per frame') < pp.index('mad_rs_report((double)g_perf_presents);')
 print('PASS: the [perf] block prints the replay split after the encode split')
+
+wrap = src[src.index('static int mad_air_build_tables_ex(struct mad_exec *e,'):]
+wrap = wrap[:wrap.index('\n}\n')]
+assert 'UINT64 t0 = g_replay_split > 0 ? mad_tick() : 0;' in wrap and 'if (t0) mad_rs_step(RS_TABLES, &t0);' in wrap
+assert 'mad_air_build_tables_ex_body(e, rs, root, consts, pso, cb_bind, arg_bind, arg_qwords, nair, airv, vis_mask,' in wrap
+assert src.index('static int mad_air_build_tables_ex_body(') < src.index('static int mad_air_build_tables_ex(struct mad_exec *e,')
+print('PASS: argument-table building is timed as its own bucket, only with replay-split on')

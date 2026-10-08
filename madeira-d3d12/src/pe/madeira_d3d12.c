@@ -4830,7 +4830,69 @@ static int mad_air_build_vb_table(struct mad_exec *e, const struct mad_pso *pso,
 
 /* Build the two argument buffers for one dispatch. Returns 0 and logs the first
  * unresolvable range rather than dispatching against a half-filled table. */
-static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
+/* madeira-bcd: [perf] replay split -- where ExecuteCommandLists' time goes,
+ * by step and by command kind (madeira.cfg replay-split = 1). Red Dead
+ * Redemption 2 (build 460, log 2026-10-08 23:59:11) spent 31-60 ms of a
+ * 38-72 ms open-world frame in ExecuteCommandLists, 1.2 calls a frame, with
+ * the GPU 24-34 % busy; the encode split put only ~8 ms of that in Metal
+ * encode calls and encoder open/end, and nothing said where the rest went.
+ * Each command kind's time includes the encode calls it makes; "of which
+ * argument tables" is the part of draws and dispatches spent building their
+ * argument and constant-buffer tables (mad_air_build_tables_ex). Off by
+ * default; when on, one timer read per command, summed per list. */
+enum { RS_LOCK, RS_PREBUILD, RS_BATCH, RS_DRAW, RS_INDIRECT, RS_DISPATCH, RS_COPY, RS_CLEAR,
+       RS_BARRIER, RS_RTS, RS_QUERY, RS_STATE, RS_LISTEND, RS_FLUSH, RS_TABLES, RS_N };
+static const char *const g_rs_names[RS_N] = {
+    "lock wait", "prebuild", "batch open", "draw", "indirect", "dispatch", "copy", "clear",
+    "barrier", "targets", "query", "state", "list end", "flush",
+    "of which argument tables" };   /* RS_TABLES is inside draw/indirect/dispatch */
+static volatile LONG64 g_rs_t[RS_N];
+static volatile LONG g_rs_n[RS_N];
+static int g_replay_split = -1;
+static int mad_rs_on(void) {
+    if (g_replay_split < 0) {
+        g_replay_split = mad_cfg_int_pe("replay-split", 0) ? 1 : 0;
+        if (g_replay_split)
+            d3d12_log("[madeira-d3d12] replay-split = 1: [perf] replay split lines time ExecuteCommandLists by step and command kind\n");
+    }
+    return g_replay_split > 0;
+}
+static int mad_rs_bucket(enum mad_ck k) {
+    switch (k) {
+    case MC_DRAW: case MC_DRAW_INDEXED: return RS_DRAW;
+    case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: return RS_INDIRECT;
+    case MC_DISPATCH: return RS_DISPATCH;
+    case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_RESOLVE: return RS_COPY;
+    case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_FILL_BB: case MC_FILL_TEX: return RS_CLEAR;
+    case MC_BARRIER: return RS_BARRIER;
+    case MC_RTS: return RS_RTS;
+    case MC_QUERY_BEGIN: case MC_QUERY_END: case MC_QUERY_RESOLVE: return RS_QUERY;
+    default: return RS_STATE;
+    }
+}
+/* Adds now - *t0 to bucket b and moves *t0 to now. */
+static inline void mad_rs_step(int b, UINT64 *t0) {
+    UINT64 t1 = mad_tick();
+    InterlockedExchangeAdd64(&g_rs_t[b], (LONG64)(t1 - *t0));
+    InterlockedIncrement(&g_rs_n[b]);
+    *t0 = t1;
+}
+static void mad_rs_report(double presents) {
+    char buf[640];
+    double tf = (double)mad_tick_freq(), np = presents > 0 ? presents : 1.0;
+    int pos, b;
+    if (g_replay_split <= 0) return;
+    pos = snprintf(buf, sizeof buf, "[perf] replay split per frame:");
+    for (b = 0; b < RS_N && pos > 0 && pos < (int)sizeof buf; b++) {
+        LONG64 t = InterlockedExchange64(&g_rs_t[b], 0);
+        LONG n = InterlockedExchange(&g_rs_n[b], 0);
+        if (!n) continue;
+        pos += snprintf(buf + pos, sizeof buf - pos, " %s %.2f ms (%.0f)", g_rs_names[b], 1000.0 * (double)t / tf / np, n / np);
+    }
+    d3d12_log("%s\n", buf);
+}
+
+static int mad_air_build_tables_ex_body(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                                    const UINT32 (*consts)[64], const struct mad_pso *pso,
                                    UINT cb_bind, UINT arg_bind, UINT arg_qwords, UINT nair,
                                    const struct madeira_ir_air_range *airv, unsigned vis_mask,   /* ml1083: one stage, described explicitly */
@@ -4948,6 +5010,19 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
         return 0;
     }
     return 1;
+}
+static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
+                                   const UINT32 (*consts)[64], const struct mad_pso *pso,
+                                   UINT cb_bind, UINT arg_bind, UINT arg_qwords, UINT nair,
+                                   const struct madeira_ir_air_range *airv, unsigned vis_mask,   /* ml1083: one stage, described explicitly */
+                                   obj_handle_t *cb_buf, UINT64 *cb_off,
+                                   obj_handle_t *arg_buf, UINT64 *arg_off) {
+    /* madeira-bcd: replay split "of which argument tables" */
+    UINT64 t0 = g_replay_split > 0 ? mad_tick() : 0;
+    int ok = mad_air_build_tables_ex_body(e, rs, root, consts, pso, cb_bind, arg_bind, arg_qwords, nair, airv, vis_mask,
+                                          cb_buf, cb_off, arg_buf, arg_off);
+    if (t0) mad_rs_step(RS_TABLES, &t0);
+    return ok;
 }
 static int mad_air_build_tables(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                                 const UINT32 (*consts)[64], const struct mad_pso *pso,
@@ -6796,65 +6871,6 @@ static void mad_capture_log_op(const struct mad_cmd *c) {
     if (!r || InterlockedIncrement(&said) > 1500) return;
     mad_alias_desc(r, al, sizeof al);
     d3d12_log("[capture-op] list#%u enc#%u %s -> %s\n", g_list_seq, g_enc_seq, extra, al);
-}
-
-/* madeira-bcd: [perf] replay split -- where ExecuteCommandLists' time goes,
- * by step and by command kind (madeira.cfg replay-split = 1). Red Dead
- * Redemption 2 (build 460, log 2026-10-08 23:59:11) spent 31-60 ms of a
- * 38-72 ms open-world frame in ExecuteCommandLists, 1.2 calls a frame, with
- * the GPU 24-34 % busy; the encode split put only ~8 ms of that in Metal
- * encode calls and encoder open/end, and nothing said where the rest went.
- * Each command kind's time includes the encode calls it makes. Off by
- * default; when on, one timer read per command, summed per list. */
-enum { RS_LOCK, RS_PREBUILD, RS_BATCH, RS_DRAW, RS_INDIRECT, RS_DISPATCH, RS_COPY, RS_CLEAR,
-       RS_BARRIER, RS_RTS, RS_QUERY, RS_STATE, RS_LISTEND, RS_FLUSH, RS_N };
-static const char *const g_rs_names[RS_N] = {
-    "lock wait", "prebuild", "batch open", "draw", "indirect", "dispatch", "copy", "clear",
-    "barrier", "targets", "query", "state", "list end", "flush" };
-static volatile LONG64 g_rs_t[RS_N];
-static volatile LONG g_rs_n[RS_N];
-static int g_replay_split = -1;
-static int mad_rs_on(void) {
-    if (g_replay_split < 0) {
-        g_replay_split = mad_cfg_int_pe("replay-split", 0) ? 1 : 0;
-        if (g_replay_split)
-            d3d12_log("[madeira-d3d12] replay-split = 1: [perf] replay split lines time ExecuteCommandLists by step and command kind\n");
-    }
-    return g_replay_split > 0;
-}
-static int mad_rs_bucket(enum mad_ck k) {
-    switch (k) {
-    case MC_DRAW: case MC_DRAW_INDEXED: return RS_DRAW;
-    case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: return RS_INDIRECT;
-    case MC_DISPATCH: return RS_DISPATCH;
-    case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_RESOLVE: return RS_COPY;
-    case MC_CLEAR_RT: case MC_CLEAR_DS: case MC_FILL_BB: case MC_FILL_TEX: return RS_CLEAR;
-    case MC_BARRIER: return RS_BARRIER;
-    case MC_RTS: return RS_RTS;
-    case MC_QUERY_BEGIN: case MC_QUERY_END: case MC_QUERY_RESOLVE: return RS_QUERY;
-    default: return RS_STATE;
-    }
-}
-/* Adds now - *t0 to bucket b and moves *t0 to now. */
-static inline void mad_rs_step(int b, UINT64 *t0) {
-    UINT64 t1 = mad_tick();
-    InterlockedExchangeAdd64(&g_rs_t[b], (LONG64)(t1 - *t0));
-    InterlockedIncrement(&g_rs_n[b]);
-    *t0 = t1;
-}
-static void mad_rs_report(double presents) {
-    char buf[640];
-    double tf = (double)mad_tick_freq(), np = presents > 0 ? presents : 1.0;
-    int pos, b;
-    if (g_replay_split <= 0) return;
-    pos = snprintf(buf, sizeof buf, "[perf] replay split per frame:");
-    for (b = 0; b < RS_N && pos > 0 && pos < (int)sizeof buf; b++) {
-        LONG64 t = InterlockedExchange64(&g_rs_t[b], 0);
-        LONG n = InterlockedExchange(&g_rs_n[b], 0);
-        if (!n) continue;
-        pos += snprintf(buf + pos, sizeof buf - pos, " %s %.2f ms (%.0f)", g_rs_names[b], 1000.0 * (double)t / tf / np, n / np);
-    }
-    d3d12_log("%s\n", buf);
 }
 
 static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
