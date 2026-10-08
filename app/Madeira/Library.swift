@@ -20,9 +20,11 @@ import Combine
 // madeira.cfg turns it off.
 // ============================================================================
 
-/// Thermal state, Low Power Mode and screen capture every 10 s while a session
-/// runs: the three device conditions that explain a slow run in a log.
-/// MADEIRA_DEVICE_STATS=0 turns the line off.
+/// Thermal state, Low Power Mode, screen capture, battery and brightness every
+/// 10 s while a session runs: the device conditions that explain a slow run in
+/// a log (447: the CPU was held at 1.31/1.70 GHz from the start of play with
+/// thermal=nominal; charging and screen recording also draw from the power
+/// budget). MADEIRA_DEVICE_STATS=0 turns the line off.
 enum DeviceLoadDiagnostics {
     private static var lastReport = 0.0
     private static var timer: Timer?
@@ -30,6 +32,7 @@ enum DeviceLoadDiagnostics {
     /// session is a diagnostic, so it is off by default.
     static func start() {
         guard timer == nil, MadeiraConfig.flag("MADEIRA_DEVICE_STATS", fallback: false) else { return }
+        UIDevice.current.isBatteryMonitoringEnabled = true
         let value = Timer(timeInterval: 10, repeats: true) { _ in report() }
         timer = value
         RunLoop.main.add(value, forMode: .common)
@@ -41,7 +44,18 @@ enum DeviceLoadDiagnostics {
         lastReport = now
         let process = ProcessInfo.processInfo
         let thermal = thermalName(process.thermalState)
-        fputs("[device-load] thermal=\(thermal) low-power=\(process.isLowPowerModeEnabled ? 1 : 0) capture=\(UIScreen.main.isCaptured ? 1 : 0)\n", stderr)
+        let device = UIDevice.current
+        if !device.isBatteryMonitoringEnabled { device.isBatteryMonitoringEnabled = true }   // the HUD turns it off when it closes
+        let level = device.batteryLevel < 0 ? "?" : String(Int((device.batteryLevel * 100).rounded()))
+        let battery: String
+        switch device.batteryState {
+        case .charging: battery = "charging"
+        case .full: battery = "full"
+        case .unplugged: battery = "unplugged"
+        default: battery = "unknown"
+        }
+        fputs("[device-load] thermal=\(thermal) low-power=\(process.isLowPowerModeEnabled ? 1 : 0) capture=\(UIScreen.main.isCaptured ? 1 : 0) "
+              + "battery=\(level)% \(battery) brightness=\(String(format: "%.2f", UIScreen.main.brightness))\n", stderr)
     }
     static func thermalName(_ state: ProcessInfo.ThermalState) -> String {
         switch state {
