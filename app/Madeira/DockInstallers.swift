@@ -561,8 +561,8 @@ enum DockInstallers {
     static let stallSeconds = 600
 
     nonisolated static func flag(_ name: String) -> Bool { SteamSignIn.flag(name, default: true) }
-    nonisolated static var enabled: Bool { flag("MADEIRA_DOCK_INSTALLERS") }
-    nonisolated static var choiceEnabled: Bool { enabled && flag("MADEIRA_DOCK_INSTALL_CHOICE") }
+    nonisolated static var enabled: Bool { flag("MADEIRA_DOCK_INSTALLERS") }   // 0: Dock starts run no install-script programs
+    nonisolated static var choiceEnabled: Bool { enabled && flag("MADEIRA_DOCK_INSTALL_CHOICE") }   // 0: no per-game choice, every start runs what is pending
 
     /// Whether madeira.cfg selects madsync, as the engine reads it (madeira_cfg_sync_engine
     /// in build/madeira_cfg.h): only inproc-sync set to 1/on/true/yes; unset is fastsync,

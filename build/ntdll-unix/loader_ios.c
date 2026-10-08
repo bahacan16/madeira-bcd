@@ -1421,7 +1421,7 @@ static unsigned long long ios_rtcs_seen, ios_rtcs_dropped, ios_rtcs_unnoted;
 
 static int ios_rtcs_read_limit( void )
 {
-    const char *e = getenv( "MADEIRA_RTCS_LOG" );
+    const char *e = getenv( "MADEIRA_RTCS_LOG" );   /* all: every "[rtcs] pre" line; N: at most N a second per thread (default 10, 0 none) */
     char *end;
     long n;
 
