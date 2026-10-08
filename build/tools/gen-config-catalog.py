@@ -98,6 +98,13 @@ OVERLAY = {
                         "separated by commas (e.g. RDR2.exe): threads of these programs get the stack they ask for, "
                         "at least 2 MB, so their stacks take less of the shared memory space. Never list Chromium "
                         "programs (SocialClubHelper.exe, Launcher.exe, steamwebhelper.exe). Read when a thread starts."},
+    "replay-split": {"category": "Direct3D 12", "title": "Log where Direct3D 12 submission time goes",
+                "kind": "bool", "default": "0",
+                "note": "Default off, logging only. 1: every 5 seconds a [perf] replay split line divides the time "
+                        "ExecuteCommandLists takes per frame into waiting for the queue, preparation, opening a "
+                        "command buffer, each kind of command (draws, dispatches, copies, clears, barriers, render "
+                        "targets, queries, state) and the end of each list. For finding why a game's frame is slow "
+                        "when the GPU is not busy."},
     "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "
