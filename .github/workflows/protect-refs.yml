@@ -1,0 +1,40 @@
+name: Protect known-good sources
+
+# Tags every commit listed in .github/protected-refs.txt ("<tag> <commit>"), so
+# a known-good build's source stays reachable even if the branch it was built
+# from is reset or deleted. A tag that already exists is left as it is: this
+# workflow never moves or deletes one. Runs when the list (or this file)
+# changes on any branch.
+on:
+  push:
+    paths:
+      - ".github/protected-refs.txt"
+      - ".github/workflows/protect-refs.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create the missing tags
+        run: |
+          set -euo pipefail
+          while read -r tag sha _; do
+            case "$tag" in ''|'#'*) continue ;; esac
+            if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+              echo "::error::$tag: commit $sha is not in this repository"
+              exit 1
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+              echo "$tag already exists, left as it is"
+              continue
+            fi
+            git tag "$tag" "$sha"
+            git push origin "refs/tags/$tag"
+            echo "::notice::tagged $sha as $tag"
+          done < .github/protected-refs.txt

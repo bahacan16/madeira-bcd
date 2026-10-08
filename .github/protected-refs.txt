@@ -1,0 +1,5 @@
+# Known-good builds whose source must stay in this repository whatever happens
+# to the development branch: "<tag> <commit>" per line, # starts a comment.
+# .github/workflows/protect-refs.yml creates each missing tag once and never
+# moves or deletes one.
+build-451 72b504c61f6dad5baebc2c3c00ecd56c4f6f0813   # OTA 0.1.451, owner's known-good backup (2026-10-08)
