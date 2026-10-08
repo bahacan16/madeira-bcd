@@ -213,6 +213,14 @@ static void test_config( void )
     CHECK( ios_swap_min == ((size_t)1 << 32), "MIN_KB clamped to 4 GB without overflow" );
     env( "wide", NULL, "64" );
     CHECK( ios_swap_resv_max == (64u << 20), "MADEIRA_SWAP_RESERVE_MAX_MB" );
+    env( "wide", NULL, "9216" );
+    CHECK( ios_swap_resv_max == ((size_t)1 << 32), "wide: RESERVE_MAX still clamped to 4 GB" );
+    env( "broad", NULL, NULL );
+    CHECK( ios_swap_broad && ios_swap_resv_max == ((size_t)8 << 30), "broad: 8 GB unless set" );
+    env( "broad", NULL, "9216" );
+    CHECK( ios_swap_resv_max == ((size_t)9216 << 20), "broad: 9216 MB takes RDR2's 8960 MB heap" );
+    env( "broad", NULL, "99999" );
+    CHECK( ios_swap_resv_max == ((size_t)16 << 30), "broad: RESERVE_MAX clamped to 16 GB" );
 }
 
 static void test_why( void )

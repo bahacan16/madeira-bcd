@@ -19950,7 +19950,8 @@ static unsigned long long ios_swap_bytes, ios_swap_peak, ios_swap_backs, ios_swa
  *    the file PROT_NONE at reserve time, so that a heap committing 64 KB at a
  *    time commits file pages (a hole reads as zero).
  *  - broad (ml1257, device-verified: Metro 2033 Redux 3.3 -> 2.7 GB footprint):
- *    every fresh reservation of at least the floor (default 4 MB) up to 8 GB is
+ *    every fresh reservation of at least the floor (default 4 MB) up to 8 GB
+ *    (MADEIRA_SWAP_RESERVE_MAX_MB, at most 16 GB: madeira-bcd) is
  *    backed WHOLE when it is made, committed or not (PROT_NONE where not), so
  *    every later commit inside it -- any size -- is an mprotect of file pages.
  *    Red Dead Redemption 2 reserves big and commits in small pieces; Metro 2033 Redux's heap never reaches
@@ -20049,8 +20050,11 @@ static void ios_swap_config( void )
     ios_swap_mode = ios_swap_broad ? "broad" : ios_swap_wide ? "wide" : "blocks";
     ios_swap_min = ios_swap_env_size( "MADEIRA_SWAP_MIN_KB", cfg_min ? cfg_min : ios_swap_broad ? 4u << 20 : 1u << 20,
                                       10, 64u << 10, (size_t)1 << 32 );
+    /* madeira-bcd: broad takes up to 16 GB when the env asks, so that RDR2.exe's
+     * 8960 MB heap (env.MADEIRA_RDR2_VA_HOLD's hold) can be backed whole with
+     * MADEIRA_SWAP_RESERVE_MAX_MB = 9216; unset it stays 8 GB. */
     if (ios_swap_broad)
-        ios_swap_resv_max = ios_swap_env_size( "MADEIRA_SWAP_RESERVE_MAX_MB", (size_t)8 << 30, 20, 1u << 20, (size_t)8 << 30 );
+        ios_swap_resv_max = ios_swap_env_size( "MADEIRA_SWAP_RESERVE_MAX_MB", (size_t)8 << 30, 20, 1u << 20, (size_t)16 << 30 );
     else
         ios_swap_resv_max = ios_swap_env_size( "MADEIRA_SWAP_RESERVE_MAX_MB", 256u << 20, 20, 1u << 20, (size_t)1 << 32 );
 }

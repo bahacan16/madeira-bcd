@@ -77,6 +77,11 @@ OVERLAY = {
                         "holds [0x75d0000000, 0x7800000000) from boot for one 8960 MB reserve, the one Red Dead "
                         "Redemption 2 makes as it starts. Set it only in that game's own file; GTA V keeps layout 2 as "
                         "it is. Read at session start."},
+    "env.MADEIRA_SWAP_RESERVE_MAX_MB": {"category": "Memory & JIT pool", "title": "Swap tier: largest reservation backed (MB)",
+                "kind": "int", "default": "", "sources": ["build/ntdll-unix/virtual_ios.c"],
+                "note": "The largest new reservation the swap tier backs whole: 256 MB in wide (at most 4 GB), 8 GB in "
+                        "broad (at most 16 GB). 9216 with broad coverage (swap-mode = 2) also backs Red Dead "
+                        "Redemption 2's 8960 MB heap with the file. Read at session start."},
     "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "
