@@ -1985,6 +1985,32 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
             ERR_(seh)( "[cxx-throw] ok ThrowInfo %p base %p (addr %p)\n",
                        (void *)info, (void *)base, rec->ExceptionAddress );
     }
+    /* madeira-bcd: Chromium's out-of-memory exit (SocialClubHelper.exe died of
+     * it on the first launch of build 442, on four threads at once). The PE
+     * [exc] line names the code only; PartitionAlloc passes { size of the
+     * failed request, total page file, available page file } and base's own
+     * OOM path passes the size alone, and the size is what tells a failed
+     * reservation from a failed commit. */
+    if (rec && rec->ExceptionCode == 0xE0000008 && rec->NumberParameters >= 1)
+    {
+        static LONG oom_lines;
+        unsigned int tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+
+        if (InterlockedIncrement( &oom_lines ) <= 16)
+        {
+            if (rec->NumberParameters >= 3)
+                ERR_(seh)( "[chromium-oom] tid %04x: request %#lx bytes (%lu MB), page file total %lu MB, "
+                           "available %lu MB, at %p\n", tid,
+                           (unsigned long)rec->ExceptionInformation[0],
+                           (unsigned long)(rec->ExceptionInformation[0] >> 20),
+                           (unsigned long)(rec->ExceptionInformation[1] >> 20),
+                           (unsigned long)(rec->ExceptionInformation[2] >> 20), rec->ExceptionAddress );
+            else
+                ERR_(seh)( "[chromium-oom] tid %04x: request %#lx bytes (%lu MB), at %p\n", tid,
+                           (unsigned long)rec->ExceptionInformation[0],
+                           (unsigned long)(rec->ExceptionInformation[0] >> 20), rec->ExceptionAddress );
+        }
+    }
 #endif
     status = send_debug_event( rec, context, first_chance, !(is_win64 || is_wow64() || is_old_wow64()) );
 

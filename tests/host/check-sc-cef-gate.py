@@ -139,6 +139,7 @@ sc_decl = sc_decl[:sc_decl.index('static int ios_sc_brp_layout;')] + 'static int
 sc_decl += ''.join(m.group(0) + '\n' for m in re.finditer(r'^#define IOS_SC2_\w+\s+\S+', native, re.M))
 sc_decl += 'enum { IOS_SC_K_V1 = 8 };\nstatic int ios_sc_layout_mode = -1, grants;\n'
 sc_decl += 'static void *ios_jit_current_peb( void ) { return (void *)1; }\n'
+sc_decl += 'static void ios_va_release_note( void ) {}\n'   # the placement proof's epoch (check-place-proof.py)
 sc_decl += ('static void ios_sc_grant_add( uint64_t v, uint64_t r, uint64_t real, uint64_t asked, int k, void *p ) '
             '{ (void)v; (void)r; (void)real; (void)asked; (void)k; (void)p; grants++; }\n')
 # madeira-bcd pool-low: ios_sc_layout reads the alias reservation's base from region C

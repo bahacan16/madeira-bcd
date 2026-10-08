@@ -2252,6 +2252,15 @@ static void ios_va_gap_probe( const char *why )
  */
 static uintptr_t ios_jumbo_hold_base;
 static size_t    ios_jumbo_hold_size;
+/* madeira-bcd: bumped by every release of address space through this file
+ * (unmap_area, remove_reserved_area, the jumbo holdback, the V8 cage, the image
+ * window, Social Club's slots and BRP hold); a placement walk that found no gap
+ * stays true only while it is unchanged (ios_ml1027_place). */
+static unsigned long ios_va_release_epoch;
+static inline void ios_va_release_note( void )
+{
+    __atomic_add_fetch( &ios_va_release_epoch, 1, __ATOMIC_RELAXED );
+}
 /* ml1029: how much of the holdback must stay reserved for the ONE big guest
  * reservation. Anything above this may be carved off the TOP to satisfy an
  * allocation that would otherwise fail outright. Read from
@@ -2357,6 +2366,7 @@ static uintptr_t ios_jumbo_holdback_take( size_t size )
              (unsigned long long)ios_jumbo_hold_size >> 20,
              (unsigned long long)size >> 20 );
     munmap( (void *)base, ios_jumbo_hold_size );
+    ios_va_release_note();
     ios_jumbo_hold_base = 0;
     ios_jumbo_hold_size = 0;
     return base;
@@ -2402,6 +2412,7 @@ static uintptr_t ios_jumbo_holdback_carve( size_t size )
                  (unsigned long long)at, (unsigned long long)size >> 20, errno );
         return 0;
     }
+    ios_va_release_note();
     ios_jumbo_hold_size -= size;
     dprintf( 2, "[jumbo-hold] ml1029 CARVED 0x%llx +%llu MB off the top; holdback now "
                 "0x%llx +%llu MB (keep floor %llu MB) -- this request would otherwise have "
@@ -8082,6 +8093,81 @@ static int ios_ml1041_readable_words( const void *from, int want )
  *
  * Runs only after a failure that is otherwise fatal, and is bounded: one region
  * walk plus at most MAX_TRY placements. */
+/* madeira-bcd: what the last complete walk proved. Every SocialClubHelper.exe
+ * start runs V8's partially reserved sandbox, whose fallbacks ask for 16 GB,
+ * 8 GB and 4 GB (with an 8 GB - 64 KB padded retry), ten times each: ~35
+ * unhinted asks that cannot fit below the ceiling. Each ended in this walk over
+ * ~157,000 regions, 170-380 ms under virtual_mutex, so ~9 s per start in which
+ * every thread of every process waited for its own memory calls (442 logs, the
+ * [jumbo#] +Nms gaps, both runs). The walk also sees the largest gap; while no
+ * release has gone through this file since (ios_va_release_epoch) and for at
+ * most IOS_PLACE_PROOF_NS, a larger request cannot be placed, so it fails here
+ * without walking. Frees outside Wine (the system's own mappings) do not bump
+ * the epoch; the time bound limits that. MADEIRA_PLACE_PROOF=0 walks every time. */
+#define IOS_PLACE_PROOF_NS (2000ull * 1000 * 1000)
+static unsigned long long ios_place_proof_gap;   /* 0: nothing proven */
+static uint64_t ios_place_proof_ns;
+static unsigned long ios_place_proof_epoch;
+static unsigned long ios_place_proof_skips;
+
+static uint64_t ios_place_now_ns( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int ios_place_proof_enabled( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        /* 0 walks the whole map on every failed large mapping; by default a failed walk is trusted for 2 s until a release. */
+        const char *e = getenv( "MADEIRA_PLACE_PROOF" );
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* A reservation made after the proof came out of gaps that walk already
+ * counted, so releasing it (whole or in part) cannot open a gap larger than the
+ * proof allows and need not bump the epoch: V8's 4 GB step reserves 4 GB, finds
+ * it misaligned and releases it before every padded retry. The next proof saw
+ * them mapped, so it forgets them. virtual_mutex held. */
+#define IOS_PLACE_FRESH 16
+static struct { uint64_t base, size; } ios_place_fresh[IOS_PLACE_FRESH];
+static unsigned int ios_place_fresh_next;
+
+static void ios_place_note_new( const void *base, size_t size )
+{
+    unsigned int i;
+
+    if (!ios_place_proof_ns || size < (64u << 20)) return;
+    i = ios_place_fresh_next++ % IOS_PLACE_FRESH;
+    ios_place_fresh[i].base = (uint64_t)(uintptr_t)base;
+    ios_place_fresh[i].size = size;
+}
+
+static int ios_place_release_is_fresh( const void *start, size_t size )
+{
+    uint64_t a = (uint64_t)(uintptr_t)start;
+    unsigned int i;
+
+    for (i = 0; i < IOS_PLACE_FRESH; i++)
+        if (ios_place_fresh[i].size && a >= ios_place_fresh[i].base &&
+            a + size <= ios_place_fresh[i].base + ios_place_fresh[i].size) return 1;
+    return 0;
+}
+
+/* Does a walk that ended with no gap of `largest` or more still hold for `size`? */
+static int ios_place_proven_full( size_t size, uint64_t now )
+{
+    return ios_place_proof_enabled() && ios_place_proof_ns &&
+           (unsigned long long)size > ios_place_proof_gap &&
+           now - ios_place_proof_ns < IOS_PLACE_PROOF_NS &&
+           ios_place_proof_epoch == __atomic_load_n( &ios_va_release_epoch, __ATOMIC_RELAXED );
+}
+
 static void *ios_ml1027_place( size_t size, int prot )
 {
     mach_vm_address_t raddr = 0x100000000ull;   /* below this is images/furniture */
@@ -8089,11 +8175,26 @@ static void *ios_ml1027_place( size_t size, int prot )
     mach_vm_address_t prev_end = 0;
     mach_vm_address_t best_base = 0;
     unsigned long long best_gap = ~0ull;
+    unsigned long long largest = 0;   /* any gap, the JIT pool's included: an upper bound */
+    unsigned long epoch = __atomic_load_n( &ios_va_release_epoch, __ATOMIC_RELAXED );
+    uint64_t t0 = ios_place_now_ns();
     unsigned regions = 0, gaps = 0;
     int truncated = 0;
     natural_t rdepth = 0;
     void *got;
     enum { MAX_TRY = 8 };
+
+    if (ios_place_proven_full( size, t0 ))
+    {
+        unsigned long n = ++ios_place_proof_skips;
+        if (n <= 8 || !(n % 64))
+            dprintf( 2, "[mmap-place] #%lu size=0x%lx refused without a walk: the walk %llu ms ago "
+                        "found no gap above %llu MB and nothing was released since "
+                        "(MADEIRA_PLACE_PROOF=0 walks every time)\n",
+                     n, (unsigned long)size, (unsigned long long)((t0 - ios_place_proof_ns) / 1000000),
+                     ios_place_proof_gap >> 20 );
+        return MAP_FAILED;
+    }
 
     {
         task_vm_info_data_t vmi;
@@ -8118,6 +8219,7 @@ static void *ios_ml1027_place( size_t size, int prot )
         if (prev_end && raddr > prev_end)
         {
             unsigned long long gap = (unsigned long long)(raddr - prev_end);
+            if (gap > largest) largest = gap;
             if (gap >= size && gap < best_gap &&
                 !ios_jit_pool_intersects( (void *)prev_end, size ))
             { best_gap = gap; best_base = prev_end; gaps++; }
@@ -8139,19 +8241,31 @@ static void *ios_ml1027_place( size_t size, int prot )
     if (!truncated && prev_end && prev_end < ceiling)
     {
         unsigned long long tail = (unsigned long long)(ceiling - prev_end);
+        if (tail > largest) largest = tail;
         if (tail >= size && tail < best_gap &&
             !ios_jit_pool_intersects( (void *)prev_end, size ))
         { best_gap = tail; best_base = prev_end; gaps++; }
+    }
+    /* A complete walk bounds every gap from here on until something is released
+     * (an empty map below the ceiling proves nothing: keep walking then). */
+    if (!truncated && prev_end)
+    {
+        ios_place_proof_gap = largest;
+        ios_place_proof_epoch = epoch;
+        ios_place_proof_ns = ios_place_now_ns();
+        memset( ios_place_fresh, 0, sizeof(ios_place_fresh) );
+        ios_place_fresh_next = 0;
     }
 
     if (!best_base)
     {
         dprintf( 2, "[mmap-place] ml1027 NO GAP FITS size=0x%lx after %u regions "
-                    "(ceiling=0x%llx walk_stopped_at=0x%llx tail=%llu MB gaps_seen=%u)%s\n",
+                    "(ceiling=0x%llx walk_stopped_at=0x%llx tail=%llu MB gaps_seen=%u, largest gap "
+                    "%llu MB, walk %llu ms)%s\n",
                  (unsigned long)size, regions, (unsigned long long)ceiling,
                  (unsigned long long)prev_end,
                  (unsigned long long)(ceiling > prev_end ? (ceiling - prev_end) >> 20 : 0),
-                 gaps,
+                 gaps, largest >> 20, (unsigned long long)((ios_place_now_ns() - t0) / 1000000),
                  truncated ? " [TRUNCATED -- scan INCOMPLETE, NOT a verdict]"
                            : " -- the map really is full for this size" );
         return MAP_FAILED;
@@ -9007,6 +9121,7 @@ static int ios_exe_win_claim( const void *addr, size_t size )
                      (unsigned long)ios_exe_win_held_size, (int)kr );
             if (kr == KERN_SUCCESS)
             {
+                ios_va_release_note();
                 ios_exewin_pending_base = ios_exe_win_held_base;
                 ios_exewin_pending_size = ios_exe_win_held_size;
                 ios_exe_win_held_base   = NULL;
@@ -9025,6 +9140,7 @@ static int ios_exe_win_claim( const void *addr, size_t size )
         dprintf( 2, "ml977: vm_deallocate of the window FAILED -- leaving it held\n" );
         return 0;
     }
+    ios_va_release_note();
     ios_exe_win_state = 0;
     dprintf( 2, "ml977: RELEASED the executable window to %p+%#lx (fixed-base main image)\n",
              addr, (unsigned long)size );
@@ -12970,6 +13086,7 @@ static void remove_reserved_area( void *addr, size_t size )
 
     TRACE( "removing %p-%p\n", addr, (char *)addr + size );
     mmap_remove_reserved_area( addr, size );
+    ios_va_release_note();
 
     /* unmap areas not covered by an existing view */
     WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
@@ -13008,6 +13125,7 @@ static void unmap_area( void *start, size_t size )
 
     assert( !((UINT_PTR)start & host_page_mask) );
     size = ROUND_SIZE( 0, size, host_page_mask );
+    if (!ios_place_release_is_fresh( start, size )) ios_va_release_note();
 
     ios_jit_range_tripwire( "unmap_area", start, size, -1, __builtin_return_address(0) );
 
@@ -14951,6 +15069,7 @@ static void ios_sc2_unhold( int k )
 {
     if (!(ios_sc2_held & (1u << k))) return;
     mach_vm_deallocate( mach_task_self(), ios_sc2_slots[k].base, ios_sc2_slots[k].size );
+    ios_va_release_note();
     ios_sc2_held &= ~(1u << k);
 }
 
@@ -15104,6 +15223,7 @@ static int ios_sc_pa_hold_arena( mach_vm_address_t *addr, SIZE_T *size )
 static void ios_sc_pa_drop_hold(void)
 {
     if (ios_sc_brp_held) mach_vm_deallocate( mach_task_self(), IOS_SC_BRP_HOLD_BASE, IOS_SC_BRP_HOLD_SIZE );
+    ios_va_release_note();
     ios_sc_brp_held = ios_sc_brp_layout = 0;
 }
 
@@ -25108,6 +25228,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             if (status == STATUS_SUCCESS)
             {
                 base = view->base;
+                ios_place_note_new( base, ROUND_SIZE( 0, view->size, host_page_mask ) );   /* see ios_place_fresh */
                 if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
                 ios_swap_init();
                 /* ml1077 commit-time backing (classic runs it unchanged); wide also backs a
@@ -26044,6 +26165,7 @@ static NTSTATUS ios_cage_grant( ULONG type, ULONG protect, SIZE_T asked, void **
     NTSTATUS st;
 
     munmap( (void *)(uintptr_t)IOS_CAGE_BASE, IOS_CAGE_REAL_SIZE );
+    ios_va_release_note();
     ios_cage_holdback_live = 0;
     *pick = (void *)(uintptr_t)IOS_CAGE_BASE;
     st = allocate_virtual_memory( pick, &csz, type, protect, 0, 0, 0, 0 );

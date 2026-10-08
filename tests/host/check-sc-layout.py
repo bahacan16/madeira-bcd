@@ -187,6 +187,7 @@ typedef uintptr_t ULONG_PTR;
 #define MB ((size_t)1 << 20)
 #define GB (1ull << 30)
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); exit(1); } while (0)
+static void ios_va_release_note( void ) {}   /* the placement proof's epoch (check-place-proof.py) */
 
 /* --- a model address space for the cage grant and V8's sandbox search (layout 2, 22:51 log) --- */
 static ULONG_PTR ios_cage_base = IOS_SC2_CAGE_BASE;
