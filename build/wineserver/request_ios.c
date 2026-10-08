@@ -316,21 +316,44 @@ static void call_req_handler( struct thread *thread )
     {
         static unsigned long counts[REQ_NB_REQUESTS], total;
         static struct timespec t0;
-        if (req < REQ_NB_REQUESTS) counts[req]++;
+        /* madeira-bcd: and from whom. Four heavy-hitter slots per request
+         * (space-saving: a newcomer replaces the smallest and inherits its
+         * count), so a storm (set_cursor 2,400/s in build 437) names its
+         * thread and process; a slot's count can overstate by at most the
+         * count it inherited. */
+        static struct { unsigned int tid, pid; unsigned long n; } hh[REQ_NB_REQUESTS][4];
+        if (req < REQ_NB_REQUESTS)
+        {
+            unsigned int tid = thread->id, pid = thread->process ? thread->process->id : 0;
+            int s, low = 0;
+            counts[req]++;
+            for (s = 0; s < 4; s++)
+            {
+                if (hh[req][s].n && hh[req][s].tid == tid) { hh[req][s].n++; break; }
+                if (hh[req][s].n < hh[req][low].n) low = s;
+            }
+            if (s == 4)
+            {
+                hh[req][low].tid = tid; hh[req][low].pid = pid; hh[req][low].n++;
+            }
+        }
         if (!total) clock_gettime( CLOCK_MONOTONIC, &t0 );
         if (++total % 200000 == 0)
         {
-            struct timespec t1; char line[600]; int n = 0, k; unsigned r;
+            struct timespec t1; char line[1400]; int n = 0, k, s; unsigned r;
             clock_gettime( CLOCK_MONOTONIC, &t1 );
             for (k = 0; k < 10; k++)
             {
-                unsigned best = 0; unsigned long bn = 0;
+                unsigned best = 0, top = 0; unsigned long bn = 0;
                 for (r = 0; r < REQ_NB_REQUESTS; r++) if (counts[r] > bn) { bn = counts[r]; best = r; }
                 if (!bn) break;
-                n += snprintf( line + n, sizeof(line) - n, " req%u=%lu", best, bn );
+                for (s = 1; s < 4; s++) if (hh[best][s].n > hh[best][top].n) top = s;
+                n += snprintf( line + n, sizeof(line) - n, " req%u=%lu(tid %04x pid %04x ~%lu)", best, bn,
+                               hh[best][top].tid, hh[best][top].pid, hh[best][top].n );
                 counts[best] = 0;
             }
             for (r = 0; r < REQ_NB_REQUESTS; r++) counts[r] = 0;
+            memset( hh, 0, sizeof(hh) );
             fprintf( stderr, "[srv-req] ml1055 last 200000 requests in %.1f s:%s\n",
                      (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, line );
             t0 = t1;
