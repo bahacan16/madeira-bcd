@@ -3128,6 +3128,61 @@ static int ios_dump_guest_instruction( HANDLE handle, LONG exit_code, uint64_t r
              memcmp( pe_bytes, copy_bytes, length ) ? "DIFFER" : "MATCH" );
     return 1;
 }
+
+/* madeira-bcd: Chromium's out-of-memory exit, seen from NtTerminateProcess.
+ * SocialClubHelper.exe raised 0xE0000008 after 24 minutes of GTA V Enhanced
+ * (log 2026-10-08 13:39:08, build 451, 14:01:51) and the game quit with it.
+ * RaiseException is dispatched in the PE ntdll and the unhandled-exception
+ * filter calls NtTerminateProcess, so the [chromium-oom] line in
+ * NtRaiseException never ran and the failed request's size was lost. The
+ * EXCEPTION_RECORD is still on the thread's stack, in RaiseException's frame:
+ * look for it in the top 256 KB (code 0xE0000008, EXCEPTION_NONCONTINUABLE, no
+ * nested record, 1-15 parameters) and print the parameters; PartitionAlloc
+ * passes the request's size and two page file figures. */
+static void ios_term_oom_record( TEB *teb )
+{
+    static uint64_t buf[8192];
+    static LONG lines;
+    uint64_t lo, hi, at;
+    int found = 0;
+
+    if (!teb || InterlockedIncrement( &lines ) > 8) return;
+    lo = (uint64_t)(ULONG_PTR)teb->Tib.StackLimit;
+    hi = (uint64_t)(ULONG_PTR)teb->Tib.StackBase;
+    if (!hi || hi <= lo) { dprintf( 2, "[chromium-oom] at exit: no stack bounds in the TEB\n" ); return; }
+    if (hi - lo > 0x40000) lo = hi - 0x40000;
+    lo &= ~(uint64_t)7;
+    for (at = lo; at < hi && !found; at += sizeof(buf) - 20 * 8)   /* chunks overlap by more than a record */
+    {
+        mach_vm_size_t got = 0;
+        uint64_t want = hi - at < sizeof(buf) ? hi - at : sizeof(buf);
+        size_t i, n;
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)at, want,
+                                    (mach_vm_address_t)buf, &got ) != KERN_SUCCESS || got < 64)
+            continue;
+        n = (size_t)(got / 8);
+        for (i = 0; i + 4 < n; i++)
+        {
+            uint64_t np = buf[i + 3] & 0xffffffffULL, k;
+            if ((uint32_t)buf[i] != 0xE0000008u || !((buf[i] >> 32) & 1) || buf[i + 1] || !np || np > 15
+                || i + 4 + np > n)
+                continue;
+            dprintf( 2, "[chromium-oom] at exit: record at %#llx (thread stack [%#llx,%#llx)), raised at %#llx, "
+                        "%llu parameter(s): request %#llx bytes (%llu MB)",
+                     (unsigned long long)(at + i * 8), (unsigned long long)lo, (unsigned long long)hi,
+                     (unsigned long long)buf[i + 2], (unsigned long long)np,
+                     (unsigned long long)buf[i + 4], (unsigned long long)(buf[i + 4] >> 20) );
+            for (k = 1; k < np && k < 4; k++)
+                dprintf( 2, ", %llu MB", (unsigned long long)(buf[i + 4 + k] >> 20) );
+            dprintf( 2, "\n" );
+            found = 1;
+            break;
+        }
+    }
+    if (!found)
+        dprintf( 2, "[chromium-oom] at exit: no 0xE0000008 record in the top of the thread's stack [%#llx,%#llx)\n",
+                 (unsigned long long)lo, (unsigned long long)hi );
+}
 #endif
 
 /******************************************************************************
@@ -3139,6 +3194,8 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
     BOOL self;
 
 #ifdef WINE_IOS
+    if ((unsigned int)exit_code == 0xE0000008u && handle == NtCurrentProcess())
+        ios_term_oom_record( NtCurrentTeb() );
     {
         static int term_log_count = 0;
         /* iOS-Madeira [term-stack] (task#29): also fire on ANY nonzero exit_code
