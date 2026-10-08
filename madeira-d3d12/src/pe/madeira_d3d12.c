@@ -2745,6 +2745,37 @@ static int mad_pso_lazy_on(void) {   /* madeira-bcd: madeira.cfg pso-lazy (defau
                   d3d12_log("[madeira-d3d12] pipelines are built %s (madeira.cfg pso-lazy)\n", on ? "at their first draw/dispatch" : "at creation"); }
     return on;
 }
+/* madeira-bcd: PIPELINE CACHE WARM-UP (madeira.cfg / a game's config pso-warm =
+ * N, 1-4 parallel compiles; default 0). A lazy pipeline is compiled at its first
+ * draw. Metal keeps what it compiled in its on-disk cache across sessions and
+ * builds, so a pipeline this device has built before takes 0.3-0.5 ms there and a
+ * new one 35-47 ms (GTA V Enhanced, builds 447-451, where new ones came in bursts
+ * that froze the game for 100-400 ms). With the switch on, every lazy pipeline is
+ * handed to winemetal when the game creates it (MadeiraCtl op 8,
+ * tools/patch-winemetal-pso-warm.py): DXMT's own builder compiles the same
+ * descriptor on a utility-QoS queue and releases the pipeline at once, so only
+ * the compile is kept, in Metal's cache, and memory stays as lazy creation left
+ * it. The game's thread does not wait. A winemetal without op 8 answers 0 and the
+ * warm-up turns itself off. */
+struct mad_pso_warm_req { UINT64 device, info, vd; };
+static void mad_pso_warm(obj_handle_t device, const void *info, const void *vd, UINT kind) {
+    static int on = -1;
+    static volatile LONG sent;
+    struct madeira_ctl_args a; struct mad_pso_warm_req r;
+    if (on < 0) { on = mad_cfg_int_pe("pso-warm", 0) > 0;   /* pipeline cache warm-up: N background compiles of every lazy pipeline at creation (1-4; 0 = off) */
+                  if (on) d3d12_log("[madeira-d3d12] pso-warm: lazy pipelines are compiled once in the background when the game creates them (madeira.cfg pso-warm)\n"); }
+    if (!on || !device || !info) return;
+    r.device = device; r.info = (UINT64)(ULONG_PTR)info; r.vd = (UINT64)(ULONG_PTR)vd;
+    memset(&a, 0, sizeof a); a.op = 8; a.len = kind; a.ptr = (UINT64)(ULONG_PTR)&r;
+    MadeiraCtl(&a);   /* winemetal copies the descriptors before it returns */
+    if (!a.ret) {
+        on = 0;
+        d3d12_log("[madeira-d3d12] pso-warm: winemetal took no warm-up request (no op 8, or remote mode); warm-up off\n");
+        return;
+    }
+    if (InterlockedIncrement(&sent) == 1)
+        d3d12_log("[madeira-d3d12] pso-warm: first pipeline handed to the warm-up queues\n");
+}
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
     if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
@@ -13231,6 +13262,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             /* madeira-bcd: descriptors kept, built by mad_pso_realize */
             p->lazy = 1; p->rp = rp; p->has_vd = has_vd; if (has_vd) p->vd = vd;
             p->device_handle = d->mtl_device;
+            mad_pso_warm(p->device_handle, &p->rp, p->has_vd ? &p->vd : NULL, p->has_vd ? 1 : 0);   /* pso-warm */
         } else {
             obj_handle_t err = 0;
             p->rps = has_vd ? MTLDevice_newRenderPipelineStateVD(d->mtl_device, &rp, &vd, &err)
@@ -13473,6 +13505,9 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     if (!p->tg[2]) { p->tg[2] = 1; }
     if (mad_pso_lazy_on()) {   /* built at its first dispatch (mad_cpso_realize) */
         p->lazy_cs = 1; p->device_handle = d->mtl_device;
+        memset(&ci, 0, sizeof ci);   /* the descriptor mad_cpso_realize builds */
+        ci.compute_function = p->vs_fn;
+        mad_pso_warm(p->device_handle, &ci, NULL, 2);   /* pso-warm */
         hr = pso_QI((ID3D12PipelineState *)p, riid, out);
         pso_Release((ID3D12PipelineState *)p);
         return hr;

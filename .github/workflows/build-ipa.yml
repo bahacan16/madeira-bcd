@@ -1048,6 +1048,15 @@ jobs:
       - name: Patch winemetal sampler reduction
         run: python3 tools/patch-winemetal-sampler-reduction.py
 
+      # A lazy D3D12 pipeline's first draw compiles it: 35-47 ms the first time
+      # this device sees it, 0.3-0.5 ms from Metal's cache afterwards (GTA V,
+      # builds 447-451; bursts froze the game for 100-400 ms). With
+      # madeira.cfg / a game's config pso-warm = N, madeira-d3d12 hands each
+      # lazy pipeline to MadeiraCtl op 8 at creation and winemetal compiles it
+      # once on N utility queues, keeping only the cached compile. Native only.
+      - name: Patch winemetal pipeline cache warm-up
+        run: python3 tools/patch-winemetal-pso-warm.py
+
       # Is God of War at 1080p GPU-bound? The logs had no GPU timing. The
       # [frame] instrument (server_ios.c, MADEIRA_FRAME_STATS=1, off by
       # default) gets each command buffer's GPU start/end, so it can print the
