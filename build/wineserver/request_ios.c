@@ -322,6 +322,12 @@ static void call_req_handler( struct thread *thread )
          * thread and process; a slot's count can overstate by at most the
          * count it inherited. */
         static struct { unsigned int tid, pid; unsigned long n; } hh[REQ_NB_REQUESTS][4];
+        static unsigned long cursor_flags[6];   /* set_cursor by flag: handle count pos clip noclip fsclip */
+        if (req == REQ_set_cursor)
+        {
+            unsigned int f = thread->req.set_cursor_request.flags, b;
+            for (b = 0; b < 6; b++) if (f & (1u << b)) cursor_flags[b]++;
+        }
         if (req < REQ_NB_REQUESTS)
         {
             unsigned int tid = thread->id, pid = thread->process ? thread->process->id : 0;
@@ -356,6 +362,15 @@ static void call_req_handler( struct thread *thread )
             memset( hh, 0, sizeof(hh) );
             fprintf( stderr, "[srv-req] ml1055 last 200000 requests in %.1f s:%s\n",
                      (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9, line );
+            if (cursor_flags[0] + cursor_flags[1] + cursor_flags[2] + cursor_flags[3] + cursor_flags[4])
+            {
+                extern unsigned long ios_clip_repeats_skipped;
+                fprintf( stderr, "[srv-req] set_cursor by flag: handle=%lu count=%lu pos=%lu clip=%lu noclip=%lu "
+                         "fsclip=%lu; unchanged ClipCursor notifications skipped so far: %lu\n",
+                         cursor_flags[0], cursor_flags[1], cursor_flags[2], cursor_flags[3], cursor_flags[4],
+                         cursor_flags[5], ios_clip_repeats_skipped );
+                memset( cursor_flags, 0, sizeof(cursor_flags) );
+            }
             t0 = t1;
         }
     }

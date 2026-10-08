@@ -618,11 +618,30 @@ static void get_message_defaults( struct msg_queue *queue, int *x, int *y, unsig
     *time = get_tick_count();
 }
 
+/* madeira-bcd: a ClipCursor that changes nothing (same rectangle, same flags,
+ * no reset) still queued a WM_WINE_CLIPCURSOR for the foreground thread, which
+ * fetches it with its own get_message round trip and hands it to a driver whose
+ * ClipCursor is the null one on iOS. Licensed GTA V Enhanced sent up to 2,400
+ * set_cursor requests a second from its own thread (build 437); such a repeat
+ * now updates nothing and notifies no one. MADEIRA_CLIP_NOTIFY_ALWAYS=1
+ * restores the notification for every call. */
+unsigned long ios_clip_repeats_skipped;
+static int ios_clip_dedupe(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *e = getenv( "MADEIRA_CLIP_NOTIFY_ALWAYS" );  /* 1: notify the foreground thread on every ClipCursor, as before */
+        cached = !(e && e[0] == '1' && !e[1]);
+    }
+    return cached;
+}
+
 /* set the cursor clip rectangle */
 void set_clip_rectangle( struct desktop *desktop, const struct rectangle *rect, unsigned int flags, int reset )
 {
     desktop_shm_t *desktop_shm = desktop->shared;
-    struct rectangle top_rect, new_rect;
+    struct rectangle top_rect, new_rect, old_rect = desktop_shm->cursor.clip;
     unsigned int old_flags;
     int x, y;
 
@@ -654,6 +673,15 @@ void set_clip_rectangle( struct desktop *desktop, const struct rectangle *rect, 
 
     /* request clip cursor rectangle reset to the desktop thread */
     if (reset) post_desktop_message( desktop, WM_WINE_CLIPCURSOR, flags, FALSE );
+
+    /* madeira-bcd: nothing changed, nothing to tell (see ios_clip_dedupe) */
+    if (!reset && flags == old_flags && ios_clip_dedupe() &&
+        new_rect.left == old_rect.left && new_rect.top == old_rect.top &&
+        new_rect.right == old_rect.right && new_rect.bottom == old_rect.bottom)
+    {
+        ios_clip_repeats_skipped++;
+        return;
+    }
 
     /* notify foreground thread of reset, clipped, or released cursor rect */
     if (reset || flags != SET_CURSOR_NOCLIP || old_flags != SET_CURSOR_NOCLIP)
