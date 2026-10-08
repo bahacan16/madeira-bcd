@@ -175,6 +175,15 @@ OVERLAY = {
     "async-submit": {"title": "D3D12 asynchronous submission"},
     "upload-swap": {"title": "D3D12 upload buffers on file-backed memory"},
     "d3d12-typed-uav-load": {"title": "D3D12 typed UAV loads (report support)"},
+    # madeira-bcd: the packed shader cache (madeira-d3d12/src/unix/madeira_sc_pack.c).
+    "d3d12-shader-pack": {"category": "Direct3D 12", "title": "D3D12 shader cache in two pack files",
+                "kind": "bool", "default": "0",
+                "note": "Off by default: one file per converted shader in Documents/shadercache, as before. 1: the "
+                        "converter keeps its DXBC and DXIL cache entries in two append-only files "
+                        "(shadercache/pack/dxbc.mdpk, dxil.mdpk); loose entries of earlier runs move in as games use "
+                        "them. Off again, the packs are not read: what moved into them converts again. Bounds: DXIL as "
+                        "env.MADEIRA_D3D12_DXIL_CACHE_MB (512 MB), DXBC 2 GB; a full pack starts over. Read once per "
+                        "app start; the game's own file wins."},
     # Read by DXMT's DXGI and by win32u's display adapter (sysparams_ios.c); a
     # library entry's "Report an NVIDIA GPU" sets it.
     "env.DXMT_ENABLE_NVEXT": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Report an NVIDIA GPU (all games)",

@@ -70,6 +70,19 @@ compile_objc() {
     fi
 }
 
+compile_c() {
+    local src=$1 name=$2 extra="${3:-}"
+    # MADEIRA_ONLY=<name>: recompile one object only.
+    if [ -n "${MADEIRA_ONLY:-}" ] && [ "$name" != "$MADEIRA_ONLY" ]; then return 0; fi
+    printf "  %-40s " "$name"
+    if xcrun -sdk iphoneos clang $COMMON_FLAGS -std=c11 -Wall $extra \
+        -c "$src" -o "$OBJ_DIR/$name.o" 2>"$OBJ_DIR/$name.err"; then
+        echo "OK"; SUCCEEDED=$((SUCCEEDED+1))
+    else
+        echo "FAILED"; FAILED=$((FAILED+1)); FAILED_FILES="$FAILED_FILES $name"
+    fi
+}
+
 compile_cxx() {
     local src=$1 name=$2 extra="${3:-}"
     # MADEIRA_ONLY=<name>: recompile one object only.
@@ -165,6 +178,9 @@ if [[ -f "$BUILD_DIR/../madeira-d3d12/deps.sh" ]] && \
     # ml1149: AMD AGS 64-bit atomics -> native SM6.6 atomics, a DXIL rewrite on
     # the LLVM 15 that airconv already links (bitcode reader + writer).
     compile_cxx "$REPO_ROOT/madeira-d3d12/src/unix/madeira_ags.cpp" madeira_ags
+    # madeira-bcd: the packed shader cache (madeira.cfg d3d12-shader-pack),
+    # plain C so tests/host/check-shader-pack.py builds and runs it on Linux.
+    compile_c "$REPO_ROOT/madeira-d3d12/src/unix/madeira_sc_pack.c" madeira_sc_pack
 else
     # Without madeira_ir_unix every D3D12 shader fails to convert (DXIL and DXBC
     # alike), so an app built past this point cannot run a D3D12 game. deps.sh

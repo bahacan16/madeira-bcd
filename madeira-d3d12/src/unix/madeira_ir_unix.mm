@@ -31,6 +31,7 @@
 
 #include "madeira_ir_abi.h"
 #include "madeira_dxil_cache.h"   /* ml1990 */
+#include "madeira_sc_pack.h"      /* madeira-bcd: madeira.cfg d3d12-shader-pack */
 
 #define IR_PRIVATE_IMPLEMENTATION 0   /* the canary owns the one definition */
 #include <metal_irconverter/metal_irconverter.h>
@@ -448,12 +449,151 @@ static int mad_sc_path(uint64_t key, char *out, size_t cap)
     return mad_sc_path_ext(key, "mdsc", out, cap);
 }
 
+/* ---------------------------------------------------------------------------
+ * madeira-bcd: the packed shader cache (madeira_sc_pack.c).
+ *
+ * One file per converted shader left 11,095 files in shadercache after two
+ * Red Dead Redemption 2 runs. madeira.cfg (or the game's own file)
+ * d3d12-shader-pack = 1 keeps the entries in one append-only file per kind
+ * instead, shadercache/pack/dxbc.mdpk and dxil.mdpk, each entry the same bytes
+ * its loose file would hold. OFF by default: then mad_sc_pack_dxbc() and
+ * mad_dxc_pack() return NULL, nothing below runs, and the loose files are
+ * written, named and pruned exactly as before.
+ *
+ * With it on, a key the pack does not have is still looked up as a loose file
+ * of an earlier run; a hit there is appended to the pack and the loose file
+ * deleted, so the directory drains as the game asks for its shaders again.
+ * There is no bulk import: the switch can be set for one game only, and
+ * moving another game's loose entries into the pack would take them away from
+ * that game. New conversions go to the pack only. Bounds: the DXIL pack has
+ * the DXIL cache's (MADEIRA_D3D12_DXIL_CACHE_MB), the DXBC pack
+ * MAD_SC_PACK_DXBC_CAP; an append past its bound drops that pack's entries
+ * and starts a new generation (madeira_sc_pack.c, SIZE BOUND).
+ * ------------------------------------------------------------------------- */
+#define MAD_SC_PACK_DXBC_CAP (2048ull << 20)   /* the loose DXBC entries never had a bound */
+static pthread_once_t g_sc_pack_once = PTHREAD_ONCE_INIT;
+static int g_sc_pack_on;
+static void mad_sc_pack_once(void)
+{
+    g_sc_pack_on = madeira_cfg_bool("d3d12-shader-pack", 0);   /* 1: packed shader cache; 0 (default): one file per shader */
+    if (g_sc_pack_on)
+        fprintf(stderr, "[madeira-ir] packed shader cache ON (madeira.cfg d3d12-shader-pack): "
+                        "shadercache/pack/dxbc.mdpk and dxil.mdpk\n");
+}
+static int mad_sc_pack_on(void)
+{
+    pthread_once(&g_sc_pack_once, mad_sc_pack_once);
+    return g_sc_pack_on;
+}
+/* NULL when the pack cannot be used; the loose files then stay in use. */
+static struct mad_pack *mad_sc_pack_open(const char *name, uint32_t kind, uint64_t cap)
+{
+    const char *docs = getenv("MADEIRA_DOCS_DIR");
+    char dir[1100];
+    if (!docs || !*docs || snprintf(dir, sizeof dir, "%s/shadercache", docs) >= (int)sizeof dir) return NULL;
+    mkdir(dir, 0755);   /* harmless if it exists */
+    if (snprintf(dir, sizeof dir, "%s/shadercache/pack", docs) >= (int)sizeof dir) return NULL;
+    return mad_pack_open(dir, name, kind, MAD_SC_BUILD, cap);
+}
+static struct mad_pack *g_sc_pack_dxbc;
+static pthread_once_t g_sc_pack_dxbc_once = PTHREAD_ONCE_INIT;
+static void mad_sc_pack_dxbc_once(void)
+{
+    g_sc_pack_dxbc = mad_sc_pack_open("dxbc", MAD_PACK_KIND_DXBC, MAD_SC_PACK_DXBC_CAP);
+}
+static struct mad_pack *mad_sc_pack_dxbc(void)
+{
+    if (!mad_sc_pack_on()) return NULL;
+    pthread_once(&g_sc_pack_dxbc_once, mad_sc_pack_dxbc_once);
+    return g_sc_pack_dxbc;
+}
+
+/* The reflection a DXBC entry carries, handed back as a fresh compile leaves
+ * it. Shared by the loose and the packed reader. */
+static void mad_sc_deliver(struct madeira_ir_convert_args *a, const struct mad_sc_header *h)
+{
+    a->ret_air_nranges2 = h->nranges2; a->ret_cb_table_bind2 = h->cb_bind2;   /* ml1083 */
+    a->ret_arg_table_bind2 = h->arg_bind2; a->ret_arg_qwords2 = h->arg_qwords2;
+    a->ret_threads_per_patch = h->threads_per_patch; a->ret_tess_out_prim = h->tess_out_prim;
+    a->ret_max_potential_factor = h->max_potential;
+
+    a->ret_backend        = h->backend;
+    a->ret_cb_table_bind  = h->cb_bind;
+    a->ret_arg_table_bind = h->arg_bind;
+    a->ret_arg_qwords     = h->arg_qwords;
+    a->ret_air_nranges    = h->nranges;
+    a->ret_air_slot_mask  = h->slot_mask;
+    a->ret_vs_input_count = h->vs_input_count;
+    a->ret_tg_size[0] = h->tg[0]; a->ret_tg_size[1] = h->tg[1]; a->ret_tg_size[2] = h->tg[2];
+    if (a->out_entry) snprintf((char *)(uintptr_t)a->out_entry, MADEIRA_IR_ENTRY_MAX, "%s", h->entry);
+    a->ret_status = MADEIRA_IR_OK;
+}
+
+/* madeira-bcd: 1 if `b` holds a whole DXBC entry as mad_sc_store writes it. */
+static int mad_sc_entry_ok(const unsigned char *b, size_t len)
+{
+    struct mad_sc_header h;
+    if (len < sizeof h) return 0;
+    memcpy(&h, b, sizeof h);
+    return h.magic == MAD_SC_MAGIC && h.version == MAD_SC_VERSION &&
+           h.nranges <= MADEIRA_IR_AIR_RANGE_MAX && h.metallib_len && h.metallib_len <= len &&
+           (uint64_t)sizeof h + ((uint64_t)h.nranges + h.nranges2) * sizeof(struct madeira_ir_air_range) +
+               h.metallib_len <= (uint64_t)len;
+}
+
+/* madeira-bcd: mad_sc_load's reading, from an entry in memory (a packed one,
+ * or a loose one being moved into the pack). Returns 0, 1 or 2 as
+ * mad_sc_load does, with the same sizing-call answer before any range check. */
+static int mad_sc_load_mem(const unsigned char *b, size_t len, struct madeira_ir_convert_args *a,
+                           struct madeira_ir_air_range *out_ranges)
+{
+    struct mad_sc_header h;
+    struct madeira_ir_air_range *out2 = (struct madeira_ir_air_range *)(uintptr_t)a->out_air_ranges2;
+    size_t n1, n2;
+    if (!mad_sc_entry_ok(b, len)) return 0;
+    memcpy(&h, b, sizeof h);
+    n1 = (size_t)h.nranges * sizeof *out_ranges;
+    n2 = (size_t)h.nranges2 * sizeof *out2;
+    a->ret_len = h.metallib_len;
+    if (!a->out_buf || a->out_cap < h.metallib_len) { a->ret_status = MADEIRA_IR_BUFFER_TOO_SMALL; return 2; }
+    if (h.nranges && (!out_ranges || h.nranges > a->air_range_cap)) return 0;
+    if (h.nranges2 && (!out2 || h.nranges2 > a->air_range_cap2)) return 0;   /* ml1083 */
+    if (n1) memcpy(out_ranges, b + sizeof h, n1);
+    if (n2) memcpy(out2, b + sizeof h + n1, n2);
+    memcpy((void *)(uintptr_t)a->out_buf, b + sizeof h + n1 + n2, (size_t)h.metallib_len);
+    mad_sc_deliver(a, &h);
+    return 1;
+}
+
+/* madeira-bcd: a DXBC entry from the pack. On a miss the loose entry of an
+ * earlier run, if there is one, moves into the pack and is served from there;
+ * a damaged loose entry is deleted, as the loose path would replace it. */
+static int mad_sc_load_packed(struct mad_pack *pack, uint64_t key, struct madeira_ir_convert_args *a,
+                              struct madeira_ir_air_range *out_ranges)
+{
+    char path[1200];
+    void *blob = NULL;
+    size_t len = 0;
+    int r;
+    if (!mad_pack_get(pack, key, &blob, &len)) {
+        if (!mad_sc_path(key, path, sizeof path) ||
+            !mad_pack_read_file(path, MAD_PACK_MAX_PAYLOAD, &blob, &len)) return 0;
+        if (!mad_sc_entry_ok((const unsigned char *)blob, len)) { free(blob); unlink(path); return 0; }
+        mad_pack_adopt(pack, key, blob, len, path);
+    }
+    r = mad_sc_load_mem((const unsigned char *)blob, len, a, out_ranges);
+    free(blob);
+    return r;
+}
+
 static int mad_sc_load(uint64_t key, struct madeira_ir_convert_args *a,
                        struct madeira_ir_air_range *out_ranges)
 {
     char path[1200];
     struct mad_sc_header h;
     int fd;
+    struct mad_pack *pack = mad_sc_pack_dxbc();   /* madeira-bcd: NULL unless d3d12-shader-pack */
+    if (pack) return mad_sc_load_packed(pack, key, a, out_ranges);
     if (!mad_sc_path(key, path, sizeof path)) return 0;
     fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -479,22 +619,51 @@ static int mad_sc_load(uint64_t key, struct madeira_ir_convert_args *a,
     }
     if (read(fd, (void *)(uintptr_t)a->out_buf, (size_t)h.metallib_len) != (ssize_t)h.metallib_len) { close(fd); return 0; }
     close(fd);
-    a->ret_air_nranges2 = h.nranges2; a->ret_cb_table_bind2 = h.cb_bind2;   /* ml1083 */
-    a->ret_arg_table_bind2 = h.arg_bind2; a->ret_arg_qwords2 = h.arg_qwords2;
-    a->ret_threads_per_patch = h.threads_per_patch; a->ret_tess_out_prim = h.tess_out_prim;
-    a->ret_max_potential_factor = h.max_potential;
-
-    a->ret_backend        = h.backend;
-    a->ret_cb_table_bind  = h.cb_bind;
-    a->ret_arg_table_bind = h.arg_bind;
-    a->ret_arg_qwords     = h.arg_qwords;
-    a->ret_air_nranges    = h.nranges;
-    a->ret_air_slot_mask  = h.slot_mask;
-    a->ret_vs_input_count = h.vs_input_count;
-    a->ret_tg_size[0] = h.tg[0]; a->ret_tg_size[1] = h.tg[1]; a->ret_tg_size[2] = h.tg[2];
-    if (a->out_entry) snprintf((char *)(uintptr_t)a->out_entry, MADEIRA_IR_ENTRY_MAX, "%s", h.entry);
-    a->ret_status = MADEIRA_IR_OK;
+    mad_sc_deliver(a, &h);
     return 1;
+}
+
+/* The header of the DXBC entry for this conversion. Shared by the loose and
+ * the packed writer. */
+static void mad_sc_header_fill(struct mad_sc_header *h, const struct madeira_ir_convert_args *a,
+                               const char *entry, uint64_t len)
+{
+    memset(h, 0, sizeof *h);
+    h->magic = MAD_SC_MAGIC; h->version = MAD_SC_VERSION;
+    h->backend = a->ret_backend; h->cb_bind = a->ret_cb_table_bind;
+    h->arg_bind = a->ret_arg_table_bind; h->arg_qwords = a->ret_arg_qwords;
+    h->nranges = a->ret_air_nranges > MADEIRA_IR_AIR_RANGE_MAX ? 0 : a->ret_air_nranges;
+    h->slot_mask = a->ret_air_slot_mask; h->vs_input_count = a->ret_vs_input_count;
+    h->tg[0] = a->ret_tg_size[0]; h->tg[1] = a->ret_tg_size[1]; h->tg[2] = a->ret_tg_size[2];
+    h->metallib_len = len;
+    snprintf(h->entry, sizeof h->entry, "%s", entry ? entry : "");
+    h->nranges2 = a->ret_air_nranges2 > MADEIRA_IR_AIR_RANGE_MAX ? 0 : a->ret_air_nranges2;   /* ml1083 */
+    h->cb_bind2 = a->ret_cb_table_bind2; h->arg_bind2 = a->ret_arg_table_bind2; h->arg_qwords2 = a->ret_arg_qwords2;
+    h->threads_per_patch = a->ret_threads_per_patch; h->tess_out_prim = a->ret_tess_out_prim;
+    h->max_potential = a->ret_max_potential_factor;
+}
+
+/* madeira-bcd: the bytes mad_sc_store would write to the loose file -- header,
+ * range lists, metallib -- appended to the pack as one record. */
+static void mad_sc_store_packed(struct mad_pack *pack, uint64_t key, const struct madeira_ir_convert_args *a,
+                                const struct madeira_ir_air_range *ranges, const char *entry,
+                                const void *data, uint64_t len)
+{
+    struct mad_sc_header h;
+    size_t n1, n2, total;
+    unsigned char *b;
+    if (len > MAD_PACK_MAX_PAYLOAD) return;
+    mad_sc_header_fill(&h, a, entry, len);
+    n1 = h.nranges && ranges ? (size_t)h.nranges * sizeof *ranges : 0;
+    n2 = h.nranges2 && a->out_air_ranges2 ? (size_t)h.nranges2 * sizeof *ranges : 0;   /* ml1083 */
+    total = sizeof h + n1 + n2 + (size_t)len;
+    if (!(b = (unsigned char *)malloc(total))) return;
+    memcpy(b, &h, sizeof h);
+    if (n1) memcpy(b + sizeof h, ranges, n1);
+    if (n2) memcpy(b + sizeof h + n1, (const void *)(uintptr_t)a->out_air_ranges2, n2);
+    memcpy(b + sizeof h + n1 + n2, data, (size_t)len);
+    mad_pack_put(pack, key, b, total);
+    free(b);
 }
 
 /* ml1085: takes the compiled bytes directly, so the SIZING call can store the
@@ -509,6 +678,7 @@ static void mad_sc_store(uint64_t key, const struct madeira_ir_convert_args *a,
     char path[1200], tmp[1264];
     struct mad_sc_header h;
     int fd;
+    struct mad_pack *pack;
     if (!len || !data) return;
     /* ml1146: a conversion whose caller asked for no range list (a vertex stage
      * converted for a geometry pipeline) still COUNTS its ranges. Stored like
@@ -517,6 +687,10 @@ static void mad_sc_store(uint64_t key, const struct madeira_ir_convert_args *a,
      * registers and spaces, and 4,766 draws skipped as "table not reported"
      * (ph-valley03). An entry is only stored when every list it counts is here. */
     if ((a->ret_air_nranges && !ranges) || (a->ret_air_nranges2 && !a->out_air_ranges2)) return;
+    if ((pack = mad_sc_pack_dxbc())) {   /* madeira-bcd: NULL unless d3d12-shader-pack */
+        mad_sc_store_packed(pack, key, a, ranges, entry, data, len);
+        return;
+    }
     if (!mad_sc_path(key, path, sizeof path)) return;
     /* Write-then-rename so a crash mid-write can never leave a torn entry that
      * a later run would trust. */
@@ -524,19 +698,7 @@ static void mad_sc_store(uint64_t key, const struct madeira_ir_convert_args *a,
     fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return;
 
-    memset(&h, 0, sizeof h);
-    h.magic = MAD_SC_MAGIC; h.version = MAD_SC_VERSION;
-    h.backend = a->ret_backend; h.cb_bind = a->ret_cb_table_bind;
-    h.arg_bind = a->ret_arg_table_bind; h.arg_qwords = a->ret_arg_qwords;
-    h.nranges = a->ret_air_nranges > MADEIRA_IR_AIR_RANGE_MAX ? 0 : a->ret_air_nranges;
-    h.slot_mask = a->ret_air_slot_mask; h.vs_input_count = a->ret_vs_input_count;
-    h.tg[0] = a->ret_tg_size[0]; h.tg[1] = a->ret_tg_size[1]; h.tg[2] = a->ret_tg_size[2];
-    h.metallib_len = len;
-    snprintf(h.entry, sizeof h.entry, "%s", entry ? entry : "");
-    h.nranges2 = a->ret_air_nranges2 > MADEIRA_IR_AIR_RANGE_MAX ? 0 : a->ret_air_nranges2;   /* ml1083 */
-    h.cb_bind2 = a->ret_cb_table_bind2; h.arg_bind2 = a->ret_arg_table_bind2; h.arg_qwords2 = a->ret_arg_qwords2;
-    h.threads_per_patch = a->ret_threads_per_patch; h.tess_out_prim = a->ret_tess_out_prim;
-    h.max_potential = a->ret_max_potential_factor;
+    mad_sc_header_fill(&h, a, entry, len);
 
     int ok = write(fd, &h, sizeof h) == (ssize_t)sizeof h;
     if (ok && h.nranges && ranges) {
@@ -1289,10 +1451,45 @@ static void mad_dxc_count(int hit)
         dprintf(2, "[d3d12-dxil-cache] ml1990 hits=%u misses=%u\n", h, m);
 }
 
+/* madeira-bcd: the DXIL entries' pack (d3d12-shader-pack, see mad_sc_pack_on),
+ * bounded by the DXIL cache's own MADEIRA_D3D12_DXIL_CACHE_MB. Only reached
+ * with the persistent DXIL cache on, so g_dxc_cap is set. */
+static struct mad_pack *g_dxc_pack;
+static pthread_once_t g_dxc_pack_once = PTHREAD_ONCE_INIT;
+static void mad_dxc_pack_once(void)
+{
+    g_dxc_pack = mad_sc_pack_open("dxil", MAD_PACK_KIND_DXIL, g_dxc_cap);
+}
+static struct mad_pack *mad_dxc_pack(void)
+{
+    if (!mad_sc_pack_on()) return NULL;
+    pthread_once(&g_dxc_pack_once, mad_dxc_pack_once);
+    return g_dxc_pack;
+}
+
+/* madeira-bcd: a DXIL entry from the pack, or the loose entry of an earlier run
+ * moved into it. The caller frees *blob. */
+static int mad_dxc_pack_load(struct mad_pack *pack, uint64_t key, uint64_t check, void **blob, size_t *len)
+{
+    char path[1200];
+    if (mad_pack_get(pack, key, blob, len)) {
+        if (mad_dxc_blob_valid(*blob, *len, key, check)) return 1;
+        free(*blob);   /* the same 64-bit key for another conversion: convert, as a loose miss would */
+        *blob = NULL; *len = 0;
+        return 0;
+    }
+    if (!mad_sc_path_ext(key, MAD_DXC_EXT, path, sizeof path) || !mad_dxc_file_load(path, key, check, blob, len))
+        return 0;
+    mad_pack_adopt(pack, key, *blob, *len, path);
+    return 1;
+}
+
 static void mad_dxc_store(uint64_t key, const void *blob, size_t len)
 {
     char path[1200], dir[1200];
     uint64_t total;
+    struct mad_pack *pack = mad_dxc_pack();   /* madeira-bcd: NULL unless d3d12-shader-pack */
+    if (pack) { mad_pack_put(pack, key, blob, len); return; }
     if (!mad_sc_path_ext(key, MAD_DXC_EXT, path, sizeof path)) return;
     if (!mad_dxc_file_store(path, blob, len)) {
         if (__atomic_add_fetch(&g_dxc_store_fail, 1, __ATOMIC_RELAXED) <= 3)
@@ -1529,8 +1726,10 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         if (dxc_slot) hit = mad_dxc_slot_take(dxc_key, dxc_check, &hit_len);
         if (!hit && dxc_disk) {
             char path[1200];
-            int found = mad_sc_path_ext(dxc_key, MAD_DXC_EXT, path, sizeof path) &&
-                        mad_dxc_file_load(path, dxc_key, dxc_check, &hit, &hit_len);
+            struct mad_pack *pack = mad_dxc_pack();   /* madeira-bcd: NULL unless d3d12-shader-pack */
+            int found = pack ? mad_dxc_pack_load(pack, dxc_key, dxc_check, &hit, &hit_len)
+                             : (mad_sc_path_ext(dxc_key, MAD_DXC_EXT, path, sizeof path) &&
+                                mad_dxc_file_load(path, dxc_key, dxc_check, &hit, &hit_len));
             mad_dxc_count(found);
         }
         if (hit) {

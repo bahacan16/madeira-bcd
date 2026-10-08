@@ -17,7 +17,8 @@ clang++ -O1 -std=c++20 -fobjc-arc -x objective-c++ -DMADEIRA_IR_HOST_TEST \
     -I"$MSC_INCLUDE" -I"$R/src" -c "$R/src/unix/madeira_ir_unix.mm" -o "$OUT/ir_unix.o"
 clang++ -O1 -std=c++20 -x objective-c++ -DMADEIRA_IR_HOST_TEST \
     -I"$R/src" -I"$R/tests/windows" -c "$R/tests/native/ir_roundtrip.mm" -o "$OUT/ir_rt.o"
-clang++ -o "$OUT/ir_roundtrip" "$OUT/ir_unix.o" "$OUT/ir_rt.o" -framework Foundation
+clang -O1 -std=c11 -c "$R/src/unix/madeira_sc_pack.c" -o "$OUT/sc_pack.o"
+clang++ -o "$OUT/ir_roundtrip" "$OUT/ir_unix.o" "$OUT/sc_pack.o" "$OUT/ir_rt.o" -framework Foundation
 
 echo "=== runtime conversion round trip (host) ==="
 MADEIRA_MSC_DYLIB="$MSC_LIB_MACOS" "$OUT/ir_roundtrip"
