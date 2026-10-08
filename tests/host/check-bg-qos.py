@@ -10,6 +10,8 @@ clock and a recording pthread_set_qos_class_self_np, and checks per thread:
     SocialClubHelper.exe, Launcher.exe, RockstarService.exe, dockhost.exe; any
     case, any directory) go to utility once, other processes and the game's own
     threads never do, even if the game is on the list;
+  - not before the game has presented for MADEIRA_BG_QOS_DELAY_S (default 60 s,
+    its sign-in minute), counted again after a pause;
   - 2 s after the last present they return to user-interactive, once;
   - a refused QoS change leaves the thread alone for good;
   - MADEIRA_BG_QOS_PROCS picks the list and an empty value turns it off;
@@ -105,12 +107,49 @@ static void *later( void *arg )   /* a demoted thread after the game stopped */
     CHECK( qos_now == QOS_CLASS_UTILITY && qos_calls == 3 );
     return NULL;
 }
+static void present_for( uint64_t seconds )   /* the sampler notes the game every 250 ms */
+{
+    uint64_t i;
+    for (i = 0; i < seconds * 4; i++) { fake_ns += 250000000ull; ios_bg_game_note( 0x3f4, 0x470 ); }
+}
+static void *delay_thread( void *arg )   /* default MADEIRA_BG_QOS_DELAY_S: 60 s of presents first */
+{
+    TEB teb; PEB peb; RTL_USER_PROCESS_PARAMETERS pp; WCHAR buf[256];
+    (void)arg;
+    make_teb( &teb, &peb, &pp, buf, "C:\\x\\SocialClubHelper.exe", 0x1ec );
+    cur_teb = &teb;
+    ios_bg_game_note( 0x3f4, 0x470 );                     /* the game's first present */
+    ios_bg_qos_check();
+    CHECK( qos_calls == 0 );
+    present_for( 59 );
+    ios_bg_qos_check();
+    CHECK( qos_calls == 0 );                              /* 59 s: still the start-up minute */
+    present_for( 1 );
+    ios_bg_qos_check();
+    CHECK( qos_now == QOS_CLASS_UTILITY && qos_calls == 1 );   /* 60 s */
+    fake_ns += 3000000000ull;                             /* the game stops presenting */
+    ios_bg_qos_check();
+    CHECK( qos_now == QOS_CLASS_USER_INTERACTIVE && qos_calls == 2 );
+    present_for( 30 );                                    /* presents again: a new minute */
+    ios_bg_qos_check();
+    CHECK( qos_calls == 2 );
+    present_for( 31 );
+    ios_bg_qos_check();
+    CHECK( qos_now == QOS_CLASS_UTILITY && qos_calls == 3 );
+    return NULL;
+}
 int main( int argc, char **argv )
 {
     struct job before = { "C:\\Program Files\\Rockstar Games\\Social Club\\SocialClubHelper.exe", 0x1ec, 0, 1, 0, 0 };
-    (void)argv;
     /* nothing presents yet */
     CHECK( run( &before ) == QOS_CLASS_USER_INTERACTIVE * 1000 );
+    if (argc > 1 && !strcmp( argv[1], "delay" ))
+    {
+        pthread_t t;
+        pthread_create( &t, NULL, delay_thread, NULL ); pthread_join( t, NULL );
+        if (!fails) puts( "PASS: default delay: demoted only after 60 s of presents, again after a pause" );
+        return fails != 0;
+    }
     ios_bg_game_note( 0x3f4, 0x470 );
     if (argc > 1)   /* MADEIRA_BG_QOS_PROCS set by the caller */
     {
@@ -159,6 +198,12 @@ with tempfile.TemporaryDirectory() as tmp:
                     str(c), '-o', str(exe)], check=True)
     base = dict(os.environ)
     base.pop('MADEIRA_BG_QOS_PROCS', None)
+    base.pop('MADEIRA_BG_QOS_DELAY_S', None)
+    out = subprocess.run([str(exe), 'delay'], capture_output=True, text=True, env=base)
+    print(out.stdout.strip() or out.stderr.strip())
+    assert out.returncode == 0, out.stderr
+    assert 'once it has presented for 60 s' in out.stderr
+    base['MADEIRA_BG_QOS_DELAY_S'] = '0'
     out = subprocess.run([str(exe)], capture_output=True, text=True, env=base)
     print(out.stdout.strip() or out.stderr.strip())
     assert out.returncode == 0, out.stderr

@@ -1715,13 +1715,18 @@ static void ios_xp_api_report( const char *wall, double wall_s )
  * ran in a sample; the threads of the processes named in MADEIRA_BG_QOS_PROCS
  * then drop to QOS_CLASS_UTILITY at their next server call, and return to
  * USER_INTERACTIVE once the game has not presented for IOS_BG_QOS_HOLD_NS.
- * Never the game's own process. Default list below; an empty value turns it
- * off. Needs the [xp] sampler (MADEIRA_PROBES not 0). */
+ * Not before the game has presented for MADEIRA_BG_QOS_DELAY_S (default 60 s):
+ * its first minute is when it talks to the launcher and Social Club (sign-in,
+ * entitlement), which must not slow down. Never the game's own process.
+ * Default list below; an empty value turns it off. Needs the [xp] sampler
+ * (MADEIRA_PROBES not 0). */
 #include <pthread/qos.h>
 #define IOS_BG_QOS_HOLD_NS (2000ull * 1000 * 1000)
 static volatile uint64_t ios_bg_game_seen_ns;   /* 0: no game has presented */
+static volatile uint64_t ios_bg_game_since_ns;  /* when this run of presents began */
 static volatile uint32_t ios_bg_game_pid;
 static unsigned long ios_bg_qos_moves;
+static uint64_t ios_bg_qos_delay_ns;
 
 static uint64_t ios_bg_now_ns( void )
 {
@@ -1739,15 +1744,22 @@ static void ios_bg_qos_init( void );
 /* the [xp] sampler saw the game's presenting thread run */
 static void ios_bg_game_note( uint32_t pid, uint32_t wtid )
 {
+    uint64_t now = ios_bg_now_ns(), last;
+
     if (!pid) return;
+    last = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_RELAXED );
     if (__atomic_exchange_n( &ios_bg_game_pid, pid, __ATOMIC_RELAXED ) != pid)
     {
         pthread_once( &ios_bg_qos_once, ios_bg_qos_init );
-        wine_log_write( "[bg-qos] the game is process %04x (presenting thread %04x); %s run at utility QoS while "
-                        "it presents (MADEIRA_BG_QOS_PROCS)", (unsigned)pid, (unsigned)wtid,
-                        ios_bg_qos_key_ok ? ios_bg_qos_names : "nothing (off)" );
+        __atomic_store_n( &ios_bg_game_since_ns, now, __ATOMIC_RELAXED );
+        wine_log_write( "[bg-qos] the game is process %04x (presenting thread %04x); %s run at utility QoS once "
+                        "it has presented for %llu s (MADEIRA_BG_QOS_PROCS, MADEIRA_BG_QOS_DELAY_S)", (unsigned)pid,
+                        (unsigned)wtid, ios_bg_qos_key_ok ? ios_bg_qos_names : "nothing (off)",
+                        (unsigned long long)(ios_bg_qos_delay_ns / 1000000000ull) );
     }
-    __atomic_store_n( &ios_bg_game_seen_ns, ios_bg_now_ns(), __ATOMIC_RELAXED );
+    else if (!last || now - last >= IOS_BG_QOS_HOLD_NS)
+        __atomic_store_n( &ios_bg_game_since_ns, now, __ATOMIC_RELAXED );   /* presents resumed */
+    __atomic_store_n( &ios_bg_game_seen_ns, now, __ATOMIC_RELAXED );
 }
 
 static void ios_bg_qos_init( void )
@@ -1760,6 +1772,12 @@ static void ios_bg_qos_init( void )
     for (i = 0; e[i] && i < sizeof(ios_bg_qos_names) - 1; i++)
         ios_bg_qos_names[i] = (e[i] >= 'A' && e[i] <= 'Z') ? e[i] + 32 : e[i];
     ios_bg_qos_names[i] = 0;
+    {
+        /* seconds the game must present before the listed processes are demoted (default 60) */
+        const char *d = getenv( "MADEIRA_BG_QOS_DELAY_S" );
+        unsigned long s = d && *d ? strtoul( d, NULL, 10 ) : 60;
+        ios_bg_qos_delay_ns = (uint64_t)(s > 86400 ? 86400 : s) * 1000000000ull;
+    }
     /* a TSD slot, not __thread: its first use allocates nothing */
     ios_bg_qos_key_ok = ios_bg_qos_names[0] && !pthread_key_create( &ios_bg_qos_key, NULL );
 }
@@ -1812,8 +1830,12 @@ static inline void ios_bg_qos_check( void )
         pthread_setspecific( ios_bg_qos_key, (void *)st );
     }
     if (st == 1) return;
-    want = ios_bg_now_ns() - seen < IOS_BG_QOS_HOLD_NS &&
-           HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) != __atomic_load_n( &ios_bg_game_pid, __ATOMIC_RELAXED );
+    {
+        uint64_t now = ios_bg_now_ns();
+        want = now - seen < IOS_BG_QOS_HOLD_NS &&
+               now - __atomic_load_n( &ios_bg_game_since_ns, __ATOMIC_RELAXED ) >= ios_bg_qos_delay_ns &&
+               HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) != __atomic_load_n( &ios_bg_game_pid, __ATOMIC_RELAXED );
+    }
     if (want == (st == 7)) return;
     if (pthread_set_qos_class_self_np( want ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0 ))
     {
