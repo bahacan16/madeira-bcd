@@ -1176,6 +1176,75 @@ static int console_headless_cmdline( const char *env, const WCHAR *image, int im
     return cl_len + n;
 }
 
+/* madeira-bcd: the JIT pool's variables in every child's environment. The app
+ * exports WINE_IOS_JIT_RX/SIZE/RW (ContentView.swift) before Wine starts; the
+ * first process imports the Unix environment and children inherit it. The
+ * emulators read them from the Windows environment (xtajit64's and the WOW64
+ * FEX's ProcessInit: DualMap::WriteOffset = RW - RX). A service does not
+ * inherit: services.exe builds its environment from the registry
+ * (CreateEnvironmentBlock), so GTA V Enhanced's RockstarService.exe service ran
+ * without them (`[atomic-alias] LIVE: WINE_IOS_JIT_RX=<unset>`,
+ * `[DUAL_MAP_SANITY] ... WriteOffset=0x0`, in every 442 and 447 log) and its
+ * emulator wrote every translated block through the RX view of its code
+ * buffer: each store a Mach fault that the exception thread emulated. Build 447
+ * (2026-10-08 10:41 log): 1.09M emulated stores in 3.5 minutes, 99.8% into
+ * that service's 16 MB FEXMemJIT ([fault-class] blockRIP = its entry point),
+ * 45k/s at start and 3.5k/s during play, the exception thread ~20% of a core.
+ * Returns `env` (a WCHAR multi-sz) with NAME=value appended for each of
+ * `names` (ASCII, matched in any case) that it lacks and `get` (getenv) has,
+ * as a new block, its length in WCHARs (with the final NUL) in *len and the
+ * names added as bits in *added; NULL when nothing is missing or on failure. */
+static WCHAR *ios_env_with( const WCHAR *env, const char *const *names, int count,
+                            char *(*get)( const char * ), SIZE_T *len, unsigned int *added )
+{
+    const char *values[8];
+    SIZE_T used, extra = 0, o;
+    const WCHAR *p;
+    WCHAR *out;
+    int i, k;
+
+    *added = 0;
+    for (i = 0; i < count && i < 8; i++)
+    {
+        int n = (int)strlen( names[i] ), found = 0;
+
+        if (!(values[i] = get( names[i] ))) continue;
+        for (p = env; p && *p && !found; p++)
+        {
+            for (k = 0; k < n; k++)
+            {
+                WCHAR c = p[k];
+                if (c >= 'a' && c <= 'z') c -= 32;
+                if (c != (WCHAR)names[i][k]) break;   /* also stops at the entry's NUL */
+            }
+            found = (k == n && p[n] == '=');
+            while (*p) p++;   /* to this entry's NUL; the loop steps past it */
+        }
+        if (found) continue;
+        *added |= 1u << i;
+        extra += n + 1 + strlen( values[i] ) + 1;
+    }
+    if (!*added) return NULL;
+    for (p = env; p && *p; p++) while (*p) p++;
+    used = env ? (SIZE_T)(p - env) : 0;   /* every entry with its NUL, not the final NUL */
+    if (!(out = malloc( (used + extra + 1) * sizeof(WCHAR) ))) { *added = 0; return NULL; }
+    if (used) memcpy( out, env, used * sizeof(WCHAR) );
+    o = used;
+    for (i = 0; i < count && i < 8; i++)
+    {
+        const char *s;
+
+        if (!(*added & (1u << i))) continue;
+        for (s = names[i]; *s; s++) out[o++] = (WCHAR)(unsigned char)*s;
+        out[o++] = '=';
+        for (s = values[i]; *s; s++) out[o++] = (WCHAR)(unsigned char)*s;
+        out[o++] = 0;
+    }
+    out[o++] = 0;
+    *len = o;
+    return out;
+}
+
 /* The browser's new command line, written to `out` (`cap` WCHARs with the
  * NUL): `cl` with PartitionAllocBackupRefPtr put first in its last
  * --disable-features= list (Chromium uses only the last one; a second switch
@@ -1857,6 +1926,31 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                 dprintf( 2, "[console] the console of %s starts without a window (conhost --headless, as with "
                             "CREATE_NO_WINDOW; env.MADEIRA_CONSOLE_WINDOW=1 shows it)\n",
                          own ? debugstr_us( &own->ImagePathName ) : "?" );
+        }
+    }
+
+    /* madeira-bcd: a child without the JIT pool's variables gets the app's (see
+     * ios_env_with); env.MADEIRA_JIT_ENV_INHERIT=0 leaves its environment alone. */
+    {
+        static const char *const jit_names[] = { "WINE_IOS_JIT_RX", "WINE_IOS_JIT_SIZE", "WINE_IOS_JIT_RW" };
+        const char *keep = getenv( "MADEIRA_JIT_ENV_INHERIT" );   /* 0: a child's environment stays as its creator built it */
+        unsigned int added = 0;
+        SIZE_T len = 0;
+        WCHAR *env = (keep && keep[0] == '0') ? NULL
+                   : ios_env_with( params->Environment, jit_names, 3, getenv, &len, &added );   /* leaks once per start, as above */
+
+        if (env)
+        {
+            static int jit_env_n;
+
+            params->Environment = env;
+            params->EnvironmentSize = len * sizeof(WCHAR);
+            if (jit_env_n++ < 16)
+                dprintf( 2, "[jit-env] %s starts without the JIT pool's variables (a service gets its "
+                            "environment from the registry): added%s%s%s so its emulator writes code "
+                            "through the RW alias (env.MADEIRA_JIT_ENV_INHERIT=0 leaves it)\n",
+                         debugstr_us( &params->ImagePathName ), (added & 1) ? " WINE_IOS_JIT_RX" : "",
+                         (added & 2) ? " WINE_IOS_JIT_SIZE" : "", (added & 4) ? " WINE_IOS_JIT_RW" : "" );
         }
     }
 
