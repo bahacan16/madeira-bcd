@@ -26371,6 +26371,34 @@ static const char *ios_sc_kind_what( int kind )
     return kind == IOS_SC_K_CAGE ? "the V8 cage" : kind == IOS_SC_K_V1 ? "the layout 1 pools" : "a large reservation";
 }
 
+/* Layout 2: how far into each of its large grants a helper has committed, in
+ * 256 MB steps (madeira-bcd). SocialClubHelper.exe died of Chromium's
+ * out-of-memory exit after 24 minutes of GTA V Enhanced (log 2026-10-08
+ * 13:39:08, build 451, 14:01:51); at 13:56 one of its commits had landed past
+ * chrome_elf.dll's real 4 GB pool. These lines tell a pool that grows all
+ * session long from one that jumps at the end. The metadata regions follow
+ * their pools and are left out. Counted per helper; at most 64 lines. */
+static void ios_sc2_note_growth( uint64_t a, uint64_t size, const struct ios_sc2_gv *gv, void *peb )
+{
+    static uint64_t high[IOS_SC_K_OTHER + 1];
+    static void *high_peb[IOS_SC_K_OTHER + 1];
+    static unsigned lines;
+    uint64_t end = a + size - gv->view;
+    int k = gv->kind;
+
+    if (k < 0 || k > IOS_SC_K_OTHER || k == IOS_SC2_J2 || k == IOS_SC2_J2L) return;
+    if (high_peb[k] != peb) { high_peb[k] = peb; high[k] = 0; }
+    if (end <= high[k]) return;
+    if ((end >> 28) > (high[k] >> 28) && lines < 64)
+    {
+        lines++;
+        dprintf( 2, "[sc-cef] layout 2: SocialClubHelper.exe has committed %s up to +%llu MB (%llu MB real of "
+                    "%llu MB reported)\n", ios_sc_kind_what( k ), (unsigned long long)(end >> 20),
+                 (unsigned long long)(gv->real >> 20), (unsigned long long)(gv->asked >> 20) );
+    }
+    high[k] = end;
+}
+
 /* Layout 2: warn once per kind of trouble and grant when a helper's commit
  * shows a PartitionAlloc block running out of its real 4 GB, a BRP super page,
  * or a commit in the given-but-unreserved part of a grant. */
@@ -26379,7 +26407,7 @@ static void ios_sc2_note_commit( void *addr, SIZE_T size )
     static unsigned char warned[IOS_SC2_C_N][IOS_SC_K_OTHER + 1];
     struct ios_sc2_gv g[IOS_SC_GRANT_MAX];
     uint64_t a = (uint64_t)(ULONG_PTR)addr, off = 0;
-    int i, n = 0, gi = 0, c, owner;
+    int i, n = 0, gi = -1, c, owner;
     void *peb;
 
     if (a < IOS_SC2_L_BASE || !ios_sc_grant_n || !ios_sc_current_is_helper()) return;
@@ -26397,6 +26425,8 @@ static void ios_sc2_note_commit( void *addr, SIZE_T size )
     }
     pthread_mutex_unlock( &ios_sc_grant_lock );
     c = ios_sc2_commit_class( a, size, g, n, &gi, &off );
+    if (gi >= 0 && (c != IOS_SC2_C_OK || a - g[gi].view < g[gi].real))   /* a commit in this grant */
+        ios_sc2_note_growth( a, size, &g[gi], peb );
     if (c == IOS_SC2_C_OK || g[gi].kind < 0 || g[gi].kind > IOS_SC_K_OTHER || warned[c][g[gi].kind]) return;
     warned[c][g[gi].kind] = 1;
     owner = g[gi].kind == IOS_SC2_J2 ? IOS_SC2_E : g[gi].kind == IOS_SC2_J2L ? IOS_SC2_L : g[gi].kind;
