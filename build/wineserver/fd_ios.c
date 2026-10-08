@@ -1370,6 +1370,9 @@ void main_loop(void)
         static unsigned long long ios_fullscan_ns = 10000000ull;
         unsigned long long ios_last_full = 0, ios_full_n = 0, ios_pass_n = 0;
         unsigned long long ios_db_report = 0;
+        unsigned long long ios_last_slow = 0, ios_slow_n = 0;
+        static unsigned long long ios_slow_ns = 1000000ull;  /* madeira-bcd: see MADEIRA_SRV_POLL_US */
+        int ios_slow_pass = 1;
         unsigned long long ios_next_timer_ns = ~0ull;  /* ns until next timer (deadline-aware sleep) */
         int ios_full_scan = 1;                           /* madeira-bcd: read every client fd this pass */
 
@@ -1395,6 +1398,13 @@ void main_loop(void)
                 if (ms > 1000) ms = 1000;
                 ios_doorbell = !(db && db[0] == '0' && !db[1]);
                 ios_fullscan_ns = (unsigned long long)ms * 1000000ull;
+                {
+                    const char *pu = getenv( "MADEIRA_SRV_POLL_US" );  /* us between socket polls and fd scans with the doorbell on (default 1000, 0 every pass) */
+                    long us = pu && *pu ? strtol( pu, NULL, 10 ) : 1000;
+                    if (us < 0) us = 0;
+                    if (us > 100000) us = 100000;
+                    ios_slow_ns = (unsigned long long)us * 1000ull;
+                }
                 ws_log("[wineserver-fd] request doorbell: %s, read of every client fd every %ld ms "
                        "(MADEIRA_SRV_DOORBELL=0 disables, MADEIRA_SRV_FULLSCAN_MS)",
                        ios_doorbell ? "on" : "off", ms);
@@ -1591,17 +1601,30 @@ void main_loop(void)
                 }
                 else ios_full_scan = 1;
                 if (ios_full_scan) { ios_last_full = now_ns; ios_full_n++; }
+                /* madeira-bcd: with requests found through their bells, a pass
+                 * woken for a request needs nothing else; the socket poll and the
+                 * scan of every fd below (INET sockets, init fds, POLLOUT) run when
+                 * a full scan is due or MADEIRA_SRV_POLL_US (1000) has passed --
+                 * the 1 ms tick the loop had before the wake semaphore. Build 442
+                 * ran ~25,000 such passes a second and spent ~210 ms of every
+                 * ~300 ms in them. */
+                ios_slow_pass = !ios_doorbell || ios_full_scan || now_ns - ios_last_slow >= ios_slow_ns;
+                if (ios_slow_pass) { ios_last_slow = now_ns; ios_slow_n++; }
                 if (!ios_db_report) ios_db_report = now_ns;
                 else if (now_ns - ios_db_report >= 10000000000ull)
                 {
                     double s = (now_ns - ios_db_report) / 1e9;
-                    ws_log("[srv-doorbell] %.0f passes/s, %.0f full scans/s, %.0f rung threads/s "
-                           "(%.0f rung again), %d poll users",
-                           ios_pass_n / s, ios_full_n / s, ios_bell_threads / s, ios_bell_again / s, nb_users);
-                    ios_pass_n = ios_full_n = ios_bell_threads = ios_bell_again = 0;
+                    /* stderr: ws_log stops reaching the session log once the app
+                     * sets ws_log_quiet (ContentView), which hid this line in 442 */
+                    fprintf( stderr, "[srv-doorbell] %.0f passes/s, %.0f socket+fd scans/s, %.0f full scans/s, "
+                             "%.0f rung threads/s (%.0f rung again), %d poll users\n",
+                             ios_pass_n / s, ios_slow_n / s, ios_full_n / s, ios_bell_threads / s,
+                             ios_bell_again / s, nb_users );
+                    ios_pass_n = ios_full_n = ios_slow_n = ios_bell_threads = ios_bell_again = 0;
                     ios_db_report = now_ns;
                 }
             }
+            if (!ios_slow_pass) continue;
 
             /* Real sockets first: zero-timeout poll() gives true INET
              * event semantics (connect completion, errors, data). See

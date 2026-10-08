@@ -143,6 +143,11 @@ assert loop.index('semaphore_timedwait( ios_srv_wake_sem, wts );') < loop.index(
 assert loop.index('__atomic_store_n( &ios_srv_wake_pending, 0, __ATOMIC_SEQ_CST );') < loop.index('ios_doorbell_service();'), \
     'the pending flag is cleared before the bells are taken'
 assert 'else ios_full_scan = 1;' in loop, 'MADEIRA_SRV_DOORBELL=0: every pass is a full scan'
+assert 'ios_slow_pass = !ios_doorbell || ios_full_scan || now_ns - ios_last_slow >= ios_slow_ns;' in loop, \
+    'sockets and fds are scanned when a full scan is due, every MADEIRA_SRV_POLL_US, or always without the doorbell'
+assert loop.index('ios_doorbell_service();') < loop.index('if (!ios_slow_pass) continue;') \
+    < loop.index('if (!ios_fd_is_inet( i, pollfd[i].fd )) continue;'), 'a request pass returns to the wait before the scans'
+assert 'fprintf( stderr, "[srv-doorbell]' in loop, 'the heartbeat reaches the session log'
 assert 'if (ios_full_scan)\n                            {\n                                revents |= POLLIN;' in loop, \
     'client fds get the synthetic POLLIN only on a full-scan pass'
 poll_thread = req[req.index('int ios_doorbell_poll_thread( unsigned int tid )'):]
