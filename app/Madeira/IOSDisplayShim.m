@@ -53,6 +53,15 @@ void madeira_display_set_layer(CAMetalLayer *layer) {
     pthread_mutex_unlock(&g_lock);
 }
 
+// Winios.m (MADEIRA_METAL_HUD_MAIN): a desktop session presents into
+// per-window layers, so this layer's Metal HUD is turned off there.
+CAMetalLayer *madeira_display_layer(void) {
+    pthread_mutex_lock(&g_lock);
+    CAMetalLayer *layer = g_layer;
+    pthread_mutex_unlock(&g_lock);
+    return layer;
+}
+
 // --- The guest's virtual monitor ---------------------------------------
 //
 // The front end lays out the presented layer and maps touches in guest

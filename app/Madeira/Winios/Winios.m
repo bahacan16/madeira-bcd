@@ -794,6 +794,7 @@ static NSNumber *g_fit_key;
 static CGRect g_fit_client_px;   /* the window's client rect, desktop px */
 static CGRect g_fit_view_pt;     /* where it is shown, compositor-view points */
 static void winios_place_metal_layer(NSNumber *key);
+static void winios_metal_hud_pick(void);   /* MADEIRA_METAL_HUD_MAIN, below */
 
 /* Surfaces are 128px-aligned (win32u), usually LARGER than the window.
  * Crop the layer contents to the window's actual size or everything
@@ -1069,6 +1070,7 @@ void winios_session_reset(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_game_metal removeAllObjects];
         if (g_comp_game) winios_drop_compositor("new session");
+        winios_metal_hud_pick();   /* the window-level layer's HUD follows the session kind */
     });
 }
 
@@ -1201,6 +1203,7 @@ static void winios_remove_layer(HWND hwnd) {
             if (g_fit_key && [g_fit_key isEqual:key]) g_fit_key = nil;
             fprintf(stderr, "[winios] metal layer removed for hwnd=%p\n", hwnd);
             fflush(stderr);
+            winios_metal_hud_pick();
         }
     });
 }
@@ -1311,11 +1314,22 @@ static unsigned long long winios_hidden_present_interval_ns(void) {
 @implementation MadeiraWindowMetalLayer {
     int _windowHidden;                /* __atomic: set on the main thread, read on DXMT's */
     unsigned long long _lastDrawableNs;
+    int _firstDrawableSaid;           /* __atomic: the [metal-hud] line below was written */
 }
 - (void)madeiraSetWindowHidden:(BOOL)hidden {
     __atomic_store_n(&_windowHidden, hidden ? 1 : 0, __ATOMIC_RELAXED);
 }
 - (nullable id<CAMetalDrawable>)nextDrawable {
+    if (!__atomic_exchange_n(&_firstDrawableSaid, 1, __ATOMIC_RELAXED)) {
+        @autoreleasepool {   /* once per layer: what Apple's Metal HUD is drawn into (MADEIRA_METAL_HUD_MAIN, below) */
+            CGSize d = self.drawableSize, b = self.bounds.size;
+            NSString *hud = [self.developerHUDProperties[@"mode"] description];
+            fprintf(stderr, "[metal-hud] hwnd=0x%llx first drawable %.0fx%.0f px on %.0fx%.0f pt, "
+                            "contentsScale %.1f, HUD mode %s\n",
+                    (unsigned long long)self.madeiraHwnd, d.width, d.height, b.width, b.height,
+                    (double)self.contentsScale, hud ? hud.UTF8String : "default");
+        }
+    }
     unsigned long long interval = winios_hidden_present_interval_ns();
     if (interval && __atomic_load_n(&_windowHidden, __ATOMIC_RELAXED)) {
         unsigned long long now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -1335,11 +1349,80 @@ static unsigned long long winios_hidden_present_interval_ns(void) {
 }
 @end
 
+/* madeira-bcd: ONE METAL HUD LAYER (opt-in). Apple's Metal Performance HUD
+ * (Settings › Developer › Graphics HUD) is drawn per CAMetalLayer that
+ * presents, sized in that layer's drawable pixels, and takes its frame
+ * metrics from one "main" layer: unless a layer's developerHUDProperties
+ * says mode=main, the first layer the app created. In a Madeira Dock
+ * session that is MetalHostView's window-level layer (made at app start),
+ * which presents nothing there; the launcher, its hidden Chromium layer
+ * (still presenting, see MADEIRA_HIDDEN_LAYER_FPS) and the game each
+ * present into a window layer of their own, and libMTLHud reports each new
+ * one's frame-interval, present-delay and fps metrics as already existing
+ * ("Metric com.apple.hud-stat.fps already exist" at the first present of
+ * every window layer; log 2026-10-08 10:41:34, build 447, GTA V Enhanced's
+ * Present #1). The launcher showed the full panel; the game showed only a
+ * large FPS figure (build 447), or a HUD box frozen at 58.06 (builds
+ * 427/433). MADEIRA_METAL_HUD_MAIN=1 makes the largest shown window layer
+ * the HUD's main layer and turns the HUD off on every other window layer
+ * and, in a desktop session, on the window-level layer. Apple documents
+ * `mode` as turning the HUD on or off for the layer, so with the switch on
+ * the HUD may show even while Developer settings has it off. Main thread
+ * only. */
+static int winios_metal_hud_main_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("MADEIRA_METAL_HUD_MAIN"); on = e && e[0] == '1'; }   /* 1: Apple's Metal HUD only on the largest shown desktop window's Metal layer (its main layer), off on the other layers; default: Apple's own choice */
+    return on;
+}
+
+/* IOSDisplayShim.m: the window-level layer (MetalHostView) */
+extern CAMetalLayer *madeira_display_layer(void);
+
+static void winios_metal_hud_set(CAMetalLayer *ml, NSDictionary *want) {
+    NSDictionary *have = ml.developerHUDProperties;
+    if (have != want && ![have isEqual:want]) ml.developerHUDProperties = want;
+}
+
+static void winios_metal_hud_pick(void) {
+    if (!winios_metal_hud_main_enabled()) return;
+    NSDictionary *off = @{ @"mode": @"disabled" };
+    NSNumber *main_key = nil;
+    CGFloat main_area = 0;
+    for (NSNumber *key in g_metal_layers) {
+        CALayer *win = g_layers[key];
+        CGSize sz = g_metal_layers[key].bounds.size;
+        if (!win || win.hidden || sz.width * sz.height <= main_area) continue;
+        main_key = key;
+        main_area = sz.width * sz.height;
+    }
+    for (NSNumber *key in g_metal_layers)
+        winios_metal_hud_set(g_metal_layers[key], [key isEqual:main_key] ? @{ @"mode": @"main" } : off);
+    BOOL desk = winios_desktop_session();
+    winios_metal_hud_set(madeira_display_layer(), desk ? off : nil);   /* a game session presents there */
+    static NSNumber *said_key;
+    static unsigned said;
+    if (main_key != said_key && ![main_key isEqual:said_key] && said < 32) {
+        said++;
+        if (main_key)
+            fprintf(stderr, "[metal-hud] main layer hwnd=0x%llx (%.0fx%.0f pt); HUD off on %lu other window "
+                            "layer(s)%s (MADEIRA_METAL_HUD_MAIN=1)\n", main_key.unsignedLongLongValue,
+                    g_metal_layers[main_key].bounds.size.width, g_metal_layers[main_key].bounds.size.height,
+                    (unsigned long)g_metal_layers.count - 1, desk ? " and the window-level layer" : "");
+        else
+            fprintf(stderr, "[metal-hud] no shown window layer: HUD off on %lu window layer(s)%s "
+                            "(MADEIRA_METAL_HUD_MAIN=1)\n", (unsigned long)g_metal_layers.count,
+                    desk ? " and the window-level layer" : "");
+        fflush(stderr);
+    }
+    said_key = main_key;
+}
+
 /* main thread: the window layer of `key` was just shown or hidden */
 static void winios_sync_metal_hidden(NSNumber *key, CALayer *l) {
     CAMetalLayer *ml = g_metal_layers[key];
     if ([ml isKindOfClass:[MadeiraWindowMetalLayer class]])
         [(MadeiraWindowMetalLayer *)ml madeiraSetWindowHidden:l.hidden];
+    winios_metal_hud_pick();
 }
 
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
@@ -1373,6 +1456,7 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
                     ml.frame.size.width, ml.frame.size.height);
             fflush(stderr);
             winios_census_note_metal((HWND)hwnd);
+            winios_metal_hud_pick();
         }
         result = ml;
     };
