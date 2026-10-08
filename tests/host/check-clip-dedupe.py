@@ -110,3 +110,12 @@ census = request[request.index('static unsigned long cursor_flags[6];'):]
 assert 'thread->req.set_cursor_request.flags' in census
 assert 'unchanged ClipCursor notifications skipped so far: %lu' in census
 print('PASS: the [srv-req] census reports set_cursor by flag and the skipped repeats')
+
+# the select census (which waits fastsync could answer in the client)
+sel = request[request.index('static unsigned long sel_shape[7], sel_obj[8], sel_multi_sem;'):]
+sel = sel[:sel.index('if (req == REQ_set_cursor)')]
+assert 'if (!obj) clear_error();' in sel and 'release_object( obj );' in sel, 'the lookup leaves no error or reference behind'
+assert 'shape = (thread->req.select_request.flags & SELECT_ALERTABLE) ? 1 : 0;' in sel
+assert 'type == &semaphore_type ? 0' in sel
+assert '[srv-req] select by shape: single %lu, single alertable %lu, any of many %lu' in request
+print('PASS: the [srv-req] census reports select by shape and by the first object waited on')

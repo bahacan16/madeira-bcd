@@ -323,6 +323,56 @@ static void call_req_handler( struct thread *thread )
          * count it inherited. */
         static struct { unsigned int tid, pid; unsigned long n; } hh[REQ_NB_REQUESTS][4];
         static unsigned long cursor_flags[6];   /* set_cursor by flag: handle count pos clip noclip fsclip */
+        /* madeira-bcd: the shape of each wait. Fastsync answers a single,
+         * non-alertable wait on an event (or, with MADEIRA_FASTSYNC_SEM=1, on a
+         * semaphore) in the client; every other shape stays a server round
+         * trip. GTA V sent ~15,000 selects a second in build 442 (sem=off), and
+         * these counts say how many of them the switch could take away.
+         * Shapes: single, single alertable, any of many, all of many,
+         * signal-and-wait, keyed event, other; objects by the first handle. */
+        static unsigned long sel_shape[7], sel_obj[8], sel_multi_sem;
+        if (req == REQ_select &&
+            get_req_data_size() >= sizeof(union apc_result) + sizeof(enum select_opcode))
+        {
+            const union apc_result *res = get_req_data();
+            data_size_t size = min( thread->req.select_request.size, get_req_data_size() - sizeof(*res) );
+            union select_op op;
+            unsigned int nh = 0, i, shape;
+            int has_sem = 0;
+
+            memset( &op, 0, sizeof(op) );
+            memcpy( &op, res + 1, min( size, sizeof(op) ) );
+            if ((op.op == SELECT_WAIT || op.op == SELECT_WAIT_ALL) && size > offsetof( union select_op, wait.handles ))
+                nh = min( (size - offsetof( union select_op, wait.handles )) / sizeof(obj_handle_t),
+                          MAXIMUM_WAIT_OBJECTS );
+            if (op.op == SELECT_WAIT && nh == 1)
+                shape = (thread->req.select_request.flags & SELECT_ALERTABLE) ? 1 : 0;
+            else if (op.op == SELECT_WAIT) shape = 2;
+            else if (op.op == SELECT_WAIT_ALL) shape = 3;
+            else if (op.op == SELECT_SIGNAL_AND_WAIT) shape = 4;
+            else if (op.op == SELECT_KEYED_EVENT_WAIT || op.op == SELECT_KEYED_EVENT_RELEASE) shape = 5;
+            else shape = 6;
+            sel_shape[shape]++;
+            for (i = 0; i < nh; i++)
+            {
+                struct object *obj = get_handle_obj( thread->process, op.wait.handles[i], 0, NULL );
+                const struct type_descr *type;
+                int k = 7;
+
+                if (!obj) clear_error();   /* the handler reports a bad handle itself */
+                else
+                {
+                    type = obj->ops->type;
+                    k = type == &semaphore_type ? 0 : type == &event_type ? 1 : type == &mutex_type ? 2 :
+                        type == &thread_type ? 3 : type == &process_type ? 4 : type == &timer_type ? 5 :
+                        type == &completion_type ? 6 : 7;
+                    release_object( obj );
+                }
+                if (!i) sel_obj[k]++;
+                if (!k) has_sem = 1;
+            }
+            if (nh > 1 && has_sem) sel_multi_sem++;
+        }
         if (req == REQ_set_cursor)
         {
             unsigned int f = thread->req.set_cursor_request.flags, b;
@@ -370,6 +420,19 @@ static void call_req_handler( struct thread *thread )
                          cursor_flags[0], cursor_flags[1], cursor_flags[2], cursor_flags[3], cursor_flags[4],
                          cursor_flags[5], ios_clip_repeats_skipped );
                 memset( cursor_flags, 0, sizeof(cursor_flags) );
+            }
+            if (sel_shape[0] + sel_shape[1] + sel_shape[2] + sel_shape[3] + sel_shape[4] + sel_shape[5] + sel_shape[6])
+            {
+                fprintf( stderr, "[srv-req] select by shape: single %lu, single alertable %lu, any of many %lu "
+                         "(%lu with a semaphore), all of many %lu, signal-and-wait %lu, keyed event %lu, other %lu; "
+                         "first object: semaphore %lu, event %lu, mutex %lu, thread %lu, process %lu, timer %lu, "
+                         "completion %lu, other %lu\n",
+                         sel_shape[0], sel_shape[1], sel_shape[2], sel_multi_sem, sel_shape[3], sel_shape[4],
+                         sel_shape[5], sel_shape[6], sel_obj[0], sel_obj[1], sel_obj[2], sel_obj[3], sel_obj[4],
+                         sel_obj[5], sel_obj[6], sel_obj[7] );
+                memset( sel_shape, 0, sizeof(sel_shape) );
+                memset( sel_obj, 0, sizeof(sel_obj) );
+                sel_multi_sem = 0;
             }
             t0 = t1;
         }
