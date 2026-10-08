@@ -1144,6 +1144,38 @@ static const char *child_extra_args( const char *spec, const WCHAR *image, int i
     return spec;
 }
 
+/* madeira-bcd: consoles without a window. kernelbase's alloc_console starts
+ * conhost.exe with a window unless the program asked for none
+ * (CREATE_NO_WINDOW appends --headless). In a Dock session explorer's desktop
+ * starts dockhost.exe, a console program, without a console, so it gets one
+ * with a window: build 442 (2026-10-08, both runs) had exactly one conhost,
+ * `conhost.exe --server 0x34` from dockhost's main thread at t+4 s, window
+ * 0x20056 shown at {0,0,505,434}, the "DOS window" left of the game, showing
+ * what dockhost, Valve's client in it and console children print. Social
+ * Club's helper opened one the same way when --enable-logging made Chromium
+ * call AllocConsole. On the phone it only covers the game, and painting what
+ * is written to it costs CPU, so a conhost.exe started for a console
+ * (--server) without --headless or --unix gets --headless: the console works
+ * as before (WriteConsole, modes, Ctrl handlers), only GetConsoleWindow() is
+ * NULL, as with CREATE_NO_WINDOW. Pseudo-consoles already start headless.
+ * env.MADEIRA_CONSOLE_WINDOW=1 keeps the window. Writes the new command line
+ * to `out` (`cap` WCHARs with the NUL) and returns its length, or -1 when it
+ * stays as it is. */
+static int console_headless_cmdline( const char *env, const WCHAR *image, int image_len,
+                                     const WCHAR *cl, int cl_len, WCHAR *out, int cap )
+{
+    static const char headless[] = " --headless";
+    int n = (int)sizeof(headless) - 1, k;
+
+    if ((env && env[0] == '1') || !ios_image_name_is( image, image_len, "conhost.exe" )) return -1;
+    if (sc_switch_end( cl, cl_len, "--server" ) < 0 || sc_switch_end( cl, cl_len, "--headless" ) >= 0 ||
+        sc_switch_end( cl, cl_len, "--unix" ) >= 0 || cl_len + n + 1 > cap) return -1;
+    memcpy( out, cl, cl_len * sizeof(WCHAR) );
+    for (k = 0; k < n; k++) out[cl_len + k] = (WCHAR)headless[k];
+    out[cl_len + n] = 0;
+    return cl_len + n;
+}
+
 /* The browser's new command line, written to `out` (`cap` WCHARs with the
  * NUL): `cl` with PartitionAllocBackupRefPtr put first in its last
  * --disable-features= list (Chromium uses only the last one; a second switch
@@ -1800,6 +1832,32 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
                         "threads have no CPU area for the emulator loaded into it (it would take the app "
                         "down); the caller gets no console (env.MADEIRA_EC_CONHOST=1 starts it)\n" );
         return STATUS_ACCESS_DENIED;
+    }
+
+    /* madeira-bcd: a console's conhost.exe starts without a window (see
+     * console_headless_cmdline); env.MADEIRA_CONSOLE_WINDOW=1 keeps it. */
+    {
+        int cl_len = params->CommandLine.Length / sizeof(WCHAR), o = -1;
+        WCHAR *nbuf = malloc( (cl_len + 16) * sizeof(WCHAR) );   /* kept when used: leaks once per console, as above */
+        const char *window = getenv( "MADEIRA_CONSOLE_WINDOW" );   /* 1: consoles keep their conhost window (default: none, as with CREATE_NO_WINDOW) */
+
+        if (nbuf)
+            o = console_headless_cmdline( window, params->ImagePathName.Buffer, params->ImagePathName.Length / sizeof(WCHAR),
+                                          params->CommandLine.Buffer, cl_len, nbuf, cl_len + 16 );
+        if (o < 0) free( nbuf );
+        else
+        {
+            const RTL_USER_PROCESS_PARAMETERS *own = NtCurrentTeb()->Peb->ProcessParameters;
+            static int console_n;
+
+            params->CommandLine.Buffer = nbuf;
+            params->CommandLine.Length = o * sizeof(WCHAR);
+            params->CommandLine.MaximumLength = params->CommandLine.Length + sizeof(WCHAR);
+            if (console_n++ < 16)
+                dprintf( 2, "[console] the console of %s starts without a window (conhost --headless, as with "
+                            "CREATE_NO_WINDOW; env.MADEIRA_CONSOLE_WINDOW=1 shows it)\n",
+                         own ? debugstr_us( &own->ImagePathName ) : "?" );
+        }
     }
 
     /* madeira-bcd: Social Club's Chromium -- see sc_helper_kind. */
