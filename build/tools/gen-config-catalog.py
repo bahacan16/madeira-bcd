@@ -84,6 +84,20 @@ OVERLAY = {
                 "note": "The largest new reservation the swap tier backs whole: 256 MB in wide (at most 4 GB), 8 GB in "
                         "broad (at most 16 GB). 9216 with broad coverage (swap-mode = 2) also backs Red Dead "
                         "Redemption 2's 8960 MB heap with the file. Read at session start."},
+    "env.MADEIRA_THREAD_STACK_SPILL": {"category": "Memory & JIT pool", "title": "New threads may use the kernel's pick when memory space is full",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a new thread's 1 MB kernel stack (and its emulator stack) is looked for from "
+                        "the start of Wine's furniture band instead of from 4 GB (each new thread no longer tries "
+                        "about 300 refused addresses first), and when that band is full the kernel places it "
+                        "anywhere still free instead of the thread failing. Red Dead Redemption 2 froze four minutes "
+                        "into the story because every new thread failed this way while 1.8 GB was free elsewhere. "
+                        "Read at session start."},
+    "env.MADEIRA_SMALL_STACK_EXES": {"category": "Memory & JIT pool", "title": "Programs whose threads keep a 2 MB stack",
+                "kind": "text", "default": "",
+                "note": "Empty by default: every thread stack is at least 8 MB (Chromium needs that). Exe names, "
+                        "separated by commas (e.g. RDR2.exe): threads of these programs get the stack they ask for, "
+                        "at least 2 MB, so their stacks take less of the shared memory space. Never list Chromium "
+                        "programs (SocialClubHelper.exe, Launcher.exe, steamwebhelper.exe). Read when a thread starts."},
     "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "

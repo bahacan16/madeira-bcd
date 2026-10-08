@@ -19157,6 +19157,43 @@ failed:
     return status;
 }
 
+/* madeira-bcd: [stack-spill] a 4 GB floor constrains nothing on iOS.
+ *
+ * init_thread_stack asks for every thread's kernel stack (1 MB), CHPE emulator
+ * stack and WoW64 64-bit stack with limit_low = limit_4g, as upstream does to
+ * keep them out of the low 4 GB. Nothing is ever mapped below 4 GB here (the
+ * __PAGEZERO), but virtual_set_large_address_space resets address_space_start
+ * to 0x10000 for a 64-bit program, so map_view's "limit_low at or below
+ * address_space_start" test (ml119) never matches these requests. They scan
+ * the low map from 4 GB on every thread creation (~260-300 refused tries each,
+ * the [va-scan] SLOW lines) and, once the furniture band is full, fail with
+ * STATUS_NO_MEMORY instead of taking the relax valve. RDR2 (build 460, log
+ * 2026-10-08 23:59:11) froze that way four minutes into the story: RDR2.exe's
+ * main thread retried CreateThread, every try ended in [va-scan] FAILED
+ * window=0x100000000..0x73ffff0000 size=0x100000 and "[thr-create] FAILED at
+ * kernel stack", while 1838 MB above the JIT pool's RW alias were free.
+ * MADEIRA_THREAD_STACK_SPILL=1 treats a limit_low at or below 4 GB as absent:
+ * the scan starts at the furniture floor, and a full band falls back to the
+ * kernel's pick like any other relaxable request. Off by default. */
+static int ios_stack_spill_enabled(void)
+{
+    static int enabled = -1;
+    int v = __atomic_load_n( &enabled, __ATOMIC_ACQUIRE );
+
+    if (v < 0)
+    {
+        const char *s = getenv( "MADEIRA_THREAD_STACK_SPILL" );
+
+        v = s && s[0] == '1' && !s[1];
+        __atomic_store_n( &enabled, v, __ATOMIC_RELEASE );
+        if (v)
+            dprintf( 2, "[stack-spill] MADEIRA_THREAD_STACK_SPILL=1: requests bounded only by a 4 GB floor "
+                        "(thread kernel, emulator and WoW64 stacks) start at the furniture floor and use the "
+                        "kernel's pick when the band is full\n" );
+    }
+    return v;
+}
+
 /***********************************************************************
  *           map_view
  *
@@ -19223,6 +19260,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
          * top-of-space tenant from ml106) stay below 464G-64K; only the PA
          * 16GB/32GB pool reserves may use the slots above. */
         int ceiling_relaxable = 0;
+        int stack_spill = 0;   /* madeira-bcd: relaxable only through ios_stack_spill_enabled */
         void *wow_hi_start = NULL, *wow_hi_end = NULL;   /* madeira-bcd: band above the 32-bit windows */
         if (ios_furniture_ceiling && !limit_high && size < 0x400000000ULL &&
             (void *)ios_furniture_ceiling < end)
@@ -19241,6 +19279,9 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
              * for the same call. (top_down is a hint, not a contract, and is
              * knowingly dropped on the relax path.) */
             ceiling_relaxable = (limit_low <= (ULONG_PTR)address_space_start);
+            /* madeira-bcd: [stack-spill] — see ios_stack_spill_enabled */
+            if (!ceiling_relaxable && limit_low <= limit_4g && ios_stack_spill_enabled())
+                ceiling_relaxable = stack_spill = 1;
         }
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
         size_t unmap_size, view_size = host_size + align_mask + 1;
@@ -19526,6 +19567,15 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             if (unmap_size) munmap( ptr, unmap_size );
         }
         ptr = unmap_extra_space( ptr, view_size, host_size, align_mask );
+        if (stack_spill)
+        {
+            static unsigned long spill_n;
+
+            if (++spill_n <= 16 || !(spill_n % 256))
+                dprintf( 2, "[stack-spill] #%lu furniture band full: 0x%lx bytes with a 4 GB floor "
+                            "placed at %p by the kernel's pick (MADEIRA_THREAD_STACK_SPILL)\n",
+                         spill_n, (unsigned long)size, ptr );
+        }
     }
 done:
     status = create_view( view_ret, ptr, size, vprot );
@@ -24415,6 +24465,71 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
 }
 
 
+/* madeira-bcd: [stack-floor] programs whose threads keep a smaller stack.
+ *
+ * ml422/ml423 give every guest thread stack at least 8 MB because Chromium's
+ * renderer threads overflowed 4 MB under ARM64EC. All pseudo-processes share
+ * one address space, so the floor is paid in furniture VA by every thread of
+ * every program: RDR2.exe made 186 threads in build 460 (log 2026-10-08
+ * 23:59:11), each with at least 8 MB of the band whose exhaustion froze it,
+ * where a 1 MB request (the twelve logged ones) needs 1 MB on Windows.
+ * MADEIRA_SMALL_STACK_EXES lists exe names
+ * (comma or semicolon separated, case-insensitive, e.g. "RDR2.exe") whose
+ * threads get what they ask for with a 2 MB minimum — twice the Windows
+ * default, for the native frames ARM64EC adds — instead; every other program,
+ * Chromium included, keeps 8 MB. Empty by default. */
+#define IOS_SMALL_STACK_FLOOR (2 * 1024 * 1024)
+
+/* 1 when the last component of `path` (len WCHARs) is one of the names in
+ * `list`. */
+static int ios_exe_name_in_list( const WCHAR *path, size_t len, const char *list )
+{
+    size_t base = 0, k, n;
+
+    if (!path || !list) return 0;
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    while (*list)
+    {
+        const char *name = list, *e;
+
+        while (*name == ' ') name++;
+        e = name;
+        while (*e && *e != ',' && *e != ';') e++;
+        n = e - name;
+        while (n && name[n - 1] == ' ') n--;
+        if (n && n == len - base)
+        {
+            for (k = 0; k < n; k++)
+            {
+                WCHAR c = path[base + k];
+                char w = name[k];
+
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (w >= 'A' && w <= 'Z') w += 32;
+                if (c != (WCHAR)(unsigned char)w) break;
+            }
+            if (k == n) return 1;
+        }
+        list = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+/* The floor for a new guest thread stack of the calling pseudo-process. */
+static SIZE_T ios_thread_stack_floor(void)
+{
+    const char *list = getenv( "MADEIRA_SMALL_STACK_EXES" );
+    PEB *peb;
+    RTL_USER_PROCESS_PARAMETERS *pp;
+
+    if (!list || !*list) return 8 * 1024 * 1024;
+    peb = ios_jit_current_peb();
+    pp = peb ? peb->ProcessParameters : NULL;
+    if (pp && ios_exe_name_in_list( pp->ImagePathName.Buffer, pp->ImagePathName.Length / sizeof(WCHAR), list ))
+        return IOS_SMALL_STACK_FLOOR;
+    return 8 * 1024 * 1024;
+}
+
 /***********************************************************************
  *           virtual_alloc_thread_stack
  */
@@ -24452,11 +24567,26 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
      * fingerprint names the recursion cycle — chase that, not more size. */
     if (guard_page && size < 8 * 1024 * 1024)
     {
-        static int floored;
-        if (floored < 12 && ++floored <= 12)
-            dprintf( 2, "[stack-floor] rev=ml424 #%d thread stack reserve 0x%lx -> 0x800000\n",
-                     floored, (unsigned long)size );
-        size = 8 * 1024 * 1024;
+        /* madeira-bcd: MADEIRA_SMALL_STACK_EXES — see ios_thread_stack_floor */
+        SIZE_T min_size = ios_thread_stack_floor();
+
+        if (min_size < 8 * 1024 * 1024)
+        {
+            static int kept;
+            if (kept < 12 && ++kept <= 12)
+                dprintf( 2, "[stack-floor] madeira-bcd #%d thread stack reserve 0x%lx -> 0x%lx "
+                            "(the program is in MADEIRA_SMALL_STACK_EXES)\n",
+                         kept, (unsigned long)size, (unsigned long)max( size, min_size ) );
+            size = max( size, min_size );
+        }
+        else
+        {
+            static int floored;
+            if (floored < 12 && ++floored <= 12)
+                dprintf( 2, "[stack-floor] rev=ml424 #%d thread stack reserve 0x%lx -> 0x800000\n",
+                         floored, (unsigned long)size );
+            size = 8 * 1024 * 1024;
+        }
     }
 #endif
     size = ROUND_SIZE( 0, size, granularity_mask );
