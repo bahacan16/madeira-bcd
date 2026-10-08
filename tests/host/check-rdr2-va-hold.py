@@ -13,8 +13,9 @@ against a fake Mach map that starts with the app's PROT_NONE hold over
   - with it: libcef.dll's pools [0x7000000000, +256 MB) taken over from the
     app's hold and the rest of that hold released to the furniture (floor
     0x7010000000); chrome_elf.dll's metadata [0x7400000000, +6400 MB),
-    libcef.dll's metadata [0x7590000000, +1 GB); chrome_elf.dll's pools and
-    Oilpan where they were; [0x75d0000000, 0x7800000000) held and registered
+    libcef.dll's metadata [0x7590000000, +1 GB); Oilpan's slot 1 GB (the FEX
+    arena then starts at 0x7c40000000); chrome_elf.dll's pools where they
+    were; [0x75d0000000, 0x7800000000) held and registered
     as the jumbo holdback, which an 8960 MB request gets once and a smaller
     one (Social Club's hinted 1 GB) never;
   - a mapping that is not the app's hold stays where it is (no release);
@@ -207,7 +208,9 @@ int main(int argc, char **argv)
             return fail("a slot is not where layout 2 puts it");
         if (ios_jumbo_hold_size || has("MADEIRA_RDR2_VA_HOLD")) return fail("a holdback without the env");
         if (ios_sc2_slots[IOS_SC2_L].size != GB(4) || ios_sc2_slots[IOS_SC2_J2L].base != 0x7600000000ull ||
-            ios_sc2_slots[IOS_SC2_J2L].size != GB(8) || ios_sc2_slots[IOS_SC2_J2].size != GB(8))
+            ios_sc2_slots[IOS_SC2_J2L].size != GB(8) || ios_sc2_slots[IOS_SC2_J2].size != GB(8) ||
+            ios_sc2_slots[IOS_SC2_OILPAN].size != GB(4) || ios_sc2_floor != 0x7100000000ull ||
+            ios_sc2_arena_lo != 0x7d00000000ull)
             return fail("the slot table changed without the env");
         printf("PASS: without MADEIRA_RDR2_VA_HOLD layout 2 holds and prints exactly what it did\n");
         return 0;
@@ -220,8 +223,10 @@ int main(int argc, char **argv)
             ios_sc2_slots[IOS_SC2_J2L].base != 0x7590000000ull || ios_sc2_slots[IOS_SC2_J2L].size != GB(1) ||
             ios_sc2_slots[IOS_SC2_J2].base != 0x7400000000ull || ios_sc2_slots[IOS_SC2_J2].size != 0x190000000ull ||
             ios_sc2_slots[IOS_SC2_E].base != 0x7800000000ull || ios_sc2_slots[IOS_SC2_E].size != GB(4) ||
-            ios_sc2_slots[IOS_SC2_OILPAN].base != 0x7c00000000ull || ios_sc2_slots[IOS_SC2_OILPAN].size != GB(4))
+            ios_sc2_slots[IOS_SC2_OILPAN].base != 0x7c00000000ull || ios_sc2_slots[IOS_SC2_OILPAN].size != GB(1) ||
+            ios_sc2_arena_lo != 0x7c40000000ull)
             return fail("the variant geometry is wrong");
+        if (!region(0x7c00000000ull, 0x7c40000000ull)) return fail("Oilpan's 1 GB slot is not held");
         if (!region(0x7400000000ull, 0x7590000000ull) || !region(0x7590000000ull, 0x75d0000000ull) ||
             !region(0x75d0000000ull, 0x7800000000ull))
             return fail("a metadata slot or the RDR2 hold is not where it belongs");
@@ -234,7 +239,8 @@ int main(int argc, char **argv)
         if (ios_jumbo_hold_base != 0x75d0000000ull || ios_jumbo_hold_size != 0x230000000ull || ios_jumbo_hold_keep)
             return fail("the RDR2 hold is not the jumbo holdback");
         if (!has("[sc-cef] layout 2 with MADEIRA_RDR2_VA_HOLD: held libcef.dll's pools [0x7000000000,+256 MB) and its "
-                 "PartitionAlloc metadata [0x7590000000,+1024 MB), chrome_elf.dll's metadata [0x7400000000,+6400 MB)"))
+                 "PartitionAlloc metadata [0x7590000000,+1024 MB), chrome_elf.dll's metadata [0x7400000000,+6400 MB) and "
+                 "pools [0x7800000000,+4 GB), Oilpan [0x7c00000000,+1024 MB)"))
             return fail("no variant line");
         if (!has("[sc-cef] MADEIRA_RDR2_VA_HOLD: [0x75d0000000,0x7800000000) held for one 8960 MB reserve"))
             return fail("no hold line");

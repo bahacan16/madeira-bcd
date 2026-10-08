@@ -252,7 +252,9 @@ int main(int argc, char **argv)
             !has("[band]   [0x7400000000,0x7590000000) chrome_elf.dll's metadata:") ||
             !has("[band]   [0x7590000000,0x75d0000000) libcef.dll's metadata:") ||
             !has("[band]   [0x75d0000000,0x7800000000) RDR2 hold:") ||
-            !has("[band]   [0x7800000000,0x7900000000) chrome_elf.dll's pools:"))
+            !has("[band]   [0x7800000000,0x7900000000) chrome_elf.dll's pools:") ||
+            !has("[band]   [0x7c00000000,0x7c40000000) Oilpan's cage:") ||
+            !has("[band]   [0x7c40000000,0x8000000000) FEX arena:"))
             return fail("the variant's pieces are wrong");
         printf("PASS: with MADEIRA_RDR2_VA_HOLD the census follows its geometry and names the hold\n");
         return 0;

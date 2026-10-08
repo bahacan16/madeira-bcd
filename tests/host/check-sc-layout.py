@@ -109,7 +109,7 @@ ex = ex[:ex.index('\n}\n')]
 exb = ex[ex.index('/* madeira-bcd: Social Club layout 2. SocialClubHelper.exe\'s V8 reserves'):]
 assert ex.index('if (process != NtCurrentProcess())') < ex.index('/* madeira-bcd: Social Club layout 2. SocialClubHelper.exe')
 assert 'int sc2 = is_jumbo && ios_sc_layout_mode == 2 && ios_sc_cef_enabled() && ios_sc_current_is_helper();' in exb
-assert 'if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2 && (ULONG_PTR)*ret < IOS_SC_ARENA_BASE)\n' \
+assert 'if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2 && (ULONG_PTR)*ret < ios_sc2_arena_lo)\n' \
        '                ios_sc2_note_commit( *ret, *size_ptr );' in exb
 order = [exb.index(x) for x in ('if (sc2 && ios_sc_grant_dead_n) ios_sc_reap_dead();',
                                 'if (sc2 && ios_sc2_ex_cage( *size_ptr, type, protect, limit_low, limit_high, align, attributes,\n'
@@ -183,7 +183,7 @@ typedef uintptr_t ULONG_PTR;
 #define STATUS_INVALID_PARAMETER 0xc000000d
 #define STATUS_NO_MEMORY 0xc0000017
 #define STATUS_CONFLICTING_ADDRESSES 0xc0000018
-''' + struct + defines('IOS_SC2_') + defines('IOS_SC_') + enum + cclass + '\nstatic uint64_t ios_sc2_floor = IOS_SC2_FLOOR;\n' + helpers + r'''
+''' + struct + defines('IOS_SC2_') + defines('IOS_SC_') + enum + cclass + '\nstatic uint64_t ios_sc2_floor = IOS_SC2_FLOOR, ios_sc2_arena_lo = IOS_SC_ARENA_BASE;\n' + helpers + r'''
 #define MB ((size_t)1 << 20)
 #define GB (1ull << 30)
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); exit(1); } while (0)

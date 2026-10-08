@@ -138,6 +138,8 @@ sc_decl = native[native.index('#define IOS_SC_GLUED_BASE'):]
 sc_decl = sc_decl[:sc_decl.index('static int ios_sc_brp_layout;')] + 'static int ios_sc_brp_layout;\n'
 sc_decl += ''.join(m.group(0) + '\n' for m in re.finditer(r'^#define IOS_SC2_\w+\s+\S+', native, re.M))
 sc_decl += 'enum { IOS_SC_K_V1 = 8 };\nstatic int ios_sc_layout_mode = -1, grants;\n'
+# madeira-bcd: the arena starts here (IOS_SC2_RDR2_ARENA_BASE with env MADEIRA_RDR2_VA_HOLD; not modelled)
+sc_decl += 'static uint64_t ios_sc2_arena_lo = IOS_SC_ARENA_BASE;\n'
 sc_decl += 'static void *ios_jit_current_peb( void ) { return (void *)1; }\n'
 sc_decl += 'static void ios_va_release_note( void ) {}\n'   # the placement proof's epoch (check-place-proof.py)
 sc_decl += ('static void ios_sc_grant_add( uint64_t v, uint64_t r, uint64_t real, uint64_t asked, int k, void *p ) '

@@ -75,7 +75,8 @@ OVERLAY = {
                 "note": "Default off; only with env.MADEIRA_SC_PA_POOLS = 2. 1: Social Club's layout 2 keeps libcef.dll's "
                         "PartitionAlloc pools at 256 MB and its metadata at 1 GB, chrome_elf.dll's metadata at 6.25 GB, "
                         "gives the rest of the app's 4 GB hold to Wine's furniture (3.75 GB more room for threads and "
-                        "allocations), and holds [0x75d0000000, 0x7800000000) from boot for one 8960 MB reserve, the one "
+                        "allocations), keeps Oilpan's cage at 1 GB so the FEX arena grows to 15 GB, and holds "
+                        "[0x75d0000000, 0x7800000000) from boot for one 8960 MB reserve, the one "
                         "Red Dead Redemption 2 makes as it starts. Set it only in that game's own file; GTA V keeps "
                         "layout 2 as it is. Read at session start."},
     "env.MADEIRA_SWAP_RESERVE_MAX_MB": {"category": "Memory & JIT pool", "title": "Swap tier: largest reservation backed (MB)",

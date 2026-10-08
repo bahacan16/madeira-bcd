@@ -15107,6 +15107,7 @@ static struct { uint64_t base, size; const char *what; } ios_sc2_slots[] =
 };
 static unsigned ios_sc2_held;      /* bit k: slot k held natively right now */
 static uint64_t ios_sc2_floor = IOS_SC2_FLOOR;   /* the furniture's floor: IOS_SC2_RDR2_FLOOR in that geometry */
+static uint64_t ios_sc2_arena_lo = IOS_SC_ARENA_BASE;   /* the FEX arena's start: IOS_SC2_RDR2_ARENA_BASE there */
 
 /* madeira-bcd (RDR2): layout 2 with room for RDR2.exe's start-up reserve.
  * Opt-in: env.MADEIRA_RDR2_VA_HOLD = 1, read only with layout 2; default off,
@@ -15142,14 +15143,21 @@ static uint64_t ios_sc2_floor = IOS_SC2_FLOOR;   /* the furniture's floor: IOS_S
  *   [0x7400000000, +6.25 GB)  chrome_elf.dll's metadata (libcef's BRP half starts here too)
  *   [0x7590000000, +1 GB)     libcef.dll's metadata
  *   [0x75d0000000, +8960 MB)  RDR2.exe's hold
- * The RW alias, chrome_elf.dll's pools, the V8 and Oilpan cages and the FEX
- * arena keep their places. */
+ * The same run's FEX arena was 76-84 % used (9.1-10.4 of 12 GB, ~35 MB per
+ * thread at 263 threads), the next wall once more threads fit, while
+ * Oilpan's 4 GB cage used 21-33 MB. So Oilpan keeps 1 GB and the arena
+ * starts right above it:
+ *   [0x7c00000000, +1 GB)     Oilpan's caged heap
+ *   [0x7c40000000, top)       FEX arena, 15 GB (IOS_SC2_RDR2_ARENA_BASE)
+ * The RW alias, chrome_elf.dll's pools and the V8 cage keep their places. */
 #define IOS_SC2_RDR2_HOLD_SIZE 0x230000000ULL   /* RDR2.exe's 8960 MB */
 #define IOS_SC2_RDR2_HOLD_BASE (IOS_SC2_E_BASE - IOS_SC2_RDR2_HOLD_SIZE)
 #define IOS_SC2_RDR2_L_REAL    0x10000000ULL    /* 256 MB of libcef.dll's pools */
 #define IOS_SC2_RDR2_FLOOR     (IOS_SC2_L_BASE + IOS_SC2_RDR2_L_REAL)   /* ios_usable_va_floor_get */
 #define IOS_SC2_RDR2_J2L_REAL  0x40000000ULL    /* 1 GB of libcef.dll's metadata */
 #define IOS_SC2_RDR2_J2L_BASE  (IOS_SC2_RDR2_HOLD_BASE - IOS_SC2_RDR2_J2L_REAL)
+#define IOS_SC2_RDR2_OILPAN_REAL 0x40000000ULL  /* 1 GB of Oilpan's caged heap */
+#define IOS_SC2_RDR2_ARENA_BASE (IOS_SC2_OILPAN_BASE + IOS_SC2_RDR2_OILPAN_REAL)
 
 static int ios_sc2_rdr2_hold_enabled(void)
 {
@@ -15169,7 +15177,9 @@ static void ios_sc2_rdr2_geometry(void)
     ios_sc2_slots[IOS_SC2_J2L].base = IOS_SC2_RDR2_J2L_BASE;
     ios_sc2_slots[IOS_SC2_J2L].size = IOS_SC2_RDR2_J2L_REAL;
     ios_sc2_slots[IOS_SC2_J2].size = IOS_SC2_RDR2_J2L_BASE - IOS_SC2_J2_BASE;
+    ios_sc2_slots[IOS_SC2_OILPAN].size = IOS_SC2_RDR2_OILPAN_REAL;
     ios_sc2_floor = IOS_SC2_RDR2_FLOOR;
+    ios_sc2_arena_lo = IOS_SC2_RDR2_ARENA_BASE;
     ios_sc2_rdr2 = 1;
 }
 
@@ -15293,7 +15303,7 @@ static int ios_band_pieces( struct ios_band_piece *p, int layout, int rdr2, uint
         }
         p[n].lo = IOS_SC2_CAGE_BASE;   p[n++].what = "V8 cage";
         p[n].lo = IOS_SC2_OILPAN_BASE; p[n++].what = "Oilpan's cage";
-        p[n].lo = IOS_SC_ARENA_BASE;   p[n++].what = "FEX arena";
+        p[n].lo = rdr2 ? IOS_SC2_RDR2_ARENA_BASE : IOS_SC_ARENA_BASE;   p[n++].what = "FEX arena";
     }
     else
     {
@@ -15587,11 +15597,12 @@ static void ios_sc2_boot_holds(void)
     }
     dprintf( 2, "[sc-cef] layout 2 with MADEIRA_RDR2_VA_HOLD: held libcef.dll's pools [0x%llx,+%llu MB) and its "
                 "PartitionAlloc metadata [0x%llx,+%llu MB), chrome_elf.dll's metadata [0x%llx,+%llu MB) and pools "
-                "[0x%llx,+4 GB), Oilpan [0x%llx,+4 GB); RW alias 0x%llx, V8 cage 0x%llx, furniture floor 0x%llx\n",
+                "[0x%llx,+4 GB), Oilpan [0x%llx,+%llu MB); RW alias 0x%llx, V8 cage 0x%llx, furniture floor 0x%llx\n",
              (unsigned long long)ios_sc2_slots[IOS_SC2_L].base, (unsigned long long)(ios_sc2_slots[IOS_SC2_L].size >> 20),
              (unsigned long long)ios_sc2_slots[IOS_SC2_J2L].base, (unsigned long long)(ios_sc2_slots[IOS_SC2_J2L].size >> 20),
              (unsigned long long)ios_sc2_slots[IOS_SC2_J2].base, (unsigned long long)(ios_sc2_slots[IOS_SC2_J2].size >> 20),
-             IOS_SC2_E_BASE, IOS_SC2_OILPAN_BASE, IOS_SC2_RW_ALIAS, IOS_SC2_CAGE_BASE, IOS_SC2_RDR2_FLOOR );
+             IOS_SC2_E_BASE, IOS_SC2_OILPAN_BASE, (unsigned long long)(ios_sc2_slots[IOS_SC2_OILPAN].size >> 20),
+             IOS_SC2_RW_ALIAS, IOS_SC2_CAGE_BASE, IOS_SC2_RDR2_FLOOR );
     /* The app held [0x7000000000, +4 GB) for libcef.dll's pools; the slot took
      * its first 256 MB. Give the rest to the furniture, but only while it is
      * still the app's untouched PROT_NONE hold. */
@@ -15716,7 +15727,8 @@ static void ios_sc_rehold( int kind )
 static int ios_sc_pa_hold_arena( mach_vm_address_t *addr, SIZE_T *size )
 {
     static int tried;
-    mach_vm_address_t h = IOS_SC_BRP_HOLD_BASE, a = IOS_SC_ARENA_BASE;
+    mach_vm_address_t h = IOS_SC_BRP_HOLD_BASE, a = ios_sc2_arena_lo;
+    mach_vm_size_t asz = 0x8000000000ULL - ios_sc2_arena_lo;   /* 12 GB; 15 GB with MADEIRA_RDR2_VA_HOLD */
     kern_return_t kr = KERN_SUCCESS;
     int mode = ios_sc_layout();
 
@@ -15727,7 +15739,7 @@ static int ios_sc_pa_hold_arena( mach_vm_address_t *addr, SIZE_T *size )
                           PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
     if (kr == KERN_SUCCESS)
     {
-        kr = mach_vm_map( mach_task_self(), &a, IOS_SC_ARENA_SIZE, 0xffff, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, 0,
+        kr = mach_vm_map( mach_task_self(), &a, asz, 0xffff, VM_FLAGS_FIXED, MEMORY_OBJECT_NULL, 0, 0,
                           PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY );
         if (kr != KERN_SUCCESS && mode == 1) mach_vm_deallocate( mach_task_self(), h, IOS_SC_BRP_HOLD_SIZE );
     }
@@ -15735,17 +15747,18 @@ static int ios_sc_pa_hold_arena( mach_vm_address_t *addr, SIZE_T *size )
     {
         dprintf( 2, "[sc-cef] env.MADEIRA_SC_PA_POOLS=%d: could not take [0x%llx,0x%llx) (kr=%d) -- the FEX arena "
                     "stays where it was and SocialClubHelper.exe's PartitionAlloc pools cannot be placed\n",
-                 mode, mode == 1 ? IOS_SC_BRP_HOLD_BASE : IOS_SC_ARENA_BASE, IOS_SC_ARENA_BASE + IOS_SC_ARENA_SIZE,
+                 mode, mode == 1 ? IOS_SC_BRP_HOLD_BASE : ios_sc2_arena_lo, ios_sc2_arena_lo + asz,
                  (int)kr );
         return 0;
     }
     ios_sc_brp_held = (mode == 1);
     ios_sc_brp_layout = 1;
     *addr = a;
-    *size = IOS_SC_ARENA_SIZE;
-    dprintf( 2, "[sc-cef] env.MADEIRA_SC_PA_POOLS=%d: FEX arena [0x%llx,0x%llx) (12 GB); [0x%llx,0x%llx) held for "
+    *size = asz;
+    dprintf( 2, "[sc-cef] env.MADEIRA_SC_PA_POOLS=%d: FEX arena [0x%llx,0x%llx) (%llu GB); [0x%llx,0x%llx) held for "
                 "SocialClubHelper.exe's %s\n", mode,
-             IOS_SC_ARENA_BASE, IOS_SC_ARENA_BASE + IOS_SC_ARENA_SIZE,
+             (unsigned long long)ios_sc2_arena_lo, (unsigned long long)(ios_sc2_arena_lo + asz),
+             (unsigned long long)(asz >> 30),
              IOS_SC_BRP_HOLD_BASE, IOS_SC_BRP_HOLD_BASE + IOS_SC_BRP_HOLD_SIZE,
              mode == 1 ? "PartitionAlloc pools" : "Oilpan cage" );
     return 1;
@@ -26788,7 +26801,7 @@ static int ios_sc2_commit_class( uint64_t a, uint64_t size, const struct ios_sc2
     }
     /* in no grant's real view: the furniture window and the FEX arena have
      * their own users; elsewhere, the reported-but-unreserved part of a grant */
-    if ((a >= ios_sc2_floor && a < IOS_SC2_J2_BASE) || a >= IOS_SC_ARENA_BASE) return IOS_SC2_C_OK;
+    if ((a >= ios_sc2_floor && a < IOS_SC2_J2_BASE) || a >= ios_sc2_arena_lo) return IOS_SC2_C_OK;
     for (i = 0; i < n; i++)
         if (g[i].view == g[i].report && a >= g[i].view + g[i].real && a < g[i].report + g[i].asked
             && (best < 0 || g[i].report > g[best].report)) best = i;
@@ -29180,7 +29193,7 @@ retry_code_carve_reuse:
             int sc2 = is_jumbo && ios_sc_layout_mode == 2 && ios_sc_cef_enabled() && ios_sc_current_is_helper();
             int caged = 0;
 
-            if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2 && (ULONG_PTR)*ret < IOS_SC_ARENA_BASE)
+            if ((type & MEM_COMMIT) && *ret && ios_sc_layout_mode == 2 && (ULONG_PTR)*ret < ios_sc2_arena_lo)
                 ios_sc2_note_commit( *ret, *size_ptr );
             if (sc2 && ios_sc_grant_dead_n) ios_sc_reap_dead();
             if (sc2 && ios_sc2_ex_cage( *size_ptr, type, protect, limit_low, limit_high, align, attributes,
