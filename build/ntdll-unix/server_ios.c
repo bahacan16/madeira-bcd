@@ -1759,7 +1759,7 @@ static void ios_bg_game_note( uint32_t pid, uint32_t wtid )
     }
     else if (!last || now - last >= IOS_BG_QOS_HOLD_NS)
         __atomic_store_n( &ios_bg_game_since_ns, now, __ATOMIC_RELAXED );   /* presents resumed */
-    __atomic_store_n( &ios_bg_game_seen_ns, now, __ATOMIC_RELAXED );
+    __atomic_store_n( &ios_bg_game_seen_ns, now, __ATOMIC_RELEASE );   /* publishes since and pid */
 }
 
 static void ios_bg_qos_init( void )
@@ -1817,7 +1817,7 @@ static int ios_bg_qos_listed_self( void )
 /* At each server call: move this thread between utility and user-interactive. */
 static inline void ios_bg_qos_check( void )
 {
-    uint64_t seen = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_RELAXED );
+    uint64_t seen = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_ACQUIRE );
     uintptr_t st;
     int want;
 
@@ -1831,9 +1831,11 @@ static inline void ios_bg_qos_check( void )
     }
     if (st == 1) return;
     {
+        /* both stamps before the clock: the sampler stores a stamp after reading its
+         * clock, so one we loaded can never be later than our own `now` */
+        uint64_t since = __atomic_load_n( &ios_bg_game_since_ns, __ATOMIC_RELAXED );
         uint64_t now = ios_bg_now_ns();
-        want = now - seen < IOS_BG_QOS_HOLD_NS &&
-               now - __atomic_load_n( &ios_bg_game_since_ns, __ATOMIC_RELAXED ) >= ios_bg_qos_delay_ns &&
+        want = now - seen < IOS_BG_QOS_HOLD_NS && now - since >= ios_bg_qos_delay_ns &&
                HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) != __atomic_load_n( &ios_bg_game_pid, __ATOMIC_RELAXED );
     }
     if (want == (st == 7)) return;
