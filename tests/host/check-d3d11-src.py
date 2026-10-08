@@ -74,13 +74,16 @@ wf = (root / ".github/workflows/build-ipa.yml").read_text()
 steps = re.findall(r"\n      - name: (.+)", wf)
 idx = {n: i for i, n in enumerate(steps)}
 b = next((i for i, n in enumerate(steps) if n.startswith("Build d3d11-src.dll")), None)
+# "Package unsigned IPA" until the paired apps (ca82558), "Package Madeira and Madeira2 unsigned IPAs" since
+package = next((i for i, n in enumerate(steps) if n.startswith("Package") and "unsigned IPA" in n), None)
 check("workflow has the d3d11-src.dll step", b is not None)
-if b is not None:
+check("workflow has the step that packages the unsigned IPA", package is not None)
+if b is not None and package is not None:
     first_dxmt_patch = min(i for i, n in enumerate(steps) if n.startswith("Patch DXMT") or n.startswith("Patch winemetal")
                            or n.startswith("Patch airconv"))
     check("it runs after llvm-mingw and before every DXMT patch step",
           idx["Install ninja/meson and fetch llvm-mingw"] < b < first_dxmt_patch)
-    check("it runs before the IPA is packaged", b < idx["Verify committed PE DLLs"] < idx["Package unsigned IPA"])
+    check("it runs before the IPA is packaged", b < idx["Verify committed PE DLLs"] < package)
     block = wf[wf.index("- name: " + steps[b]):]
     block = block[:block.index("\n      - name:", 10)]
     check("its failure does not fail the run", "continue-on-error: true" in block and "bash tools/build-d3d11-dll.sh" in block)

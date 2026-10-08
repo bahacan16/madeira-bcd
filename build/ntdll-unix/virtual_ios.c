@@ -6258,7 +6258,7 @@ int ios_patch_rtl_pc_to_file_header_current( const void *pe_addr )
  * ml283 [exec-req] probe in that wrapper -- taken for the first 64 requests per
  * ntdll copy that ask for an EXECUTE protection -- does its own syscall, log line
  * and notification and then `return st;` WITHOUT leave_syscall_callback(). In the
- * shipped binary (function at VA 0x1800570f4) its three exits, 0x1800573bc
+ * binary shipped until 7b56800 (function at VA 0x1800570f4) its three exits, 0x1800573bc
  * (cross-process), 0x1800573c8 (no NotifyMemoryProtect) and 0x1800573f8 (after the
  * notification), all branch to the epilogue at 0x180057514; only the non-exec
  * path passes 0x1800574d8 `ldr x8,[x18,#0x1788]; cbz x8; strb wzr,[x8,#1]`.
@@ -6292,7 +6292,13 @@ int ios_patch_rtl_pc_to_file_header_current( const void *pe_addr )
  * or `env.MADEIRA_EXECREQ_LEAVE = 1` in a game's settings), because it changes
  * what the emulator is told after every executable protect in every game: it is
  * the upstream behaviour, but notifications the leak used to drop will arrive
- * (docs/gta5-child-crash.md section 8). */
+ * (docs/gta5-child-crash.md section 8).
+ *
+ * Wine 38aa753f98b (ml1259) added the missing leave_syscall_callback() in source,
+ * and every ntdll.dll shipped since 7b56800 (2026-10-04) has it, so build 442 said
+ * "not found" for every ntdll copy. That layout (ios_execreq_fixed_sig) is now
+ * recognised: MADEIRA_EXECREQ_LEAVE=1 says once that there is nothing to patch
+ * and writes nothing. */
 #define IOS_EXECREQ_WORDS 17u
 static const uint32_t ios_execreq_sig[IOS_EXECREQ_WORDS] = {
     0x72001f3f, /* +0x00 tst  w25, #0xff                 is_current              */
@@ -6340,6 +6346,20 @@ static uint32_t ios_a64_bl_target( uint32_t pc, uint32_t insn )
 {
     int32_t imm = (int32_t)(insn << 6) >> 6;   /* sign-extended imm26 */
     return pc + (uint32_t)(imm * 4);
+}
+
+static uint32_t ios_a64_imm19_target( uint32_t pc, uint32_t insn )
+{
+    int32_t imm = (int32_t)(insn << 8) >> 13;   /* sign-extended imm19: b.cond, cbz, cbnz */
+    return pc + (uint32_t)(imm * 4);
+}
+
+static int ios_a64_is_branch( uint32_t insn )
+{
+    return (insn & 0x7c000000u) == 0x14000000u    /* b, bl */
+        || (insn & 0xff000010u) == 0x54000000u    /* b.cond */
+        || (insn & 0x7c000000u) == 0x34000000u    /* cbz, cbnz, tbz, tbnz */
+        || (insn & 0xfe000000u) == 0xd6000000u;   /* br, blr, ret */
 }
 
 static int ios_execreq_leave_wanted( void )
@@ -6392,9 +6412,65 @@ static int ios_execreq_layout_ok( const uint32_t *w, int check_x18 )
     return 1;
 }
 
-/* The probe's RVA in the image's executable sections, or 0 unless found exactly once. */
-static uint32_t ios_execreq_find( const unsigned char *img )
+/* The probe as wine 38aa753f98b builds it (VA 0x1800574d8 in 18c8f6d's ntdll.dll):
+ * every exit runs leave_syscall_callback() -- `ldr x8,[x18,#0x1788]; cbz/cbnz x8;
+ * strb wzr,[x8,#1]` -- before the epilogue. {word, mask}: what adrp and the
+ * add/ldr offsets address, and the branch offsets, move with every rebuild. */
+#define IOS_EXECREQ_FIXED_WORDS 19u
+static const uint32_t ios_execreq_fixed_sig[IOS_EXECREQ_FIXED_WORDS][2] = {
+    { 0x72001f3f, 0xffffffff }, /* +0x00 tst  w25, #0xff             is_current          */
+    { 0x54000000, 0xff00001f }, /* +0x04 b.eq -> cross-process block, then the clear     */
+    { 0x90000008, 0x9f00001f }, /* +0x08 adrp x8, (pNotifyMemoryProtect)                 */
+    { 0xf940010b, 0xffc003ff }, /* +0x0c ldr  x11, [x8, #...]                            */
+    { 0xb400000b, 0xff00001f }, /* +0x10 cbz  x11 -> the clear                           */
+    { 0xf94002c1, 0xffffffff }, /* +0x14 ldr  x1, [x22]               *size_ptr          */
+    { 0xf9400280, 0xffffffff }, /* +0x18 ldr  x0, [x20]               *addr_ptr          */
+    { 0x90000008, 0x9f00001f }, /* +0x1c adrp x8, (icall checker)                        */
+    { 0xf9400108, 0xffc003ff }, /* +0x20 ldr  x8, [x8, #...]                             */
+    { 0x9000000a, 0x9f00001f }, /* +0x24 adrp x10, ...                                   */
+    { 0x9100014a, 0xffc003ff }, /* +0x28 add  x10, x10, #...                             */
+    { 0xd63f0100, 0xffffffff }, /* +0x2c blr  x8                                         */
+    { 0x2a1303e2, 0xffffffff }, /* +0x30 mov  w2, w19                 new_prot           */
+    { 0x52800023, 0xffffffff }, /* +0x34 mov  w3, #1                  After              */
+    { 0x2a1a03e4, 0xffffffff }, /* +0x38 mov  w4, w26                 status             */
+    { 0xd63f0160, 0xffffffff }, /* +0x3c blr  x11                     NotifyMemoryProtect */
+    { 0xf94bc648, 0xffffffff }, /* +0x40 ldr  x8, [x18, #0x1788]      leave_syscall_callback() */
+    { 0xb5000008, 0xff00001f }, /* +0x44 cbnz x8 -> the clear's strb                     */
+    { 0x14000000, 0xfc000000 }, /* +0x48 b    -> epilogue                                */
+};
+
+/* Is `w` (the image at a `tst w25, #0xff`, `room` bytes before the section ends)
+ * the fixed probe? Checks that each exit reaches the clear: the cross-process
+ * block runs straight into it, the no-NotifyMemoryProtect exit branches to it,
+ * the notified exit has its own copy, and the clear falls into the epilogue. */
+static int ios_execreq_fixed_ok( const uint32_t *w, uint32_t room )
 {
+    uint32_t i, xp, clr, epi;
+
+    for (i = 0; i < IOS_EXECREQ_FIXED_WORDS; i++)
+        if ((w[i] & ios_execreq_fixed_sig[i][1]) != ios_execreq_fixed_sig[i][0]) return 0;
+    xp = ios_a64_imm19_target( 0x04, w[1] );
+    clr = ios_a64_imm19_target( 0x10, w[4] );
+    epi = clr + 12;
+    if (clr < (IOS_EXECREQ_FIXED_WORDS + 11) * 4 || clr >= room || room - clr < 12 + 7 * 4) return 0;
+    if (w[clr / 4] != 0xf94bc648 /* ldr x8, [x18, #0x1788] */ ||
+        w[clr / 4 + 1] != ios_a64_cbz64( clr + 4, epi, 8 ) ||
+        w[clr / 4 + 2] != 0x3900051f /* strb wzr, [x8, #1]: InSyscallCallback = 0 */) return 0;
+    if (w[epi / 4] != 0x2a1a03e0 /* mov w0, w26 */ || w[epi / 4 + 6] != 0xd65f03c0 /* ret */) return 0;
+    if (ios_a64_imm19_target( 0x44, w[17] ) != clr + 8 || w[18] != ios_a64_b( 0x48, epi )) return 0;
+    /* ten straight-line instructions and the BL to send_cross_process_notification */
+    if (xp + 11 * 4 != clr || w[xp / 4] != 0xf94002c3 /* ldr x3,[x22] */ ||
+        w[xp / 4 + 7] != 0xb90013fa /* str w26,[sp,#0x10] */) return 0;
+    for (i = 0; i < 10; i++) if (ios_a64_is_branch( w[xp / 4 + i] )) return 0;
+    return (w[xp / 4 + 10] & 0xfc000000u) == 0x94000000u;
+}
+
+/* The probe's RVA in the image's executable sections, or 0 unless found exactly
+ * once: with the layout the patch was written against, or (fixed) as wine
+ * 38aa753f98b builds it. */
+static uint32_t ios_execreq_find( const unsigned char *img, int fixed )
+{
+    const uint32_t need = fixed ? IOS_EXECREQ_FIXED_WORDS * 4 : IOS_EXECREQ_EPILOGUE + 7 * 4;
     uint32_t e_lfanew, size_of_image, nsec, optsz, i, found = 0, hits = 0;
     const unsigned char *sh;
 
@@ -6411,11 +6487,14 @@ static uint32_t ios_execreq_find( const unsigned char *img )
         memcpy( &vs, sh + 40 * i + 8, 4 ); memcpy( &va, sh + 40 * i + 12, 4 ); memcpy( &ch, sh + 40 * i + 36, 4 );
         if (!(ch & 0x20000000u /* IMAGE_SCN_MEM_EXECUTE */) || va >= size_of_image) continue;
         if (vs > size_of_image - va) vs = size_of_image - va;
-        for (off = (va + 3) & ~3u; off + IOS_EXECREQ_EPILOGUE + 7 * 4 <= va + vs; off += 4)
+        for (off = (va + 3) & ~3u; off + need <= va + vs; off += 4)
         {
-            if (*(const uint32_t *)(img + off) != ios_execreq_sig[0]) continue;
-            if (memcmp( img + off, ios_execreq_sig, sizeof(ios_execreq_sig) )) continue;
-            if (!ios_execreq_layout_ok( (const uint32_t *)(img + off), 1 )) continue;
+            const uint32_t *w = (const uint32_t *)(img + off);
+
+            if (w[0] != ios_execreq_sig[0]) continue;   /* tst w25, #0xff in both layouts */
+            if (fixed ? !ios_execreq_fixed_ok( w, va + vs - off )
+                      : (memcmp( w, ios_execreq_sig, sizeof(ios_execreq_sig) ) || !ios_execreq_layout_ok( w, 1 )))
+                continue;
             found = off;
             hits++;
         }
@@ -6425,11 +6504,11 @@ static uint32_t ios_execreq_find( const unsigned char *img )
 
 /* Patch the copy of `module` (the PE ntdll) that the CURRENT process runs:
  * ios_jit_translate_addr is owner-aware, so on a pseudo-process child's boot
- * thread this is the child's private copy. 1 patched, 0 already patched or not
- * wanted, -1 refused (logged). */
+ * thread this is the child's private copy. 1 patched, 0 already patched, not
+ * wanted or not needed (the fixed probe), -1 refused (logged). */
 int ios_patch_execreq_leave( void *module )
 {
-    static int said_off;
+    static int said_off, said_fixed;
     const unsigned char *img = module;
     uintptr_t rx_lo = (uintptr_t)ios_jit_rx_base_global;
     uint32_t rva, want[3], i;
@@ -6444,8 +6523,15 @@ int ios_patch_execreq_leave( void *module )
         return 0;
     }
     if (!module || !rx_lo || !ios_jit_rw_base_global) return -1;
-    if (!(rva = ios_execreq_find( img )))
+    if (!(rva = ios_execreq_find( img, 0 )))
     {
+        if ((rva = ios_execreq_find( img, 1 )))
+        {
+            if (!said_fixed++)
+                dprintf( 2, "[execreq-leave] ntdll %p: NtProtectVirtualMemory's [exec-req] path already leaves the "
+                            "syscall callback (rva %#x, wine 38aa753f98b) -- nothing to patch\n", module, rva );
+            return 0;
+        }
         dprintf( 2, "[execreq-leave] ntdll %p: the [exec-req] probe was not found exactly once with the "
                     "expected layout -- not patched (a different ntdll.dll build?)\n", module );
         return -1;
