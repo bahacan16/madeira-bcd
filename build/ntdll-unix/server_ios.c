@@ -1705,6 +1705,132 @@ static void ios_xp_api_report( const char *wall, double wall_s )
     }
 }
 
+/* madeira-bcd: [bg-qos] the launcher's processes leave the performance cores
+ * while the game presents. Every Wine thread runs at USER_INTERACTIVE
+ * (start_thread), so in build 442's GTA V gameplay SocialClubHelper.exe,
+ * dockhost.exe, RockstarService.exe and Launcher.exe took ~55 ms of P-core time
+ * per 320 ms [xp-t] sample next to the game's ~223, while the efficiency cores
+ * were ~86 % idle and ~2.7 threads waited for a core ([xp] run=). The [xp]
+ * sampler marks the game as presenting whenever its presenting thread (role P)
+ * ran in a sample; the threads of the processes named in MADEIRA_BG_QOS_PROCS
+ * then drop to QOS_CLASS_UTILITY at their next server call, and return to
+ * USER_INTERACTIVE once the game has not presented for IOS_BG_QOS_HOLD_NS.
+ * Never the game's own process. Default list below; an empty value turns it
+ * off. Needs the [xp] sampler (MADEIRA_PROBES not 0). */
+#include <pthread/qos.h>
+#define IOS_BG_QOS_HOLD_NS (2000ull * 1000 * 1000)
+static volatile uint64_t ios_bg_game_seen_ns;   /* 0: no game has presented */
+static volatile uint32_t ios_bg_game_pid;
+static unsigned long ios_bg_qos_moves;
+
+static uint64_t ios_bg_now_ns( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static char ios_bg_qos_names[512];   /* lower-case, ';'-separated */
+static pthread_key_t ios_bg_qos_key;     /* per thread: 0 unknown, 1 not listed, 3 listed, 7 listed and demoted */
+static int ios_bg_qos_key_ok;
+static pthread_once_t ios_bg_qos_once = PTHREAD_ONCE_INIT;
+static void ios_bg_qos_init( void );
+
+/* the [xp] sampler saw the game's presenting thread run */
+static void ios_bg_game_note( uint32_t pid, uint32_t wtid )
+{
+    if (!pid) return;
+    if (__atomic_exchange_n( &ios_bg_game_pid, pid, __ATOMIC_RELAXED ) != pid)
+    {
+        pthread_once( &ios_bg_qos_once, ios_bg_qos_init );
+        wine_log_write( "[bg-qos] the game is process %04x (presenting thread %04x); %s run at utility QoS while "
+                        "it presents (MADEIRA_BG_QOS_PROCS)", (unsigned)pid, (unsigned)wtid,
+                        ios_bg_qos_key_ok ? ios_bg_qos_names : "nothing (off)" );
+    }
+    __atomic_store_n( &ios_bg_game_seen_ns, ios_bg_now_ns(), __ATOMIC_RELAXED );
+}
+
+static void ios_bg_qos_init( void )
+{
+    /* ';'-separated exe names demoted to utility QoS while the game presents; empty = off */
+    const char *e = getenv( "MADEIRA_BG_QOS_PROCS" );
+    size_t i;
+
+    if (!e) e = "SocialClubHelper.exe;Launcher.exe;RockstarService.exe;dockhost.exe";
+    for (i = 0; e[i] && i < sizeof(ios_bg_qos_names) - 1; i++)
+        ios_bg_qos_names[i] = (e[i] >= 'A' && e[i] <= 'Z') ? e[i] + 32 : e[i];
+    ios_bg_qos_names[i] = 0;
+    /* a TSD slot, not __thread: its first use allocates nothing */
+    ios_bg_qos_key_ok = ios_bg_qos_names[0] && !pthread_key_create( &ios_bg_qos_key, NULL );
+}
+
+/* Is the calling thread's process on the list? (its PEB's image name) */
+static int ios_bg_qos_listed_self( void )
+{
+    TEB *teb = NtCurrentTeb();
+    RTL_USER_PROCESS_PARAMETERS *pp = teb && teb->Peb ? teb->Peb->ProcessParameters : NULL;
+    const WCHAR *path;
+    const char *n;
+    size_t len, base = 0, k;
+
+    if (!pp || !(path = pp->ImagePathName.Buffer)) return 0;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    for (n = ios_bg_qos_names; *n; )
+    {
+        size_t m = 0;
+        while (n[m] && n[m] != ';') m++;
+        if (m && m == len - base)
+        {
+            for (k = 0; k < m; k++)
+            {
+                WCHAR c = path[base + k];
+                if (c >= 'A' && c <= 'Z') c += 32;
+                if (c != (WCHAR)(unsigned char)n[k]) break;
+            }
+            if (k == m) return 1;
+        }
+        n += m;
+        if (*n == ';') n++;
+    }
+    return 0;
+}
+
+/* At each server call: move this thread between utility and user-interactive. */
+static inline void ios_bg_qos_check( void )
+{
+    uint64_t seen = __atomic_load_n( &ios_bg_game_seen_ns, __ATOMIC_RELAXED );
+    uintptr_t st;
+    int want;
+
+    if (!seen) return;   /* no game has presented yet, so nothing was ever demoted */
+    pthread_once( &ios_bg_qos_once, ios_bg_qos_init );
+    if (!ios_bg_qos_key_ok) return;
+    if (!(st = (uintptr_t)pthread_getspecific( ios_bg_qos_key )))
+    {
+        st = ios_bg_qos_listed_self() ? 3 : 1;
+        pthread_setspecific( ios_bg_qos_key, (void *)st );
+    }
+    if (st == 1) return;
+    want = ios_bg_now_ns() - seen < IOS_BG_QOS_HOLD_NS &&
+           HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) != __atomic_load_n( &ios_bg_game_pid, __ATOMIC_RELAXED );
+    if (want == (st == 7)) return;
+    if (pthread_set_qos_class_self_np( want ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0 ))
+    {
+        pthread_setspecific( ios_bg_qos_key, (void *)(uintptr_t)1 );   /* refused (fixed priority): leave it */
+        return;
+    }
+    pthread_setspecific( ios_bg_qos_key, (void *)(uintptr_t)(want ? 7 : 3) );
+    {
+        unsigned long n = __atomic_add_fetch( &ios_bg_qos_moves, 1, __ATOMIC_RELAXED );
+        if (n <= 24 || !(n % 256))
+            wine_log_write( "[bg-qos] #%lu process %04x thread %04x -> %s", n,
+                            (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ),
+                            (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ),
+                            want ? "utility (the game presents)" : "user-interactive (the game stopped presenting)" );
+    }
+}
+
 /* madeira-bcd: [xp-t] shows a native thread (no TEB) as m<thread id> only,
  * and in build 442 two of them were 30-50 ms a sample with nothing to say what
  * they were. Name each once, the first time it is busy enough to be listed. */
@@ -1790,6 +1916,12 @@ static void ios_xprobe_main( void )
                                 r->minst = (double)((cur[0].instr - pv->c[0].instr) + (cur[1].instr - pv->c[1].instr)) / 1e6;
                                 r->role = NULL;
                                 for (i = 0; i < ios_xp_nroles; i++) if (ios_xp_roles[i].tid == idi.thread_id) { r->role = ios_xp_roles[i].role; break; }
+                                if (r->role && strchr( r->role, 'P' ) && teb && pt + et >= 1.0)
+                                {
+                                    uint32_t gp = 0;
+                                    ios_ts_read( teb + 0x40, &gp, 4 );   /* ClientId.UniqueProcess */
+                                    ios_bg_game_note( gp, w );
+                                }
                                 if (r->role && teb && (strchr( r->role, 'P' ) || strchr( r->role, 'E' ))) ios_xp_game_teb = teb;   /* ml1131 */
                                 if (teb && !ios_xp_nroles) ios_xp_fallback_add( teb, pt + et );   /* ml1131c */
                                 sum_thr_ms += pt + et; nrows++;
@@ -2237,6 +2369,7 @@ unsigned int server_call_unlocked( void *req_ptr )
 #ifdef WINE_IOS
     /* killed inside a section (ios_defer_section_abort): no more requests */
     if (ios_section_state() & IOS_SECTION_ABORT) return STATUS_THREAD_IS_TERMINATING;
+    ios_bg_qos_check();   /* madeira-bcd: [bg-qos] */
 #endif
     if ((ret = send_request( req ))) return ret;
     /* iOS-Madeira 2026-07-05: kick the in-process server loop out of its
