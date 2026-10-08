@@ -10,12 +10,14 @@ against a fake Mach map that starts with the app's PROT_NONE hold over
 [0x7000000000, +4 GB), and checks:
   - without the env layout 2 holds exactly what it held before, prints the
     same line, and no holdback exists;
-  - with it: libcef.dll's pools [0x7000000000, +2 GB) and their metadata
-    [0x7080000000, +2 GB), both taken over from the app's hold;
-    chrome_elf.dll's metadata [0x7400000000, +7424 MB); chrome_elf.dll's
-    pools and Oilpan where they were; [0x75d0000000, 0x7800000000) held and
-    registered as the jumbo holdback, which an 8960 MB request gets once and
-    a smaller one (Social Club's hinted 1 GB) never;
+  - with it: libcef.dll's pools [0x7000000000, +256 MB) taken over from the
+    app's hold and the rest of that hold released to the furniture (floor
+    0x7010000000); chrome_elf.dll's metadata [0x7400000000, +6400 MB),
+    libcef.dll's metadata [0x7590000000, +1 GB); chrome_elf.dll's pools and
+    Oilpan where they were; [0x75d0000000, 0x7800000000) held and registered
+    as the jumbo holdback, which an 8960 MB request gets once and a smaller
+    one (Social Club's hinted 1 GB) never;
+  - a mapping that is not the app's hold stays where it is (no release);
   - a jumbo-mb in madeira.cfg does not replace that hold;
   - a mapping in the way leaves no holdback and says so, the slots stay held;
   - a slot released and held again goes back to the same place;
@@ -141,6 +143,7 @@ static void *anon_mmap_tryfixed(void *start, size_t size, int prot, int flags)
 static int cfg_jumbo_mb;
 static int madeira_cfg_int(const char *key, int def) { return !strcmp(key, "jumbo-mb") ? cfg_jumbo_mb : def; }
 static int ios_sc_layout_mode = 2;
+static int ios_sc2_rdr2;
 static int ios_sc_layout(void) { return ios_sc_layout_mode; }
 static char out[1 << 16]; static size_t outn;
 static int fake_dprintf(int fd, const char *fmt, ...)
@@ -213,32 +216,40 @@ int main(int argc, char **argv)
     {
         ios_sc2_boot_holds();
         if (ios_sc2_held != ALL_HELD || !ios_sc2_rdr2) return fail("the variant did not hold every slot");
-        if (ios_sc2_slots[IOS_SC2_L].base != 0x7000000000ull || ios_sc2_slots[IOS_SC2_L].size != GB(2) ||
-            ios_sc2_slots[IOS_SC2_J2L].base != 0x7080000000ull || ios_sc2_slots[IOS_SC2_J2L].size != GB(2) ||
-            ios_sc2_slots[IOS_SC2_J2].base != 0x7400000000ull || ios_sc2_slots[IOS_SC2_J2].size != 0x1d0000000ull ||
+        if (ios_sc2_slots[IOS_SC2_L].base != 0x7000000000ull || ios_sc2_slots[IOS_SC2_L].size != (256ull << 20) ||
+            ios_sc2_slots[IOS_SC2_J2L].base != 0x7590000000ull || ios_sc2_slots[IOS_SC2_J2L].size != GB(1) ||
+            ios_sc2_slots[IOS_SC2_J2].base != 0x7400000000ull || ios_sc2_slots[IOS_SC2_J2].size != 0x190000000ull ||
             ios_sc2_slots[IOS_SC2_E].base != 0x7800000000ull || ios_sc2_slots[IOS_SC2_E].size != GB(4) ||
             ios_sc2_slots[IOS_SC2_OILPAN].base != 0x7c00000000ull || ios_sc2_slots[IOS_SC2_OILPAN].size != GB(4))
             return fail("the variant geometry is wrong");
-        if (!region(0x7400000000ull, 0x75d0000000ull) || !region(0x75d0000000ull, 0x7800000000ull))
-            return fail("chrome_elf.dll's metadata or the RDR2 hold is not where it belongs");
+        if (!region(0x7400000000ull, 0x7590000000ull) || !region(0x7590000000ull, 0x75d0000000ull) ||
+            !region(0x75d0000000ull, 0x7800000000ull))
+            return fail("a metadata slot or the RDR2 hold is not where it belongs");
+        if (!region(0x7000000000ull, 0x7010000000ull) || covered(0x7010000000ull, 0x7010001000ull) ||
+            covered(0x70fffff000ull, 0x7100000000ull) || ios_sc2_floor != 0x7010000000ull)
+            return fail("the app's hold was not cut down to libcef.dll's 256 MB, or the floor did not move");
+        if (!has("[sc-cef] MADEIRA_RDR2_VA_HOLD: [0x7010000000,0x7100000000) released from the app's hold; "
+                 "the furniture starts at 0x7010000000 (3840 MB more)"))
+            return fail("no release line");
         if (ios_jumbo_hold_base != 0x75d0000000ull || ios_jumbo_hold_size != 0x230000000ull || ios_jumbo_hold_keep)
             return fail("the RDR2 hold is not the jumbo holdback");
-        if (!has("[sc-cef] layout 2 with MADEIRA_RDR2_VA_HOLD: held libcef.dll's pools [0x7000000000,+2048 MB) and its "
-                 "PartitionAlloc metadata [0x7080000000,+2048 MB), chrome_elf.dll's metadata [0x7400000000,+7424 MB)"))
+        if (!has("[sc-cef] layout 2 with MADEIRA_RDR2_VA_HOLD: held libcef.dll's pools [0x7000000000,+256 MB) and its "
+                 "PartitionAlloc metadata [0x7590000000,+1024 MB), chrome_elf.dll's metadata [0x7400000000,+6400 MB)"))
             return fail("no variant line");
         if (!has("[sc-cef] MADEIRA_RDR2_VA_HOLD: [0x75d0000000,0x7800000000) held for one 8960 MB reserve"))
             return fail("no hold line");
         if (has("[sc-cef] layout 2: held libcef.dll's pools [0x7000000000,+4 GB)")) return fail("the layout 2 line is misleading here");
-        /* the slots are released for their grants: libcef's pools and metadata leave the app's hold */
+        /* the slots are released for their grants and held again when a dead helper's grant goes */
         ios_sc2_unhold(IOS_SC2_L);
         ios_sc2_unhold(IOS_SC2_J2L);
-        if (covered(0x7000000000ull, 0x7000001000ull) || covered(0x7080000000ull, 0x7080001000ull))
+        if (covered(0x7000000000ull, 0x7000001000ull) || covered(0x7590000000ull, 0x7590001000ull))
             return fail("released slots are still mapped");
-        if (!ios_sc2_hold(IOS_SC2_J2L) || !region(0x7080000000ull, 0x7100000000ull)) return fail("a re-hold went elsewhere");
+        if (!ios_sc2_hold(IOS_SC2_J2L) || !region(0x7590000000ull, 0x75d0000000ull)) return fail("a re-hold went elsewhere");
+        if (!ios_sc2_hold(IOS_SC2_L) || !region(0x7000000000ull, 0x7010000000ull)) return fail("libcef's re-hold went elsewhere");
         if (ios_jumbo_holdback_take(0x40000000) || ios_jumbo_hold_size != 0x230000000ull)
             return fail("a 1 GB request (Social Club's hinted one) got the hold");
-        printf("PASS: with MADEIRA_RDR2_VA_HOLD: libcef 2+2 GB in the app's hold, chrome_elf metadata 7424 MB, "
-               "[0x75d0000000,0x7800000000) held as the jumbo holdback\n");
+        printf("PASS: with MADEIRA_RDR2_VA_HOLD: libcef's pools 256 MB, furniture from 0x7010000000, chrome_elf metadata "
+               "6400 MB, libcef metadata 1 GB, [0x75d0000000,0x7800000000) held as the jumbo holdback\n");
         return 0;
     }
     if (!strcmp(s, "take"))
@@ -283,9 +294,22 @@ int main(int argc, char **argv)
     {
         map_remove(0x7000000000ull, 0x7100000000ull);
         ios_sc2_boot_holds();
-        if (ios_sc2_held != ALL_HELD || !region(0x7000000000ull, 0x7080000000ull) || !region(0x7080000000ull, 0x7100000000ull))
-            return fail("without the app's hold the libcef slots are not mapped fresh");
-        printf("PASS: without the app's hold libcef.dll's slots are mapped fresh\n");
+        if (ios_sc2_held != ALL_HELD || !region(0x7000000000ull, 0x7010000000ull) || covered(0x7010000000ull, 0x7010001000ull))
+            return fail("without the app's hold libcef.dll's pools are not mapped fresh");
+        if (!has("[0x7010000000,0x7100000000) was free; the furniture starts at 0x7010000000")) return fail("no was-free line");
+        printf("PASS: without the app's hold libcef.dll's pools are mapped fresh and the furniture range was free\n");
+        return 0;
+    }
+    if (!strcmp(s, "foreign"))
+    {
+        /* something other than the app's PROT_NONE hold sits in the range the furniture would get */
+        map_remove(0x7000000000ull, 0x7100000000ull);
+        map_add(0x7000000000ull, 0x7010000000ull, 0);
+        map_add(0x7050000000ull, 0x7050004000ull, 3);
+        ios_sc2_boot_holds();
+        if (!region(0x7050000000ull, 0x7050004000ull)) return fail("a foreign mapping was removed");
+        if (!has("[0x7010000000,0x7100000000) is partly mapped by something else")) return fail("no partly-mapped line");
+        printf("PASS: a mapping that is not the app's hold stays where it is\n");
         return 0;
     }
     if (!strcmp(s, "layout1"))
@@ -311,7 +335,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-rdr2-va-hold-') as directory:
                             '-Wno-unused-but-set-variable', '-fsanitize=address,undefined', '-o', str(exe), str(c)],
                            capture_output=True, text=True)
     assert build.returncode == 0, build.stdout + build.stderr
-    for scenario in ('off', 'on', 'take', 'jumbo-mb', 'blocked', 'noapp', 'layout1'):
+    for scenario in ('off', 'on', 'take', 'jumbo-mb', 'blocked', 'noapp', 'foreign', 'layout1'):
         env = {k: v for k, v in os.environ.items() if not k.startswith('MADEIRA_')}
         if scenario != 'off':
             env['MADEIRA_RDR2_VA_HOLD'] = '1'

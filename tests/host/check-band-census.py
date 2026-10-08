@@ -241,15 +241,16 @@ int main(int argc, char **argv)
     }
     if (!strcmp(s, "rdr2"))
     {
-        /* MADEIRA_RDR2_VA_HOLD: libcef 2 + 2 GB, chrome_elf metadata 7424 MB, the hold below chrome_elf's pools */
+        /* MADEIRA_RDR2_VA_HOLD: libcef's pools 256 MB, furniture from 0x7010000000, chrome_elf metadata
+         * 6.25 GB, libcef metadata 1 GB, the hold below chrome_elf's pools */
         ios_sc2_rdr2 = 1;
         ios_band_census("periodic");
         if (!has("layout 2 with MADEIRA_RDR2_VA_HOLD, [0x7000000000,0x8000000000)")) return fail("the header does not name the variant");
         if (count("[band]   [") != 11) return fail("the variant does not have eleven pieces");
-        if (!has("[band]   [0x7000000000,0x7080000000) libcef.dll's pools:") ||
-            !has("[band]   [0x7080000000,0x7100000000) libcef.dll's metadata:") ||
-            !has("[band]   [0x7100000000,0x7400000000) furniture:") ||
-            !has("[band]   [0x7400000000,0x75d0000000) chrome_elf.dll's metadata:") ||
+        if (!has("[band]   [0x7000000000,0x7010000000) libcef.dll's pools:") ||
+            !has("[band]   [0x7010000000,0x7400000000) furniture:") ||
+            !has("[band]   [0x7400000000,0x7590000000) chrome_elf.dll's metadata:") ||
+            !has("[band]   [0x7590000000,0x75d0000000) libcef.dll's metadata:") ||
             !has("[band]   [0x75d0000000,0x7800000000) RDR2 hold:") ||
             !has("[band]   [0x7800000000,0x7900000000) chrome_elf.dll's pools:"))
             return fail("the variant's pieces are wrong");

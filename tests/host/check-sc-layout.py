@@ -183,7 +183,7 @@ typedef uintptr_t ULONG_PTR;
 #define STATUS_INVALID_PARAMETER 0xc000000d
 #define STATUS_NO_MEMORY 0xc0000017
 #define STATUS_CONFLICTING_ADDRESSES 0xc0000018
-''' + struct + defines('IOS_SC2_') + defines('IOS_SC_') + enum + cclass + helpers + r'''
+''' + struct + defines('IOS_SC2_') + defines('IOS_SC_') + enum + cclass + '\nstatic uint64_t ios_sc2_floor = IOS_SC2_FLOOR;\n' + helpers + r'''
 #define MB ((size_t)1 << 20)
 #define GB (1ull << 30)
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); exit(1); } while (0)
