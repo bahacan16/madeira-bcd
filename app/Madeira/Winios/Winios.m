@@ -206,6 +206,66 @@ static void winios_bg_observe(void) {
                     wfz_bg_exit = winios_now_mono(); wfz_bg_now = 0; }];
 }
 
+/* madeira-bcd: [main-stall] IS THE iOS MAIN THREAD RUNNING? winemetal applies a
+ * Metal layer's drawable size and format in a block it runs on the main thread
+ * and waits for (execute_on_main: dispatch_sync), and a desktop session's
+ * swapchain gets its window layer the same way (winios_metal_layer_for_hwnd).
+ * So a swapchain creation or ResizeBuffers cannot return while the main thread
+ * is blocked -- one candidate for Red Dead Redemption 2 hanging when its Screen
+ * Type is switched to Windowed Borderless (owner, 2026-10-08). The freeze
+ * watcher keeps one no-op block queued on the main queue and reports when it
+ * has waited 2 s (then 5, 10, 20 ... s), dumps every thread's stack once per
+ * stall at 5 s (4 dumps per run at most), and says when the main thread ran
+ * again. Not while the app is in the background, and a watcher that was itself
+ * stopped (a task suspension, see GAP) starts the wait over. Logging only. */
+extern void ios_dump_all_thread_stacks(void);
+static _Atomic double wms_queued;        /* mono time the pending heartbeat was queued; 0 = none pending */
+static _Atomic int wms_reported;         /* this stall was reported: the main block says when it ran */
+static double wms_next_report;           /* watcher thread only, from here down */
+static double wms_last_queue;            /* when the last heartbeat was queued: one a second */
+static int wms_dumped;                   /* this stall's stacks were dumped */
+static unsigned wms_stalls, wms_dumps;
+
+static void winios_main_heartbeat(double now, double slept, double t0) {
+    double queued = atomic_load(&wms_queued), waited;
+    if (queued == 0.0) {
+        if (now - wms_last_queue < 1.0) return;
+        wms_last_queue = now;
+        atomic_store(&wms_queued, now);
+        wms_next_report = 2.0;
+        wms_dumped = 0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            double q = atomic_load(&wms_queued);
+            if (atomic_exchange(&wms_reported, 0) && q > 0.0)
+                dprintf(STDERR_FILENO, "[main-stall] the iOS main thread ran again after %.1f s\n",
+                        winios_now_mono() - q);
+            atomic_store(&wms_queued, 0.0);
+        });
+        return;
+    }
+    if (wfz_bg_now || slept > 1.0) {   /* backgrounded, or this watcher was stopped too: start over */
+        atomic_store(&wms_queued, now);
+        wms_next_report = 2.0;
+        return;
+    }
+    waited = now - queued;
+    if (waited < wms_next_report) return;
+    if (!atomic_exchange(&wms_reported, 1)) wms_stalls++;
+    if (wms_stalls <= 32)
+        dprintf(STDERR_FILENO, "[main-stall] #%u the iOS main thread has not run a queued block for %.1f s "
+                "(queued at t+%.1fs); a dispatch_sync to it (Metal layer setup, desktop window layer) waits as long\n",
+                wms_stalls, waited, queued - t0);
+    if (waited >= 5.0 && !wms_dumped && wms_dumps < 4) {
+        wms_dumped = 1;
+        wms_dumps++;
+        dprintf(STDERR_FILENO, "[main-stall] #%u every thread's stack (dump %u of at most 4 per run):\n",
+                wms_stalls, wms_dumps);
+        /* off this thread: a long dump here would read as a GAP of the watcher */
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ ios_dump_all_thread_stacks(); });
+    }
+    wms_next_report = wms_next_report < 5.0 ? 5.0 : wms_next_report * 2.0;
+}
+
 static void *winios_freeze_watch(void *arg) {
     const double SLEEP_S = 0.25;
     const double GAP_S   = 2.0;    /* well above any scheduling delay */
@@ -234,6 +294,8 @@ static void *winios_freeze_watch(void *arg) {
 
         double slept = now - last;
         double wall  = (double)(w1.tv_sec - w0.tv_sec) + (double)(w1.tv_usec - w0.tv_usec) / 1e6;
+
+        winios_main_heartbeat(now, slept, t0);   /* madeira-bcd: [main-stall] */
 
         {   /* ml522: report transitions immediately, with t+ so they can be
              * placed exactly against the gap boundaries. Which SIDE of a gap
@@ -366,6 +428,76 @@ BOOL winios_pCreateWindow(HWND hwnd) {
      * per HWND yet. */
     WLOG("pCreateWindow hwnd=%p", hwnd);
     return TRUE;
+}
+
+/* ============================================================ *
+ * [swap-win] windows a swapchain presents into
+ * ============================================================
+ *
+ * madeira-bcd: Red Dead Redemption 2 hangs when its Screen Type is switched
+ * to Windowed Borderless (owner, 2026-10-08). The switch restyles, moves and
+ * re-shows the window its swapchain presents into, and nothing in the log said
+ * what happened to that window. IOSDisplayShim reports every HWND a D3D9/11/12
+ * swapchain makes its Metal view for; the driver hooks then log that window's
+ * style changes, position changes, shows, activations and destruction as
+ * [swap-win] lines (driver_ios.c, and below). Logging only. Each window has its
+ * own budget per kind of line -- the first 32, then every 100th -- so a
+ * launcher's windows cannot use up the game's. A slot holds the HWND, 0 =
+ * free; lock-free, any thread. A new session starts with an empty table (HWND
+ * values are reused). */
+#define WINIOS_SWAP_HWNDS 32
+#define WINIOS_SWAP_KINDS 8   /* style, pos-begin, pos, activate (driver_ios.c); show, layer (here) */
+static _Atomic(uintptr_t) g_swap_hwnds[WINIOS_SWAP_HWNDS];
+static _Atomic unsigned g_swap_said[WINIOS_SWAP_HWNDS][WINIOS_SWAP_KINDS];
+enum { WINIOS_SWAP_SHOW = 4, WINIOS_SWAP_LAYER = 5 };
+
+/* The window's slot + 1, or 0 when no swapchain presents into it. */
+int winios_swapchain_hwnd(void *hwnd) {
+    uintptr_t h = (uintptr_t)hwnd;
+    if (!h) return 0;
+    for (int i = 0; i < WINIOS_SWAP_HWNDS; i++)
+        if (atomic_load_explicit(&g_swap_hwnds[i], memory_order_relaxed) == h) return i + 1;
+    return 0;
+}
+
+/* Whether to log this line of `kind` for the window in `slot1` (from
+ * winios_swapchain_hwnd): the first 32 of its kind, then every 100th. */
+int winios_swapchain_take(int slot1, int kind, unsigned *seq) {
+    unsigned k;
+    if (slot1 < 1 || slot1 > WINIOS_SWAP_HWNDS || kind < 0 || kind >= WINIOS_SWAP_KINDS) return 0;
+    k = atomic_fetch_add_explicit(&g_swap_said[slot1 - 1][kind], 1, memory_order_relaxed) + 1;
+    *seq = k;
+    return k <= 32 || (k % 100) == 0;
+}
+
+/* IOSDisplayShim.m, on the Wine thread that creates the swapchain. */
+void winios_note_swapchain_hwnd(void *hwnd) {
+    uintptr_t h = (uintptr_t)hwnd;
+    if (!h || winios_swapchain_hwnd(hwnd)) return;
+    for (int i = 0; i < WINIOS_SWAP_HWNDS; i++) {
+        uintptr_t empty = 0;
+        if (atomic_compare_exchange_strong(&g_swap_hwnds[i], &empty, h)) {
+            for (int k = 0; k < WINIOS_SWAP_KINDS; k++) atomic_store(&g_swap_said[i][k], 0);
+            fprintf(stderr, "[swap-win] hwnd=%p presents through a swapchain: its style, position, show, activation "
+                            "and destruction are logged as [swap-win] lines\n", hwnd);
+            fflush(stderr);
+            return;
+        }
+    }
+}
+
+static int winios_forget_swapchain_hwnd(void *hwnd) {
+    uintptr_t h = (uintptr_t)hwnd;
+    int found = 0;
+    for (int i = 0; h && i < WINIOS_SWAP_HWNDS; i++) {
+        uintptr_t want = h;
+        if (atomic_compare_exchange_strong(&g_swap_hwnds[i], &want, 0)) found = 1;
+    }
+    return found;
+}
+
+static void winios_swapchain_hwnds_reset(void) {
+    for (int i = 0; i < WINIOS_SWAP_HWNDS; i++) atomic_store(&g_swap_hwnds[i], 0);
 }
 
 static void winios_remove_layer(HWND hwnd);   /* compositor, below */
@@ -566,6 +698,10 @@ void winios_pDestroyWindow(HWND hwnd) {
     uintptr_t pending = (uintptr_t)hwnd;
     atomic_compare_exchange_strong(&g_restore_foreground, &pending, 0);
     winios_census_forget(hwnd);
+    if (winios_forget_swapchain_hwnd(hwnd)) {   /* madeira-bcd: [swap-win] */
+        fprintf(stderr, "[swap-win] hwnd=%p destroyed (pDestroyWindow) while a swapchain had presented into it\n", hwnd);
+        fflush(stderr);
+    }
     winios_remove_layer(hwnd);
 }
 
@@ -624,6 +760,14 @@ UINT winios_pShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp) {
                      "[show-win] #%d hwnd=%p cmd=%d swp_in=%08x -> returning ~0 "
                      "(pre-ml528 returned 0, which destroyed SWP_SHOWWINDOW) rev=ml529\n",
                      n, hwnd, cmd, (unsigned)swp );
+    }
+    {   /* madeira-bcd: [swap-win], the window's own budget */
+        int slot = winios_swapchain_hwnd(hwnd);
+        unsigned seq;
+        if (slot && winios_swapchain_take(slot, WINIOS_SWAP_SHOW, &seq))
+            dprintf( STDERR_FILENO, "[swap-win] #%u show hwnd=%p cmd=%d swp=%08x (ShowWindow; the default "
+                     "placement is kept) mach_tid=%u\n", seq, hwnd, cmd, (unsigned)swp,
+                     (unsigned)pthread_mach_thread_np( pthread_self() ) );
     }
     return ~0u;
 }
@@ -1067,6 +1211,7 @@ void winios_note_game_metal_hwnd(void *hwnd) {
 /* Called at every Wine session start (WineProcessBridge): a game session
  * starts with no overlay windows and no known Metal windows. */
 void winios_session_reset(void) {
+    winios_swapchain_hwnds_reset();   /* [swap-win]: HWND values of the last session mean nothing now */
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_game_metal removeAllObjects];
         if (g_comp_game) winios_drop_compositor("new session");
@@ -1436,6 +1581,37 @@ static void winios_sync_metal_hidden(NSNumber *key, CALayer *l) {
     winios_metal_hud_pick();
 }
 
+/* madeira-bcd: [swap-win] main thread, desktop sessions. The layers of a window
+ * a swapchain presents into, logged when they change: the window layer's frame
+ * and hidden state (a hidden window's Metal layer presents at
+ * MADEIRA_HIDDEN_LAYER_FPS), the Metal layer's frame and drawable size, and
+ * whether it is fitted to the desktop. Logging only. */
+static void winios_swap_layer_note(NSNumber *key, const char *why) {
+    static NSMutableDictionary<NSNumber *, NSString *> *said;
+    unsigned seq;
+    int slot = g_comp_game ? 0 : winios_swapchain_hwnd((void *)(uintptr_t)key.unsignedLongLongValue);
+    if (!slot) return;
+    CALayer *l = g_layers[key];
+    CAMetalLayer *ml = g_metal_layers[key];
+    if (!l) return;
+    CGRect f = l.frame, mf = ml ? ml.frame : CGRectZero;
+    CGSize ds = ml ? ml.drawableSize : CGSizeZero;
+    BOOL fit = g_fit_key && [g_fit_key isEqual:key];
+    NSString *state = [NSString stringWithFormat:@"%.0f %.0f %.0f %.0f %d %d %.0f %.0f %.0f %.0f %.0f %.0f %d",
+                       f.origin.x, f.origin.y, f.size.width, f.size.height, (int)l.hidden, ml != nil,
+                       mf.origin.x, mf.origin.y, mf.size.width, mf.size.height, ds.width, ds.height, (int)fit];
+    if (!said) said = [NSMutableDictionary new];
+    if ([said[key] isEqualToString:state]) return;
+    said[key] = state;
+    if (!winios_swapchain_take(slot, WINIOS_SWAP_LAYER, &seq)) return;
+    fprintf(stderr, "[swap-win] #%u layer hwnd=0x%llx (%s): window layer (%.0f,%.0f %.0fx%.0f pt) hidden=%d, "
+                    "metal layer %s(%.0f,%.0f %.0fx%.0f pt) drawable %.0fx%.0f px%s\n", seq,
+            key.unsignedLongLongValue, why, f.origin.x, f.origin.y, f.size.width, f.size.height, (int)l.hidden,
+            ml ? "" : "none ", mf.origin.x, mf.origin.y, mf.size.width, mf.size.height, ds.width, ds.height,
+            fit ? ", fitted to the desktop" : "");
+    fflush(stderr);
+}
+
 /* Called by IOSDisplayShim on a wine thread when DXMT creates a swapchain
  * view for an HWND in desktop mode. Returns the (unretained) CAMetalLayer;
  * the shim CFRetains it for DXMT's lifetime handling. */
@@ -1468,6 +1644,7 @@ CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd) {
             fflush(stderr);
             winios_census_note_metal((HWND)hwnd);
             winios_metal_hud_pick();
+            winios_swap_layer_note(key, "metal layer created");
         }
         result = ml;
     };
@@ -1489,6 +1666,7 @@ void winios_window_visibility(HWND hwnd, int visible) {
         l.hidden = hidden;
         [CATransaction commit];
         winios_sync_metal_hidden(@((uintptr_t)hwnd), l);
+        winios_swap_layer_note(@((uintptr_t)hwnd), "parent shown or hidden");
         static unsigned n;
         if (++n <= 64 || (n % 128) == 0) {
             fprintf(stderr, "[winios] inherited visibility hwnd=%p visible=%d\n", hwnd, !hidden);
@@ -1515,6 +1693,7 @@ void winios_window_geometry(HWND hwnd, int x, int y, int w, int h,
         winios_apply_contents_rect(key, l);
         winios_place_metal_layer(key);
         [CATransaction commit];
+        winios_swap_layer_note(key, "parent moved");
         static unsigned n;
         if (++n <= 64 || (n % 128) == 0)
             fprintf(stderr, "[winios] inherited frame hwnd=%p screen=(%d,%d %dx%d)\n", hwnd, x, y, w, h);
@@ -1552,6 +1731,7 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         winios_place_metal_layer(key);
         [CATransaction commit];
         winios_sync_metal_hidden(key, l);
+        winios_swap_layer_note(key, "window frame");
     });
 }
 

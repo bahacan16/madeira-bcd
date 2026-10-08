@@ -1545,6 +1545,11 @@ struct mad_queue {
     obj_handle_t f6_pool[64]; unsigned f6_next;
     struct mad_f6_pend { unsigned char idx, kind, natt; struct mad_resource *att[9]; } f6_pend[40]; unsigned f6_npend;
     UINT64 open_ticket;   /* madeira-bcd: sync diagnostics (upload-guard / desc-guard), the open batch's ticket; 0 = none */
+    /* madeira-bcd: [swap-diag] what the worker is doing: job kind (MAD_SUB_*, 0 = none), the step
+     * of a Present ('F' flush, 'L' GPU latency wait, 'A' layer setup on the main thread,
+     * 'D' nextDrawable, 'C' blit and commit) and the generic-timer tick it started at.
+     * Plain stores, read only by a drain or throttle that has waited 2 s. */
+    volatile LONG diag_job, diag_step; volatile UINT64 diag_since;
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
@@ -7700,6 +7705,70 @@ static void mad_wait_committed(struct mad_fence *f, UINT64 value) {
         d3d12_log("[madeira-d3d12] ml1120 queue Wait: fence %p value %llu not committed within 5 s (committed %lld, value %llu); continuing\n",
                   (void *)f, (unsigned long long)value, (long long)f->committed, (unsigned long long)f->value);
 }
+/* madeira-bcd: SWAPCHAIN MODE-SWITCH DIAGNOSTICS ([swap-diag]), the shared part;
+ * the swapchain's own lines are beside the swapchain. Red Dead Redemption 2
+ * hangs when its Screen Type is switched to Windowed Borderless (owner,
+ * 2026-10-08), and the two logs of it name no swapchain call at all:
+ * SetFullscreenState and ResizeTarget never logged, and ResizeBuffers logged
+ * only at its very end, after the queue drain and the layer's setup on the iOS
+ * main thread, so a call that never returned left no trace. These lines say
+ * which call was entered and did not return, and where inside it. Logging only:
+ * every call does what it did before. Each kind of line logs its first 32
+ * occurrences, then every 100th. */
+static volatile LONG g_swd_stall_n;
+static int mad_swd_take(volatile LONG *n, LONG *seq) {
+    LONG k = InterlockedIncrement(n);
+    if (seq) *seq = k;
+    return k <= 32 || (k % 100) == 0;
+}
+static double mad_swd_ms(UINT64 t0) {
+    return (double)(mad_tick() - t0) * 1000.0 / (double)mad_tick_freq();
+}
+static void mad_swd_log(const char *fmt, ...) {   /* d3d12_log that leaves the caller's LastError alone */
+    char buf[900];
+    va_list ap;
+    DWORD err = GetLastError();
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    d3d12_log("%s", buf);
+    SetLastError(err);
+}
+static void mad_swd_step(struct mad_queue *q, LONG step) {   /* a Present's step, for a drain that waits on it */
+    if (!q) return;
+    q->diag_since = mad_tick();
+    q->diag_step = step;
+}
+static const char *mad_swd_job_name(LONG job) {
+    switch (job) {
+    case MAD_SUB_ECL: return "ExecuteCommandLists";
+    case MAD_SUB_SIGNAL: return "Signal";
+    case MAD_SUB_WAIT: return "a queue Wait";
+    case MAD_SUB_PRESENT: return "Present";
+    }
+    return "no job";
+}
+static const char *mad_swd_step_name(LONG step) {
+    switch (step) {
+    case 'F': return " (flush)";
+    case 'L': return " (GPU frame-latency wait)";
+    case 'A': return " (layer setup on the iOS main thread)";
+    case 'D': return " (nextDrawable)";
+    case 'C': return " (blit and commit)";
+    }
+    return "";
+}
+/* A drain or a Present throttle has waited another 2 s for the worker. Called
+ * without sub_lock; the fields are read racily, which is fine for a log line. */
+static void mad_swd_stall(struct mad_queue *q, const char *what, unsigned slices) {
+    LONG seq, job = q->diag_job, step = q->diag_step;
+    UINT64 since = q->diag_since;
+    if (!mad_swd_take(&g_swd_stall_n, &seq)) return;
+    mad_swd_log("[swap-diag] #%ld %s on queue %p still waiting after %u s: the worker is in %s%s for %.0f ms, "
+                "%ld present(s) queued, tid %04lx\n", (long)seq, what, (void *)q, slices * 2,
+                mad_swd_job_name(job), job == MAD_SUB_PRESENT ? mad_swd_step_name(step) : "",
+                job && since ? mad_swd_ms(since) : 0.0, (long)q->sub_presents, (unsigned long)GetCurrentThreadId());
+}
 static DWORD WINAPI mad_sub_worker(void *arg) {
     struct mad_queue *q = arg;
     mad_xp_role('W');   /* ml1128 */
@@ -7716,6 +7785,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
 
         QueryPerformanceCounter(&t0);
         pool = NSAutoreleasePool_alloc_init();
+        q->diag_since = mad_tick(); q->diag_step = 0; q->diag_job = j->kind;   /* [swap-diag] */
         switch (j->kind) {
         case MAD_SUB_ECL: {
             UINT i;
@@ -7743,6 +7813,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
             LeaveCriticalSection(&q->sub_lock);
             break;
         }
+        q->diag_job = 0; q->diag_step = 0;   /* [swap-diag] */
         {   /* ml1128: per-kind elapsed, and the pool drain on its own */
             LONG64 tk = mad_qpc(), d = tk - t0.QuadPart;
             switch (j->kind) {
@@ -7769,10 +7840,22 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
  * entry points on application threads, never from a worker. */
 static void mad_queue_drain(struct mad_queue *q) {
     LARGE_INTEGER t0, t1;
+    unsigned slices = 0;
+    DWORD err;
     if (!q || !q->sub_thread) return;
     QueryPerformanceCounter(&t0);
+    err = GetLastError();
     EnterCriticalSection(&q->sub_lock);
-    while (q->sub_head || q->sub_busy) SleepConditionVariableCS(&q->sub_idle, &q->sub_lock, INFINITE);
+    while (q->sub_head || q->sub_busy) {
+        /* madeira-bcd: [swap-diag] 2 s slices instead of INFINITE. The loop
+         * re-checks the same condition, so it ends exactly when it did; a
+         * drain that does not end now says what the worker is doing. */
+        if (SleepConditionVariableCS(&q->sub_idle, &q->sub_lock, 2000)) continue;
+        LeaveCriticalSection(&q->sub_lock);
+        mad_swd_stall(q, "queue drain", ++slices);
+        SetLastError(err);
+        EnterCriticalSection(&q->sub_lock);
+    }
     LeaveCriticalSection(&q->sub_lock);
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_drain_ticks, t1.QuadPart - t0.QuadPart);
@@ -7783,14 +7866,24 @@ static void mad_queue_drain(struct mad_queue *q) {
 static int g_present_ahead = -1;
 static void mad_present_throttle(struct mad_queue *q) {
     LARGE_INTEGER t0, t1;
+    unsigned slices = 0;
+    DWORD err;
     if (g_present_ahead < 0) {
         g_present_ahead = (int)mad_cfg_int_pe("async-present-ahead", 1);
         if (g_present_ahead < 0) g_present_ahead = 0; if (g_present_ahead > 3) g_present_ahead = 3;
         d3d12_log("[madeira-d3d12] ml1121 asynchronous Present, run-ahead %d frame(s)\n", g_present_ahead);
     }
     QueryPerformanceCounter(&t0);
+    err = GetLastError();
     EnterCriticalSection(&q->sub_lock);
-    while (q->sub_presents > g_present_ahead) SleepConditionVariableCS(&q->sub_presented, &q->sub_lock, INFINITE);
+    while (q->sub_presents > g_present_ahead) {
+        /* madeira-bcd: [swap-diag] 2 s slices, as in mad_queue_drain */
+        if (SleepConditionVariableCS(&q->sub_presented, &q->sub_lock, 2000)) continue;
+        LeaveCriticalSection(&q->sub_lock);
+        mad_swd_stall(q, "Present throttle", ++slices);
+        SetLastError(err);
+        EnterCriticalSection(&q->sub_lock);
+    }
     LeaveCriticalSection(&q->sub_lock);
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_xp.t_thr, t1.QuadPart - t0.QuadPart);   /* ml1128 */
@@ -15360,8 +15453,15 @@ struct mad_swapchain {
     /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
+    LONG diag_seq;   /* madeira-bcd: [swap-diag] number of the creation / ResizeBuffers being logged, 0 = none */
 };
 static IDXGISwapChain4Vtbl g_swap_vtbl;
+/* madeira-bcd: [swap-diag] counters of the swapchain's mode-switch lines (see
+ * mad_swd_take): SetFullscreenState, GetFullscreenState, ResizeTarget,
+ * ResizeBuffers(1), GetContainingOutput, creation and destruction, slow layer
+ * setups, slow GPU frame-latency waits. */
+static volatile LONG g_swd_fs_n, g_swd_getfs_n, g_swd_rt_n, g_swd_rb_n, g_swd_out_n, g_swd_life_n,
+                     g_swd_layer_n, g_swd_lat_n;
 
 static void mad_swap_release_fx(struct mad_swapchain *s) {
     UINT i;
@@ -15445,8 +15545,13 @@ static obj_handle_t g_layer_cfg_layer;
 static const void *g_layer_cfg_owner;
 static void mad_swap_apply_layer(struct mad_swapchain *s) {
     struct WMTLayerProps props;
+    double old_w, old_h, ms;
+    unsigned old_pf;
+    UINT64 t0;
+    LONG seq;
     memset(&props, 0, sizeof props);
     MetalLayer_getProps(s->layer, &props);
+    old_w = props.drawable_width; old_h = props.drawable_height; old_pf = (unsigned)props.pixel_format;
     props.device = s->dev->mtl_device;
     /* MetalFX upscaling: the drawable is the scaled size (fx_w x fx_h). */
     props.drawable_width = s->fx_w ? s->fx_w : s->desc.Width;
@@ -15454,7 +15559,25 @@ static void mad_swap_apply_layer(struct mad_swapchain *s) {
     props.pixel_format = s->pf;
     props.framebuffer_only = false;
     props.display_sync_enabled = true;
+    /* madeira-bcd: [swap-diag] winemetal applies the properties in a block on the
+     * iOS main thread (execute_on_main: dispatch_sync), the one step of a resize
+     * that waits for another thread. A logged creation or ResizeBuffers brackets
+     * it; any other caller is named when it took 100 ms or more. */
+    if (s->diag_seq)
+        mad_swd_log("[swap-diag] #%ld layer 0x%llx: drawable %.0fx%.0f format %u -> %.0fx%.0f format %u, "
+                    "set on the iOS main thread (dispatch_sync) ...\n", (long)s->diag_seq,
+                    (unsigned long long)s->layer, old_w, old_h, old_pf, props.drawable_width,
+                    props.drawable_height, (unsigned)props.pixel_format);
+    t0 = mad_tick();
     MetalLayer_setProps(s->layer, &props);
+    ms = mad_swd_ms(t0);
+    if (s->diag_seq)
+        mad_swd_log("[swap-diag] #%ld layer 0x%llx set in %.1f ms\n", (long)s->diag_seq,
+                    (unsigned long long)s->layer, ms);
+    else if (ms >= 100.0 && mad_swd_take(&g_swd_layer_n, &seq))
+        mad_swd_log("[swap-diag] layer 0x%llx of swapchain %p (hwnd %p) took %.0f ms to set on the iOS main thread "
+                    "(slow setup #%ld, present #%llu)\n", (unsigned long long)s->layer, (void *)s, (void *)s->hwnd,
+                    ms, (long)seq, (unsigned long long)s->presents);
     g_layer_cfg_layer = s->layer;
     g_layer_cfg_owner = s;
 }
@@ -15515,7 +15638,15 @@ static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     LONG n = InterlockedDecrement(&s->refs);
     if (n == 0) { mad_pd_purge(T);   /* ml1143 */
+        UINT64 t0 = mad_tick(), t1;   /* madeira-bcd: [swap-diag] */
+        LONG seq;
+        int say = mad_swd_take(&g_swd_life_n, &seq);
+        if (say)
+            mad_swd_log("[swap-diag] #%ld swapchain %p (hwnd %p, %ux%u) final Release enter after %llu presents, tid %04lx\n",
+                        (long)seq, (void *)s, (void *)s->hwnd, s->desc.Width, s->desc.Height,
+                        (unsigned long long)s->presents, (unsigned long)GetCurrentThreadId());
         if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1121: queued presents name this swapchain */
+        t1 = mad_tick();
         mad_swap_release_buffers(s);
         if (g_layer_cfg_owner == s) g_layer_cfg_owner = NULL;   /* the next Present re-applies its own layer settings */
         if (s->view) ReleaseMetalView(s->view);
@@ -15523,6 +15654,9 @@ static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
         if (s->factory) IDXGIFactory1_Release(s->factory);
         ID3D12CommandQueue_Release((ID3D12CommandQueue *)s->queue);
         d3d12_log("[madeira-d3d12] swapchain destroyed after %llu presents\n", (unsigned long long)s->presents);
+        if (say)
+            mad_swd_log("[swap-diag] #%ld swapchain %p released in %.1f ms (queue drain %.1f ms)\n", (long)seq, (void *)s,
+                        mad_swd_ms(t0), (double)(t1 - t0) * 1000.0 / (double)mad_tick_freq());
         free(s);
     }
     return (ULONG)n;
@@ -15603,6 +15737,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     if (idx >= s->nbuf) return;
     src = s->buffers[idx];
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
+    mad_swd_step(s->queue, 'F');    /* madeira-bcd: [swap-diag] steps, named by a drain that waits on this Present */
     { LONG64 tf = mad_qpc();   /* ml1128 */
     mad_device_flush_all(s->queue->device);          /* ml884: the frame's batch precedes the present */
     InterlockedExchangeAdd64(&g_xp.t_flush, mad_qpc() - tf); }
@@ -15676,12 +15811,24 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         if (dv->gpu_event && need && (UINT64)mad_gpu_completed(dv) < need) {
             static LONG waits, said;
             LONG64 tl = mad_qpc();   /* ml1128 */
+            UINT64 tw = mad_tick();
+            double wait_ms;
+            LONG seq;
             InterlockedIncrement(&waits);
+            mad_swd_step(s->queue, 'L');
             MTLSharedEvent_waitUntilSignaledValue(dv->gpu_event, need, 1000);
             InterlockedIncrement64(&g_xp.n_lat); InterlockedExchangeAdd64(&g_xp.t_lat, mad_qpc() - tl);
             if (InterlockedIncrement(&said) <= 3 || (waits % 2000) == 0)
                 d3d12_log("[madeira-d3d12] ml1070 present #%llu waited for the GPU to finish frame N-%u (serial %llu; %ld such waits so far)\n",
                           (unsigned long long)s->presents, lat, (unsigned long long)need, waits);
+            /* madeira-bcd: [swap-diag] the wait gives up after 1 s; a GPU that stopped
+             * finishing work turns every Present into such a wait */
+            wait_ms = mad_swd_ms(tw);
+            if (wait_ms >= 500.0 && mad_swd_take(&g_swd_lat_n, &seq))
+                mad_swd_log("[swap-diag] present #%llu (swapchain %p) waited %.0f ms for the GPU to finish frame N-%u: "
+                            "serial %llu needed, %llu completed (slow wait #%ld)\n", (unsigned long long)s->presents,
+                            (void *)s, wait_ms, lat, (unsigned long long)need,
+                            (unsigned long long)mad_gpu_completed(dv), (long)seq);
         }
     }
     if (g_sd_state > 0) {   /* madeira-bcd: sync diagnostics -- a game that paces by Present reuses frame N-lat's data as soon as this returns */
@@ -15699,16 +15846,20 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         if (InterlockedIncrement(&said) <= 8)
             d3d12_log("[madeira-d3d12] swapchain %ux%u (hwnd %p): another swapchain reconfigured the shared Metal layer -- its drawable size and format restored before present #%llu\n",
                       s->desc.Width, s->desc.Height, (void *)s->hwnd, (unsigned long long)s->presents);
+        mad_swd_step(s->queue, 'A');
         mad_swap_apply_layer(s);
     }
+    mad_swd_step(s->queue, 'D');
     { LONG64 td = mad_qpc();   /* ml1128 */
     drawable = MetalLayer_nextDrawable(s->layer);
     InterlockedExchangeAdd64(&g_xp.t_draw, mad_qpc() - td); }
     if (!drawable) {
         static unsigned said;
         if (said++ < 3) d3d12_log("[madeira-d3d12] Present: the layer gave no drawable\n");
+        mad_swd_step(s->queue, 0);
         return;   /* a dropped frame, not an error the application can act on */
     }
+    mad_swd_step(s->queue, 'C');
     { LONG64 tc = mad_qpc();   /* ml1128: blit + presentDrawable + commit */
     tex = MetalDrawable_texture(drawable);
     cb = MTLCommandQueue_commandBuffer(s->queue->device->mtl_queue);
@@ -15745,6 +15896,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         MTLCommandBuffer_commit(cb);
     }
     InterlockedExchangeAdd64(&g_xp.t_cmt, mad_qpc() - tc); }
+    mad_swd_step(s->queue, 0);
     /* ml1056: no release -- the drawable was never ours (see swap_Present). */
     s->presents++;
     mad_perf_present();   /* ml1108 */
@@ -15764,16 +15916,41 @@ static HRESULT STDMETHODCALLTYPE swap_GetBuffer(IDXGISwapChain4 *T, UINT i, REFI
 }
 static HRESULT STDMETHODCALLTYPE swap_SetFullscreenState(IDXGISwapChain4 *T, BOOL fs, IDXGIOutput *target) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
-    (void)target;
+    UINT64 t0 = mad_tick();   /* madeira-bcd: [swap-diag] */
+    LONG seq;
+    int say = mad_swd_take(&g_swd_fs_n, &seq), was = !s->fs.Windowed;
+    if (say)
+        mad_swd_log("[swap-diag] #%ld SetFullscreenState(%d, output %p) enter: swapchain %p hwnd %p %ux%u, fullscreen was %d, "
+                    "tid %04lx\n", (long)seq, fs, (void *)target, (void *)s, (void *)s->hwnd, s->desc.Width, s->desc.Height,
+                    was, (unsigned long)GetCurrentThreadId());
     /* The window is what the desktop says it is; fullscreen is recorded so the
      * application reads back what it set, and changes nothing else. */
     s->fs.Windowed = !fs;
+    if (say)
+        mad_swd_log("[swap-diag] #%ld SetFullscreenState -> S_OK in %.2f ms: fullscreen %d -> %d, recorded only (no window "
+                    "style, size, display mode or layer change)\n", (long)seq, mad_swd_ms(t0), was, !s->fs.Windowed);
     return S_OK;
+}
+/* madeira-bcd: [swap-diag] a game may ask every frame, so: the first 16 calls,
+ * every answer that differs from the one before, the first 8 times an output is
+ * asked for while fullscreen (Windows returns the swapchain's output there, this
+ * runtime NULL), then every 3600th call. */
+static void mad_swd_getfs(struct mad_swapchain *s, int answer, int want_output) {
+    static volatile LONG last = -1, null_n;
+    LONG n = InterlockedIncrement(&g_swd_getfs_n), prev = InterlockedExchange(&last, answer ? 1 : 0), k = 0;
+    int changed = prev >= 0 && prev != (answer ? 1 : 0);
+    if (answer && want_output) k = InterlockedIncrement(&null_n);
+    if (n <= 16 || changed || (k && (k <= 8 || (k % 3600) == 0)) || (n % 3600) == 0)
+        mad_swd_log("[swap-diag] GetFullscreenState call #%ld on swapchain %p -> fullscreen %d%s%s, tid %04lx\n", (long)n,
+                    (void *)s, answer,
+                    k ? ", output NULL although fullscreen (Windows returns the output)" : want_output ? ", output NULL" : "",
+                    changed ? " (changed since the call before)" : "", (unsigned long)GetCurrentThreadId());
 }
 static HRESULT STDMETHODCALLTYPE swap_GetFullscreenState(IDXGISwapChain4 *T, BOOL *fs, IDXGIOutput **target) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     if (fs) *fs = !s->fs.Windowed;
     if (target) *target = NULL;
+    mad_swd_getfs(s, !s->fs.Windowed, target != NULL);
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE swap_GetDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAIN_DESC *d) {
@@ -15794,10 +15971,24 @@ static HRESULT STDMETHODCALLTYPE swap_GetDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAI
     d->Flags = s->desc.Flags;
     return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
-    struct mad_swapchain *s = (struct mad_swapchain *)T;
+/* ResizeBuffers and ResizeBuffers1. madeira-bcd: [swap-diag] lines at entry,
+ * around the layer setup (mad_swap_apply_layer) and at exit with the time of
+ * the queue drain; the buffers are released and made as before. */
+static HRESULT mad_swap_resize(struct mad_swapchain *s, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
+                               const char *api) {
     UINT i;
+    UINT64 t0 = mad_tick(), t1;
+    LONG seq;
+    int say = mad_swd_take(&g_swd_rb_n, &seq);
+    HRESULT hr;
+    if (say)
+        mad_swd_log("[swap-diag] #%ld %s(count %u, %ux%u, format %u, flags %#x) enter: swapchain %p hwnd %p is %ux%u x%u "
+                    "format %u, fullscreen %d, after %llu presents, tid %04lx\n", (long)seq, api, count, w, h,
+                    (unsigned)fmt, flags, (void *)s, (void *)s->hwnd, s->desc.Width, s->desc.Height, s->nbuf,
+                    (unsigned)s->desc.Format, !s->fs.Windowed, (unsigned long long)s->presents,
+                    (unsigned long)GetCurrentThreadId());
     if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1120: no list may still reference the old buffers */
+    t1 = mad_tick();
     for (i = 0; i < s->nbuf; i++)
         if (s->buffers[i] && s->buffers[i]->refs > 1)
             d3d12_log("[madeira-d3d12] ResizeBuffers: back buffer %u still has %ld outside references\n", i, (long)s->buffers[i]->refs - 1);
@@ -15807,28 +15998,71 @@ static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT cou
     if (h) s->desc.Height = h;
     if (fmt != DXGI_FORMAT_UNKNOWN) s->desc.Format = fmt;
     s->desc.Flags = flags;
-    return mad_swap_make_buffers(s);
+    s->diag_seq = say ? seq : 0;
+    hr = mad_swap_make_buffers(s);
+    s->diag_seq = 0;
+    if (say)
+        mad_swd_log("[swap-diag] #%ld %s -> %#lx in %.1f ms (queue drain %.1f ms): now %ux%u x%u format %u\n", (long)seq,
+                    api, (unsigned long)hr, mad_swd_ms(t0), (double)(t1 - t0) * 1000.0 / (double)mad_tick_freq(),
+                    s->desc.Width, s->desc.Height, s->nbuf, (unsigned)s->desc.Format);
+    return hr;
 }
-static HRESULT STDMETHODCALLTYPE swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) { (void)T; (void)m; return S_OK; }
+static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
+    return mad_swap_resize((struct mad_swapchain *)T, count, w, h, fmt, flags, "ResizeBuffers");
+}
+static HRESULT STDMETHODCALLTYPE swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) {
+    struct mad_swapchain *s = (struct mad_swapchain *)T;
+    LONG seq;
+    /* madeira-bcd: [swap-diag] still a no-op: the window keeps its size and the
+     * display its mode, so no WM_SIZE or WM_DISPLAYCHANGE follows from it. */
+    if (mad_swd_take(&g_swd_rt_n, &seq)) {
+        if (m)
+            mad_swd_log("[swap-diag] #%ld ResizeTarget(%ux%u, refresh %u/%u, format %u, scanline %u, scaling %u) on swapchain %p "
+                        "(hwnd %p, %ux%u, fullscreen %d) -> S_OK at once: a no-op, the window and the display mode keep "
+                        "their size; tid %04lx\n", (long)seq, m->Width, m->Height, m->RefreshRate.Numerator,
+                        m->RefreshRate.Denominator, (unsigned)m->Format, (unsigned)m->ScanlineOrdering, (unsigned)m->Scaling,
+                        (void *)s, (void *)s->hwnd, s->desc.Width, s->desc.Height, !s->fs.Windowed,
+                        (unsigned long)GetCurrentThreadId());
+        else
+            mad_swd_log("[swap-diag] #%ld ResizeTarget(NULL) on swapchain %p -> S_OK at once (a no-op); tid %04lx\n",
+                        (long)seq, (void *)s, (unsigned long)GetCurrentThreadId());
+    }
+    return S_OK;
+}
 static HRESULT STDMETHODCALLTYPE swap_GetContainingOutput(IDXGISwapChain4 *T, IDXGIOutput **out) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     IDXGIAdapter1 *adapter = NULL;
     HRESULT hr;
+    UINT64 t0 = mad_tick();   /* madeira-bcd: [swap-diag] */
+    LONG seq;
     if (!out) return E_POINTER;
     *out = NULL;
-    if (!s->factory) return DXGI_ERROR_UNSUPPORTED;
-    hr = IDXGIFactory1_EnumAdapters1(s->factory, 0, &adapter);
-    if (FAILED(hr)) return hr;
-    hr = IDXGIAdapter1_EnumOutputs(adapter, 0, out);
-    IDXGIAdapter1_Release(adapter);
+    if (!s->factory) hr = DXGI_ERROR_UNSUPPORTED;
+    else if (SUCCEEDED(hr = IDXGIFactory1_EnumAdapters1(s->factory, 0, &adapter))) {
+        hr = IDXGIAdapter1_EnumOutputs(adapter, 0, out);
+        IDXGIAdapter1_Release(adapter);
+    }
+    if (mad_swd_take(&g_swd_out_n, &seq))
+        mad_swd_log("[swap-diag] #%ld GetContainingOutput on swapchain %p -> %#lx, output %p, in %.2f ms; tid %04lx\n",
+                    (long)seq, (void *)s, (unsigned long)hr, (void *)*out, mad_swd_ms(t0),
+                    (unsigned long)GetCurrentThreadId());
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE swap_GetFrameStatistics(IDXGISwapChain4 *T, DXGI_FRAME_STATISTICS *st) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
+    static volatile LONG asked;   /* madeira-bcd: [swap-diag] the first 8 calls, then every 3600th */
+    LONG n;
     if (!st) return E_INVALIDARG;
     memset(st, 0, sizeof *st);
     st->PresentCount = (UINT)s->presents;
     st->PresentRefreshCount = (UINT)s->presents;
+    /* SyncRefreshCount and SyncQPCTime stay 0: a game that waits for them to
+     * move would wait for ever, so a fast-climbing call count is worth seeing */
+    n = InterlockedIncrement(&asked);
+    if (n <= 8 || (n % 3600) == 0)
+        mad_swd_log("[swap-diag] GetFrameStatistics call #%ld on swapchain %p (fullscreen %d) -> present count %u, "
+                    "sync refresh count 0; tid %04lx\n", (long)n, (void *)s, !s->fs.Windowed, st->PresentCount,
+                    (unsigned long)GetCurrentThreadId());
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE swap_GetLastPresentCount(IDXGISwapChain4 *T, UINT *n) {
@@ -15891,8 +16125,15 @@ static HRESULT STDMETHODCALLTYPE swap_SetColorSpace1(IDXGISwapChain4 *T, DXGI_CO
 }
 static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers1(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                      const UINT *node_masks, IUnknown *const *queues) {
-    (void)node_masks; (void)queues;
-    return swap_ResizeBuffers(T, count, w, h, fmt, flags);
+    struct mad_swapchain *s = (struct mad_swapchain *)T;
+    char api[96];
+    (void)node_masks;
+    /* madeira-bcd: [swap-diag] which queue the first buffer is meant for
+     * (the queues are not used: every buffer presents on the swapchain's) */
+    snprintf(api, sizeof api, "ResizeBuffers1[queue %p%s]",
+             queues && (count || s->nbuf) ? (void *)queues[0] : NULL,
+             queues && (count || s->nbuf) && queues[0] && (void *)queues[0] != (void *)s->queue ? ", not the swapchain's" : "");
+    return mad_swap_resize(s, count, w, h, fmt, flags, api);
 }
 static HRESULT STDMETHODCALLTYPE swap_SetHDRMetaData(IDXGISwapChain4 *T, DXGI_HDR_METADATA_TYPE type, UINT n, void *d) { (void)T; (void)type; (void)n; (void)d; return S_OK; }
 
@@ -15901,9 +16142,17 @@ static HRESULT mad_swapchain_create(struct mad_queue *q, IDXGIFactory1 *factory,
                                     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGISwapChain1 **out) {
     struct mad_swapchain *s;
     HRESULT hr;
+    UINT64 t0 = mad_tick(), t1;   /* madeira-bcd: [swap-diag] */
+    LONG seq;
+    int say;
     if (!out) return E_POINTER;
     *out = NULL;
     if (!q || !desc || !hwnd) return DXGI_ERROR_INVALID_CALL;
+    say = mad_swd_take(&g_swd_life_n, &seq);
+    if (say)
+        mad_swd_log("[swap-diag] #%ld swapchain creation enter: hwnd %p %ux%u x%u format %u, flags %#x, windowed %d, tid %04lx\n",
+                    (long)seq, (void *)hwnd, desc->Width, desc->Height, desc->BufferCount, (unsigned)desc->Format,
+                    desc->Flags, fs ? fs->Windowed : TRUE, (unsigned long)GetCurrentThreadId());
     s = calloc(1, sizeof *s);
     if (!s) return E_OUTOFMEMORY;
     s->vtbl = &g_swap_vtbl; s->refs = 1; s->iid = &IID_IDXGISwapChain4; s->name = "SwapChain";
@@ -15915,13 +16164,21 @@ static HRESULT mad_swapchain_create(struct mad_queue *q, IDXGIFactory1 *factory,
     s->desc = *desc;
     if (fs) s->fs = *fs; else s->fs.Windowed = TRUE;
     s->max_latency = 1;
+    /* desktop mode: the window's own layer, made on the iOS main thread (dispatch_sync) */
     s->view = CreateMetalViewFromHWND((intptr_t)hwnd, s->dev->mtl_device, &s->layer);
+    t1 = mad_tick();
     if (!s->view || !s->layer) {
         d3d12_log("[madeira-d3d12] swapchain: no Metal view for hwnd %p\n", (void *)hwnd);
         swap_Release((IDXGISwapChain4 *)s);
         return DXGI_ERROR_UNSUPPORTED;
     }
+    s->diag_seq = say ? seq : 0;
     hr = mad_swap_make_buffers(s);
+    s->diag_seq = 0;
+    if (say)
+        mad_swd_log("[swap-diag] #%ld swapchain %p creation -> %#lx in %.1f ms (Metal view %.1f ms, layer 0x%llx)\n", (long)seq,
+                    (void *)s, (unsigned long)hr, mad_swd_ms(t0), (double)(t1 - t0) * 1000.0 / (double)mad_tick_freq(),
+                    (unsigned long long)s->layer);
     if (FAILED(hr)) { swap_Release((IDXGISwapChain4 *)s); return hr; }
     *out = (IDXGISwapChain1 *)s;
     return S_OK;

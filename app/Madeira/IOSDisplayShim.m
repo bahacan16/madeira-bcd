@@ -172,6 +172,9 @@ extern CAMetalLayer *winios_metal_layer_for_hwnd(void *hwnd);
 // Game sessions: the window a swapchain presents from is the game's own;
 // Winios.m's game-mode window overlay must not draw its GDI bits.
 extern void winios_note_game_metal_hwnd(void *hwnd);
+// Both kinds of session: the driver logs what happens to a swapchain's window
+// ([swap-win] lines, Winios.m / driver_ios.c).
+extern void winios_note_swapchain_hwnd(void *hwnd);
 
 static macdrv_metal_device my_create_metal_device(void) {
     // DXMT also has a separate code path that creates its own MTLDevice;
@@ -190,6 +193,7 @@ static void my_release_metal_device(macdrv_metal_device d) {
 // compositor. Game mode: the fullscreen singleton, exactly as before.
 static macdrv_metal_view my_view_create_metal_view(macdrv_view v, macdrv_metal_device d) {
     (void)d;
+    winios_note_swapchain_hwnd((void *)v);
     if (madeira_desktop_mode()) {
         CAMetalLayer *layer = winios_metal_layer_for_hwnd((void *)v);
         if (!layer) {
