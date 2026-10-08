@@ -1378,6 +1378,42 @@ void set_thread_id( TEB *teb, DWORD pid, DWORD tid )
 /***********************************************************************
  *           init_thread_stack
  */
+/* madeira-bcd: which part of a new thread could not be allocated.
+ * SocialClubHelper.exe's Chrome_IOThread created a thread and the helper died
+ * at once with Chromium's out-of-memory exit and a size of 0 (logs 2026-10-08
+ * 13:39:08, build 451, and 16:38:52, build 455; GTA V Enhanced then shows
+ * "Failed to initialize. Error code: 17"): Chromium terminates with the stack
+ * size it asked for (0 = default) when CreateThread fails with an
+ * out-of-memory error. The server had made the thread; what failed after it
+ * (the TEB, one of the stacks, pthread_create) was never logged.
+ * init_thread_stack records the stack it is allocating; NtCreateThreadEx
+ * reports a failure with that step, the status, the pthread error, the sizes
+ * asked for and the task's thread count. At most 64 lines. */
+static __thread const char *ios_its_step;
+
+static void ios_note_thread_create_failure( const char *step, NTSTATUS status, int err,
+                                            SIZE_T reserve, SIZE_T commit )
+{
+    static LONG lines;
+    thread_act_array_t acts = NULL;
+    mach_msg_type_number_t n = 0, i;
+    int threads = -1;
+
+    if (InterlockedIncrement( &lines ) > 64) return;
+    if (task_threads( mach_task_self(), &acts, &n ) == KERN_SUCCESS)
+    {
+        threads = (int)n;
+        for (i = 0; i < n; i++) mach_port_deallocate( mach_task_self(), acts[i] );
+        vm_deallocate( mach_task_self(), (vm_address_t)acts, n * sizeof(*acts) );
+    }
+    dprintf( 2, "[thr-create] FAILED at %s: status=0x%x pthread=%d(%s) reserve=0x%lx commit=0x%lx "
+                "creator pid=%04x tid=%04x peb=%p; task threads %d\n",
+             step ? step : "?", (unsigned)status, err, err ? strerror( err ) : "-",
+             (unsigned long)reserve, (unsigned long)commit,
+             (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ),
+             (unsigned)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ), NtCurrentTeb()->Peb, threads );
+}
+
 NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE_T commit_size )
 {
     struct ntdll_thread_data *thread_data = (struct ntdll_thread_data *)&teb->GdiTebBatch;
@@ -1386,6 +1422,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     NTSTATUS status;
 
     /* kernel stack */
+    ios_its_step = "kernel stack";
     if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, kernel_stack_size, kernel_stack_size, FALSE )))
         return status;
     thread_data->kernel_stack = stack.DeallocationStack;
@@ -1409,6 +1446,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
             ((get_machine_context_size( wow_machine ) + 7) & ~7) + sizeof(ULONG64);
 
         /* 64-bit stack */
+        ios_its_step = "WoW64 64-bit stack";
         if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, 0x40000, 0x40000, TRUE ))) return status;
         cpu = (WOW64_CPURESERVED *)(((ULONG_PTR)stack.StackBase - cpusize) & ~15);
         cpu->Machine = wow_machine;
@@ -1433,6 +1471,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
          * non-LAA program's own stack above 0x80000000. */
         if (!limit && ios_wow_base()) limit = limit_2g - 1;
 #endif
+        ios_its_step = "WoW64 32-bit stack";
         if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
             return status;
         wow_teb->Tib.StackBase = ios_wow_guest_addr( stack.StackBase );
@@ -1459,6 +1498,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
         const SIZE_T chpev2_stack_size = 0x40000;
 
         /* emulator stack */
+        ios_its_step = "emulator stack";
         if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, chpev2_stack_size, chpev2_stack_size, FALSE )))
             return status;
 
@@ -1479,6 +1519,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
 #endif
 
     /* native stack */
+    ios_its_step = "stack";
     if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
         return status;
     teb->Tib.StackBase = stack.StackBase;
@@ -1561,7 +1602,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     struct object_attributes *objattr;
     struct ntdll_thread_data *thread_data;
     DWORD tid = 0;
-    int request_pipe[2];
+    int request_pipe[2], pthread_err;
     TEB *teb;
     WOW_TEB *wow_teb;
     unsigned int status;
@@ -1702,10 +1743,16 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
 
     pthread_sigmask( SIG_BLOCK, &server_block_set, &sigset );
 
-    if ((status = virtual_alloc_teb( &teb ))) goto done;
+    if ((status = virtual_alloc_teb( &teb )))
+    {
+        ios_note_thread_create_failure( "TEB", status, 0, stack_reserve, stack_commit );
+        goto done;
+    }
 
+    ios_its_step = NULL;
     if ((status = init_thread_stack( teb, get_zero_bits_limit( zero_bits ), stack_reserve, stack_commit )))
     {
+        ios_note_thread_create_failure( ios_its_step, status, 0, stack_reserve, stack_commit );
         virtual_free_teb( teb );
         goto done;
     }
@@ -1731,11 +1778,12 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
     pthread_attr_setguardsize( &pthread_attr, 0 );
     pthread_attr_setscope( &pthread_attr, PTHREAD_SCOPE_SYSTEM ); /* force creating a kernel thread */
     InterlockedIncrement( &nb_threads );
-    if (pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, teb ))
+    if ((pthread_err = pthread_create( &pthread_id, &pthread_attr, (void * (*)(void *))start_thread, teb )))
     {
         InterlockedDecrement( &nb_threads );
         virtual_free_teb( teb );
         status = STATUS_NO_MEMORY;
+        ios_note_thread_create_failure( "pthread_create", status, pthread_err, stack_reserve, stack_commit );
     }
     pthread_attr_destroy( &pthread_attr );
 

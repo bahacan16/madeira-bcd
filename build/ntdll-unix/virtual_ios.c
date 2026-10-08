@@ -18995,13 +18995,20 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
                 {
                 static unsigned long vs_storm;
-                static unsigned vs_fails;
+                static unsigned vs_fails, vs_relaxed;
                 /* ml366: FAILED must never be storm-gated — ml365's mmdevapi
                  * c0000017 loads left NO [va-scan] evidence because boot-time
                  * SLOW lines had already spent this site's storm budget. A
                  * failure is the one verdict worth a line every time (own
-                 * generous cap so a retry loop cannot flood the log). */
-                if (ptr ? ios_storm_gate( &vs_storm ) : (vs_fails++ < 256))
+                 * generous cap so a retry loop cannot flood the log).
+                 * madeira-bcd: a failure the unclamped retry absorbs gets its
+                 * own smaller budget (64, then every 1024th): in GTA V
+                 * Enhanced (log 2026-10-08 16:38:52, build 455) 256 of them
+                 * had spent the cap 7 minutes into the session, so nothing
+                 * could be seen when the Social Club helper failed to create
+                 * a thread 6 minutes later. */
+                if (ptr ? ios_storm_gate( &vs_storm )
+                        : ceiling_relaxable ? (++vs_relaxed <= 64 || !(vs_relaxed % 1024)) : (vs_fails++ < 256))
                 dprintf( 2, "[va-scan] %s window=%p..%p size=%p align=%p %s tries=%u skips=%u"
                             " | seen=%p..%p views=%u maxgap=%p tailgap=%p stop=%s"
                             " | firstfail=%p errno=%d(%s) %s%s\n",
