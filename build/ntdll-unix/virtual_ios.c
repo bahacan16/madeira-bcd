@@ -5498,18 +5498,47 @@ static uintptr_t ios_aux_adrp_page( uintptr_t pc, uint32_t insn )
     return (pc & ~(uintptr_t)0xFFF) + (uintptr_t)(imm << 12);
 }
 
-/* index of the mapping whose JIT copy holds `rx`, or of the PE image holding
- * `pe` (when rx is 0), or -1 */
-static int ios_aux_find_mapping( uintptr_t rx, uintptr_t pe )
+/* index of the one live mapping whose JIT copy holds `rx` (-1 when none, or
+ * when a stale entry left by an unload still claims the range too) */
+static int ios_aux_find_copy( uintptr_t rx )
+{
+    int i, found = -1;
+    for (i = 0; i < ios_jit_mapping_count; i++)
+    {
+        uintptr_t b = (uintptr_t)ios_jit_mappings[i].jit_base;
+        size_t sz = ios_jit_mappings[i].size;
+        if (!b || !sz || !ios_jit_mappings[i].pe_base || rx < b || rx >= b + sz) continue;
+        if (found >= 0) return -1;
+        found = i;
+    }
+    return found;
+}
+
+/* index of a live mapping whose PE image holds `pe`, or -1 */
+static int ios_aux_find_pe( uintptr_t pe )
 {
     int i;
     for (i = 0; i < ios_jit_mapping_count; i++)
     {
-        uintptr_t b = rx ? (uintptr_t)ios_jit_mappings[i].jit_base : (uintptr_t)ios_jit_mappings[i].pe_base;
-        uintptr_t a = rx ? rx : pe;
-        if (b && a >= b && a < b + ios_jit_mappings[i].size) return i;
+        uintptr_t b = (uintptr_t)ios_jit_mappings[i].pe_base;
+        size_t sz = ios_jit_mappings[i].size;
+        if (b && sz && pe >= b && pe < b + sz) return i;
     }
     return -1;
+}
+
+/* `len` bytes at `addr` through the fault-safe reader (an image may have gone
+ * away under a table entry the unload never cleared); 0 on success */
+static int ios_aux_safe_read( uintptr_t addr, void *out, size_t len )
+{
+    unsigned char buf[24];
+    uintptr_t a = addr & ~(uintptr_t)7;
+    size_t pre = addr - a, w;
+    if (len + pre > sizeof(buf)) return -1;
+    for (w = 0; w < pre + len; w += 8)
+        if (ios_safe_read64( (uint64_t)(a + w), (uint64_t *)(buf + w) )) return -1;
+    memcpy( out, buf + pre, len );
+    return 0;
 }
 
 int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, uintptr_t jit_pc )
@@ -5518,16 +5547,18 @@ int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, ui
     static volatile int healed;
     uintptr_t rx = (uintptr_t)ios_jit_rx_base_global, rw = (uintptr_t)ios_jit_rw_base_global;
     size_t pool = ios_jit_pool_size_global;
-    uintptr_t call, stub, cont, slot, main_slot, jb, end, pe_cont, text_lo, text_hi;
-    uint32_t bl, s0, s1, s2, c0, c1;
+    uintptr_t call, stub, cont, slot, main_slot, jb, end, pe_cont, text_lo, text_hi, pe;
+    uint32_t bl, s0, s1, s2, c0, c1, lfanew, iat_rva, iat_size, rva;
+    uint16_t magic;
     uint64_t cur, value;
+    unsigned char thunk[14];
     int i, k, n;
 
     if (!ios_aux_heal_enabled() || !rx || !rw || !pool || !thread_peb) return 0;
     if ((lr & 3) || lr < rx + 4 || lr >= rx + pool) return 0;
     if (jit_pc < rx || jit_pc >= rx + pool) return 0;
     call = lr - 4;
-    if ((i = ios_aux_find_mapping( call, 0 )) < 0) return 0;
+    if ((i = ios_aux_find_copy( call )) < 0) return 0;
     /* the caller's copy must be this process's alone */
     if (ios_jit_mappings[i].owner_peb)
     {
@@ -5537,13 +5568,16 @@ int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, ui
     {
         if (ios_jit_mappings[i].map_peb != thread_peb) return 0;
         for (k = 0; k < ios_jit_mapping_count; k++)
-            if (k != i && ios_jit_mappings[k].pe_base == ios_jit_mappings[i].pe_base) return 0;
+            if (k != i && ios_jit_mappings[k].size && ios_jit_mappings[k].pe_base == ios_jit_mappings[i].pe_base) return 0;
     }
     jb = (uintptr_t)ios_jit_mappings[i].jit_base;
     end = jb + ios_jit_mappings[i].size;
+    pe = (uintptr_t)ios_jit_mappings[i].pe_base;
     text_lo = jb + ios_jit_mappings[i].text_offset;
     text_hi = text_lo + ios_jit_mappings[i].text_size;
+    if (end > rx + pool) return 0;
 
+    /* the call, its stub and the stub's continuation: pool memory, always mapped */
     bl = *(volatile uint32_t *)call;
     if ((bl & 0xFC000000u) != 0x94000000u) return 0;                     /* BL imm26 */
     stub = call + (uintptr_t)((intptr_t)((int32_t)(bl << 6) >> 6) * 4);
@@ -5564,33 +5598,31 @@ int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, ui
     if ((slot & 7) || slot < jb || slot + 8 > end) return 0;
     if ((main_slot & 7) || main_slot < jb || main_slot + 8 > end) return 0;
     if (ios_jit_mappings[i].text_size && slot + 8 > text_lo && slot < text_hi) return 0;
+
     /* a static import: the main slot is in the image's IAT directory (a delay-load
-     * slot, whose DLL may be unloaded again, is not) */
-    {
-        const unsigned char *pe = ios_jit_mappings[i].pe_base;
-        uint32_t lfanew, iat_rva, iat_size, rva = (uint32_t)(main_slot - jb);
-        memcpy( &lfanew, pe + 0x3c, 4 );
-        if (lfanew < 0x40 || lfanew > 0x1000 || memcmp( pe + lfanew, "PE\0\0", 4 )) return 0;
-        if (*(const uint16_t *)(pe + lfanew + 24) != 0x20b) return 0;                 /* PE32+ */
-        memcpy( &iat_rva, pe + lfanew + 24 + 112 + 8 * 12, 4 );                     /* DataDirectory[IAT] */
-        memcpy( &iat_size, pe + lfanew + 24 + 112 + 8 * 12 + 4, 4 );
-        if (rva < iat_rva || rva + 8 > (uint64_t)iat_rva + iat_size) return 0;
-    }
+     * slot, whose DLL may be unloaded again, is not); headers read fault-safely */
+    if (ios_aux_safe_read( pe + 0x3c, &lfanew, 4 ) || lfanew < 0x40 || lfanew > 0x1000) return 0;
+    if (ios_aux_safe_read( pe + lfanew, &rva, 4 ) || rva != 0x00004550u) return 0;          /* "PE\0\0" */
+    if (ios_aux_safe_read( pe + lfanew + 24, &magic, 2 ) || magic != 0x20b) return 0;       /* PE32+ */
+    if (ios_aux_safe_read( pe + lfanew + 24 + 112 + 8 * 12, &iat_rva, 4 )) return 0;        /* DataDirectory[IAT] */
+    if (ios_aux_safe_read( pe + lfanew + 24 + 112 + 8 * 12 + 4, &iat_size, 4 )) return 0;
+    rva = (uint32_t)(main_slot - jb);
+    if (rva < iat_rva || (uint64_t)rva + 8 > (uint64_t)iat_rva + iat_size) return 0;
 
     /* still the default: the continuation, as a copy or a PE address */
     cur = *(volatile uint64_t *)slot;
-    pe_cont = (uintptr_t)ios_jit_mappings[i].pe_base + (cont - jb);
+    pe_cont = pe + (cont - jb);
     if (cur != cont && cur != pe_cont) return 0;
 
     /* the continuation's main IAT value is the target, or a thunk to exactly it */
     value = *(volatile uint64_t *)main_slot;
     if (value != fault_pc)
     {
-        int t = ios_aux_find_mapping( 0, (uintptr_t)value );
         int32_t rel;
-        if (t < 0 || (uintptr_t)value + 14 > (uintptr_t)ios_jit_mappings[t].pe_base + ios_jit_mappings[t].size) return 0;
-        if (memcmp( (const void *)(uintptr_t)value, ffs, sizeof(ffs) )) return 0;
-        memcpy( &rel, (const unsigned char *)(uintptr_t)value + 10, 4 );
+        if (ios_aux_find_pe( (uintptr_t)value ) < 0) return 0;
+        if (ios_aux_safe_read( (uintptr_t)value, thunk, sizeof(thunk) )) return 0;
+        if (memcmp( thunk, ffs, sizeof(ffs) )) return 0;
+        memcpy( &rel, thunk + 10, 4 );
         if ((uintptr_t)value + 14 + (intptr_t)rel != fault_pc) return 0;
     }
     /* exactly where the redirect sends this process */
@@ -5598,17 +5630,12 @@ int ios_jit_heal_aux_iat( uintptr_t fault_pc, uintptr_t lr, void *thread_peb, ui
 
     __atomic_store_n( (uint64_t *)(rw + (slot - rx)), (uint64_t)jit_pc, __ATOMIC_RELEASE );
     n = __sync_add_and_fetch( &healed, 1 );
+    /* dprintf: this runs on the exception thread, which must not wait on stdio */
     if (n <= 32 || !(n % 256))
-    {
-        int t = ios_aux_find_mapping( jit_pc, 0 );
-        fprintf( stderr, "[aux-iat-heal] #%d %s+0x%lx calls %s+0x%lx: AuxiliaryIAT slot +0x%lx now holds %p "
-                 "(was the check_icall continuation) peb=%p (MADEIRA_AUX_IAT_HEAL=0 disables)\n",
-                 n, ios_pe_module_name( ios_jit_mappings[i].pe_base, ios_jit_mappings[i].size ),
-                 (unsigned long)(call - jb),
-                 t >= 0 ? ios_pe_module_name( ios_jit_mappings[t].pe_base, ios_jit_mappings[t].size ) : "?",
-                 t >= 0 ? (unsigned long)(jit_pc - (uintptr_t)ios_jit_mappings[t].jit_base) : 0ul,
+        dprintf( STDERR_FILENO, "[aux-iat-heal] #%d image %p (copy %p) +0x%lx calls %p: AuxiliaryIAT slot +0x%lx "
+                 "now holds the copy %p, was the check_icall continuation; peb=%p (MADEIRA_AUX_IAT_HEAL=0 disables)\n",
+                 n, (void *)pe, (void *)jb, (unsigned long)(call - jb), (void *)fault_pc,
                  (unsigned long)(slot - jb), (void *)jit_pc, thread_peb );
-    }
     return 1;
 }
 /* madeira-bcd: aux-IAT heal (end) */

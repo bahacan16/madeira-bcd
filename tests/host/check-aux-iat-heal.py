@@ -88,7 +88,14 @@ static struct ios_jit_mapping ios_jit_mappings[8];
 static int ios_jit_mapping_count;
 static void *ios_jit_rx_base_global, *ios_jit_rw_base_global;
 static size_t ios_jit_pool_size_global;
-static const char *ios_pe_module_name( const void *b, size_t s ) { (void)s; return b == (void *)PE_K32 ? "kernel32.dll" : "ntdll.dll"; }
+#include <sys/uio.h>
+/* fault-safe like the production mach_vm_read_overwrite reader */
+static int ios_safe_read64( uint64_t addr, uint64_t *out )
+{
+    struct iovec l = { out, 8 }, r = { (void *)(uintptr_t)addr, 8 };
+    if (addr < 0x1000 || (addr & 7)) return -1;
+    return process_vm_readv( getpid(), &l, 1, &r, 1, 0 ) == 8 ? 0 : -1;
+}
 ''' + translate + heal + r'''
 #define POOL_SIZE 0x400000ul
 static unsigned char *rx_view, *rw_view;
@@ -180,6 +187,14 @@ int main( int argc, char **argv )
     CHECK( !ios_jit_heal_aux_iat( qpc, K32_COPY + 0x25748, PEB_A, NTD_COPY + 0x71aac ) );
     reset( k32, ntd, 1 );                                                                   /* redirect target is not the process's copy */
     CHECK( !ios_jit_heal_aux_iat( qpc, K32_COPY + 0x25750, PEB_A, NTD_COPY + 0x71ab0 ) );
+    CHECK( rd64( K32_COPY + 0x6d0e0 ) == K32_COPY + 0x2b300 );
+    reset( k32, ntd, 1 );                                                                   /* a stale entry still claims the copy range */
+    ios_jit_mappings[2] = ios_jit_mappings[0]; ios_jit_mappings[2].pe_base = (void *)(PE_NTD + NTD_SIZE_ALIGNED * 4);
+    ios_jit_mapping_count = 3;
+    CHECK( !ios_jit_heal_aux_iat( qpc, K32_COPY + 0x25750, PEB_A, NTD_COPY + 0x71aac ) );
+    reset( k32, ntd, 1 );                                                                   /* the caller's image is gone (unmapped PE) */
+    ios_jit_mappings[0].pe_base = (void *)(PE_NTD + NTD_SIZE_ALIGNED * 4);
+    CHECK( !ios_jit_heal_aux_iat( qpc, K32_COPY + 0x25750, PEB_A, NTD_COPY + 0x71aac ) );
     CHECK( rd64( K32_COPY + 0x6d0e0 ) == K32_COPY + 0x2b300 );
     reset( k32, ntd, 1 );                                                                   /* main slot outside the IAT directory */
     {
