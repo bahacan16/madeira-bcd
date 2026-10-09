@@ -349,7 +349,7 @@ check(file(rdr2) == R.rdr2Steam.fileText, "first sight writes the list")
 check(red.fastSync == true && red.semaphoreFastPath == false && red.display == nil && red.fpsMode == 1, "first sight's entry fields")
 check(red.resolution == "1568x720", "this screen's shape at 720 lines")
 check(!LibraryPrefs.avx(rdr2) && !LibraryPrefs.nvidia(rdr2) && !LibraryPrefs.wineVCRT(rdr2), "first sight's switches")
-check(mark(rdr2)?.hasPrefix("rdr2-steam#5#") == true, "what was written is recorded")
+check(mark(rdr2)?.hasPrefix("rdr2-steam#\(R.rdr2Steam.version)#") == true, "what was written is recorded")
 check(!R.prepare(&red) && file(rdr2) == R.rdr2Steam.fileText, "once")
 GameProfile(windowsPath: rdr2).text = R.rdr2Steam.fileText + "fence-chain = 1\n"
 check(!R.prepare(&red) && file(rdr2).hasSuffix("fence-chain = 1\n"), "a changed config is the player's")
@@ -447,7 +447,7 @@ LibraryModel.shared.entries = [LibraryEntry(title: "God of War", windowsPath: go
 check(R.reset(windowsPath: gowHome, title: "God of War")?.id == "god-of-war" && file(gowHome) == R.godOfWar.fileText
       && LibraryModel.shared.entries[0].resolution == "1920x1080" && LibraryModel.shared.entries[0].config == nil,
       "a home screen Reset reaches the library entry for the same program")
-check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v4 written (first sight)") }, "log line")
+check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v\(R.rdr2Steam.version) written (first sight)") }, "log line")
 UserDefaults.standard.removeObject(forKey: key)
 print("PASS: the home screen shares the files and records; Safe thread sync and Screen size take the list's values")
 '''
