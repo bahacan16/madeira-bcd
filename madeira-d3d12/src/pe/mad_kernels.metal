@@ -40,3 +40,41 @@ kernel void mad_probe_words(device const uint *src [[buffer(0)]],
     if (i < n)
         dst[i] = src[i];
 }
+
+// madeira-bcd clear-rects: ClearRenderTargetView / ClearDepthStencilView with
+// rectangles, as DXMT's D3D11 ClearView does them: one triangle over the whole
+// target per rectangle, cut by the scissor, one instance per array layer. The
+// value is fragment buffer 0 (x is the depth); a stencil value comes from the
+// depth-stencil state's reference. The build compiles the file again
+// without them (-DMAD_NO_CLEAR_RECTS) if they do not compile, so the
+// kernels above never depend on them.
+#ifndef MAD_NO_CLEAR_RECTS
+struct mad_clear_out {
+    float4 position [[position]];
+    uint layer [[render_target_array_index]];
+};
+
+vertex mad_clear_out mad_clear_vs(ushort id [[vertex_id]], ushort inst [[instance_id]])
+{
+    mad_clear_out o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.position = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.layer = inst;
+    return o;
+}
+
+fragment float4 mad_clear_fs_float(constant float4 &v [[buffer(0)]]) { return v; }
+fragment uint4 mad_clear_fs_uint(constant float4 &v [[buffer(0)]]) { return (uint4)v; }
+fragment int4 mad_clear_fs_sint(constant float4 &v [[buffer(0)]]) { return (int4)v; }
+
+struct mad_clear_depth_out {
+    float depth [[depth(any)]];
+};
+
+fragment mad_clear_depth_out mad_clear_fs_depth(constant float4 &v [[buffer(0)]])
+{
+    mad_clear_depth_out o;
+    o.depth = v.x;
+    return o;
+}
+#endif

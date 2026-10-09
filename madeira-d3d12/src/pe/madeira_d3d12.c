@@ -430,6 +430,10 @@ struct mad_device {
     struct { UINT32 value[4]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 16-byte period) */
     obj_handle_t k_lib, k_tind_pso, k_ring; UINT64 k_ring_pos; int k_state; SRWLOCK k_lock;   /* madeira-bcd: helper kernels (mad_kernels.metal) */
     obj_handle_t k_probe_pso; unsigned char *k_ring_cpu;   /* madeira-bcd: indirect-argument probes */
+    /* madeira-bcd clear-rects: the helper library's clear functions (vertex; fragment
+     * float, uint, sint, depth), pipelines by target format, depth-stencil states by flags */
+    obj_handle_t clr_vs, clr_fs[4], clr_dss[4]; int clr_state; SRWLOCK clr_lock;
+    struct { UINT64 key; obj_handle_t pso; } clr_pso[32]; unsigned nclr_pso;
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
     LUID adapter_luid;   /* madeira-bcd: GetAdapterLuid, the DXGI adapter it was created on */
 };
@@ -472,6 +476,8 @@ static volatile LONG64 g_reserved_live_bytes; static volatile LONG g_reserved_li
 static volatile LONG64 g_sa_tex_bytes, g_sa_tex_logical, g_mheap_bytes; static volatile LONG g_sa_tex_n, g_ring_chunks;
 static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
+static int g_lzlib = -1;   /* madeira-bcd pso-lazy-libs, see mad_lzlib_on */
+static volatile LONG g_lzlib_dropped, g_lzlib_kept, g_lzlib_restored, g_lzlib_failed;
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
@@ -742,6 +748,10 @@ static void mad_acct_report(void) {
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
     d3d12_log("[madeira-d3d12] ml1060 shader libraries created: %ld, %lld MB of metallib (one per pipeline STAGE, never shared "
               "between pipelines)\n", g_lib_count, (long long)(g_lib_bytes >> 20));
+    if (g_lzlib > 0)   /* madeira-bcd pso-lazy-libs */
+        d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines let their libraries go at creation (%ld kept them), %ld read "
+                  "them back at first use (%ld failed)\n", (long)g_lzlib_dropped, (long)g_lzlib_kept, (long)g_lzlib_restored,
+                  (long)g_lzlib_failed);
 }
 static void mad_smpdesc_put(UINT64 id, UINT filter, UINT au, UINT av, UINT aw, UINT aniso, UINT cmp, UINT border,
                             float minlod, float maxlod, float bias) {   /* madeira-bcd: see g_smpdesc */
@@ -920,6 +930,10 @@ struct mad_pso {
     UINT64 cs_hash; UINT cs_len;   /* madeira-bcd: FNV-1a of the CS bytecode, for GPU fault reports */
     LONG first_used; LONG64 born_present; DWORD born_tick;   /* madeira-bcd: pso-first-use */
     SRWLOCK rlock;                 /* madeira-bcd: serialises this pipeline's lazy build (zero = SRWLOCK_INIT) */
+    /* madeira-bcd pso-lazy-libs: lz = the stage libraries were dropped once the
+     * pipeline was created and come back from the shader cache under these keys
+     * at its first draw (mad_lzlib_restore); lz_has_ps never changes after creation */
+    int lz, lz_has_ps; UINT64 lz_vs_key[2], lz_ps_key[2];
     char vs_name[64], ps_name[64];                  /* ml879: for the draw dump */
     char blend[400];                                /* ml1106/ml1107: every RT's blend state for the draw dump */
     UINT root_off[MAD_ROOT_PARAM_MAX]; int has_root_off; /* ml882: offsets from the converter's reflection */
@@ -1395,7 +1409,8 @@ struct mad_cmd {
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
         struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*) */
-        struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared */
+        struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v;
+                 UINT nrect, rect_at; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared; madeira-bcd clear-rects: rectangles in cdata */
         struct { UINT vcount, icount, vstart, istart; } draw;
         struct { UINT icount, inst, start; INT base; UINT istart; } drawi;
         struct { struct mad_resource *dst, *src; UINT64 doff, soff, len; } bb;
@@ -4409,6 +4424,260 @@ static UINT64 mad_kring_alloc(struct mad_device *d, UINT64 bytes) {
     ReleaseSRWLockExclusive(&d->k_lock);
     return off;
 }
+
+/* madeira-bcd clear-rects (madeira.cfg or the game's own file, off by default).
+ * ClearRenderTargetView and ClearDepthStencilView take rectangles, and only
+ * those are to be cleared; this runtime cleared the whole view (a load action
+ * has no rectangle). Horizon Zero Dawn (build 480, 2026-10-09 20:37) began to
+ * pass rectangles with its first gameplay frames -- once a frame for a depth
+ * view, and for a render target -- and its image was badly corrupted from then
+ * on. With the switch, a clear whose rectangles do not cover the view gets a
+ * pass of its own, as DXMT's D3D11 ClearView does: the target loaded and
+ * stored, and per rectangle a triangle over the whole target cut by the
+ * scissor, drawn with the helper library's clear functions (mad_kernels.metal);
+ * a depth value comes from the fragment function, a stencil value from a
+ * replace-always stencil state's reference. A rectangle that covers the view
+ * keeps the old load-action clear; rectangles all outside the view clear
+ * nothing. Without the helper library (a local build) the whole view is
+ * cleared, as before. */
+static int g_clear_rects = -1;
+static volatile LONG g_crect_passes, g_crect_rects, g_crect_fallback, g_crect_empty;
+static int mad_clear_rects_on(void) {
+    if (g_clear_rects < 0) {
+        g_clear_rects = mad_cfg_int_pe("clear-rects", 0) ? 1 : 0;   /* madeira.cfg clear-rects = 1 */
+        if (g_clear_rects)
+            d3d12_log("[madeira-d3d12] clear-rects = 1: render-target and depth-stencil clears with rectangles clear only "
+                      "those rectangles\n");
+    }
+    return g_clear_rects;
+}
+/* 0 = a float/unorm/snorm target, 1 = uint, 2 = sint: the clear fragment it takes. */
+static int mad_pf_int_kind(enum WMTPixelFormat pf) {
+    switch (pf) {
+    case WMTPixelFormatR8Uint: case WMTPixelFormatR16Uint: case WMTPixelFormatRG8Uint: case WMTPixelFormatR32Uint:
+    case WMTPixelFormatRG16Uint: case WMTPixelFormatRGBA8Uint: case WMTPixelFormatRGB10A2Uint: case WMTPixelFormatRG32Uint:
+    case WMTPixelFormatRGBA16Uint: case WMTPixelFormatRGBA32Uint:
+        return 1;
+    case WMTPixelFormatR8Sint: case WMTPixelFormatR16Sint: case WMTPixelFormatRG8Sint: case WMTPixelFormatR32Sint:
+    case WMTPixelFormatRG16Sint: case WMTPixelFormatRGBA8Sint: case WMTPixelFormatRG32Sint: case WMTPixelFormatRGBA16Sint:
+    case WMTPixelFormatRGBA32Sint:
+        return 2;
+    default:
+        return 0;
+    }
+}
+/* At record time: 0 = clear the whole view (no rectangles, the switch off, or a
+ * rectangle that covers the view), -1 = clear nothing (every rectangle empty or
+ * outside the view), else the number of rectangles stored in the list's words
+ * at *at, each x0, y0, x1, y1 clipped to the view. */
+static int mad_clear_rects_record(struct mad_list *l, const struct mad_resource *r, const struct mad_rtvp *v,
+                                  UINT n, const D3D12_RECT *rects, int is_depth, UINT *at) {
+    static volatile LONG said;
+    UINT w, h, i, k = 0;
+    if (!n || !rects || !r || !mad_clear_rects_on()) return 0;
+    w = r->width >> v->level; h = r->height >> v->level;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    for (i = 0; i < n; i++)
+        if (rects[i].left <= 0 && rects[i].top <= 0 && rects[i].right >= (LONG)w && rects[i].bottom >= (LONG)h) return 0;
+    if (!mad_grow((void **)&l->cdata, &l->cdcap, l->ncdata + n * 4, sizeof *l->cdata)) return 0;
+    *at = l->ncdata;
+    for (i = 0; i < n; i++) {
+        LONG x0 = rects[i].left < 0 ? 0 : rects[i].left, y0 = rects[i].top < 0 ? 0 : rects[i].top;
+        LONG x1 = rects[i].right > (LONG)w ? (LONG)w : rects[i].right, y1 = rects[i].bottom > (LONG)h ? (LONG)h : rects[i].bottom;
+        UINT32 *q = &l->cdata[*at + k * 4];
+        if (x1 <= x0 || y1 <= y0) continue;
+        q[0] = (UINT32)x0; q[1] = (UINT32)y0; q[2] = (UINT32)x1; q[3] = (UINT32)y1;
+        k++;
+    }
+    if (InterlockedIncrement(&said) <= 24)
+        d3d12_log("[madeira-d3d12] clear-rects: %s r#%u %ux%u (view %ux%u, level %u, %u layers): %u of %u rectangle(s) inside, "
+                  "first %ld,%ld-%ld,%ld\n", is_depth ? "depth-stencil" : "render target", r->serial, r->width, r->height, w, h,
+                  v->level, v->layers ? v->layers : 1, k, n, (long)rects[0].left, (long)rects[0].top, (long)rects[0].right,
+                  (long)rects[0].bottom);
+    if (!k) { InterlockedIncrement(&g_crect_empty); return -1; }
+    l->ncdata += k * 4;
+    return (int)k;
+}
+/* The pipeline that clears a target of r's format and sample count (0: none). */
+static obj_handle_t mad_clear_pso(struct mad_device *d, const struct mad_resource *r, int is_depth) {
+    UINT samples = r->samples ? r->samples : 1;
+    UINT64 key = ((UINT64)r->tex_pf << 16) | ((UINT64)samples << 4) | (is_depth ? 2u : 0u) | (r->has_stencil ? 1u : 0u);
+    obj_handle_t pso = 0, err = 0;
+    unsigned i;
+    mad_kernels_ready(d);   /* loads the helper library */
+    AcquireSRWLockExclusive(&d->clr_lock);
+    if (!d->clr_state) {
+        d->clr_state = -1;
+        if (d->k_lib && (d->clr_vs = MTLLibrary_newFunction(d->k_lib, "mad_clear_vs"))) {
+            d->clr_fs[0] = MTLLibrary_newFunction(d->k_lib, "mad_clear_fs_float");
+            d->clr_fs[1] = MTLLibrary_newFunction(d->k_lib, "mad_clear_fs_uint");
+            d->clr_fs[2] = MTLLibrary_newFunction(d->k_lib, "mad_clear_fs_sint");
+            d->clr_fs[3] = MTLLibrary_newFunction(d->k_lib, "mad_clear_fs_depth");
+            if (d->clr_fs[0] && d->clr_fs[1] && d->clr_fs[2] && d->clr_fs[3]) d->clr_state = 1;
+        }
+        d3d12_log("[madeira-d3d12] clear-rects: the helper library's clear functions are %s\n",
+                  d->clr_state > 0 ? "ready" : "NOT available; rectangle clears clear the whole view, as before");
+    }
+    if (d->clr_state > 0) {
+        for (i = 0; i < d->nclr_pso; i++) if (d->clr_pso[i].key == key) break;
+        if (i < d->nclr_pso) pso = d->clr_pso[i].pso;
+        else if (d->nclr_pso < 32) {
+            struct WMTRenderPipelineInfo rp;
+            memset(&rp, 0, sizeof rp);
+            rp.vertex_function = d->clr_vs;
+            rp.rasterization_enabled = true;
+            rp.raster_sample_count = (uint8_t)samples;
+            rp.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+            rp.max_tessellation_factor = 16;   /* Metal requires 1..64 even when unused */
+            rp.depth_pixel_format = WMTPixelFormatInvalid;
+            rp.stencil_pixel_format = WMTPixelFormatInvalid;
+            if (is_depth) {
+                rp.fragment_function = d->clr_fs[3];
+                rp.depth_pixel_format = r->tex_pf;
+                if (r->has_stencil) rp.stencil_pixel_format = r->tex_pf;
+            } else {
+                rp.fragment_function = d->clr_fs[mad_pf_int_kind(r->tex_pf)];
+                rp.colors[0].pixel_format = r->tex_pf;
+                rp.colors[0].write_mask = WMTColorWriteMaskAll;
+            }
+            pso = MTLDevice_newRenderPipelineState(d->mtl_device, &rp, &err);
+            if (err) mad_log_nserror("clear-rects pipeline", err);
+            d->clr_pso[d->nclr_pso].key = key; d->clr_pso[d->nclr_pso].pso = pso; d->nclr_pso++;   /* a refusal is remembered too */
+            d3d12_log("[madeira-d3d12] clear-rects: pipeline for format %u, %u sample(s)%s %s\n", (unsigned)r->tex_pf, samples,
+                      is_depth ? (r->has_stencil ? ", depth+stencil" : ", depth") : "", pso ? "built" : "REFUSED");
+        }
+    }
+    ReleaseSRWLockExclusive(&d->clr_lock);
+    return pso;
+}
+/* The depth-stencil state of a clear: flags = D3D12_CLEAR_FLAGS of the call. */
+static obj_handle_t mad_clear_dss(struct mad_device *d, UINT8 flags) {
+    obj_handle_t dss;
+    flags &= 3;
+    AcquireSRWLockExclusive(&d->clr_lock);
+    if (!d->clr_dss[flags]) {
+        struct WMTDepthStencilInfo dsi;
+        memset(&dsi, 0, sizeof dsi);
+        dsi.depth_compare_function = WMTCompareFunctionAlways;
+        dsi.depth_write_enabled = (flags & D3D12_CLEAR_FLAG_DEPTH) != 0;
+        if (flags & D3D12_CLEAR_FLAG_STENCIL) {
+            struct WMTStencilInfo s;
+            memset(&s, 0, sizeof s);
+            s.enabled = true;
+            s.depth_stencil_pass_op = s.stencil_fail_op = s.depth_fail_op = WMTStencilOperationReplace;
+            s.stencil_compare_function = WMTCompareFunctionAlways;
+            s.write_mask = 0xff; s.read_mask = 0xff;
+            dsi.front_stencil = s; dsi.back_stencil = s;
+        }
+        d->clr_dss[flags] = MTLDevice_newDepthStencilState(d->mtl_device, &dsi);
+    }
+    dss = d->clr_dss[flags];
+    ReleaseSRWLockExclusive(&d->clr_lock);
+    return dss;
+}
+/* At replay: the clear of c (nrect rectangles at rect_at in the list's words) as
+ * a pass of its own. An earlier whole clear of the same view still pending goes
+ * first. */
+static void exec_clear_rects(struct mad_exec *e, const struct mad_list *l, const struct mad_cmd *c) {
+    struct mad_resource *r = c->u.clear.res;
+    const struct mad_rtvp *v = &c->u.clear.v;
+    struct mad_device *d = e->q->device;
+    const int is_depth = c->kind == MC_CLEAR_DS;
+    struct WMTRenderPassInfo rpi;
+    struct wmtcmd_render_setpso c_pso;
+    struct wmtcmd_render_setviewport c_vp;
+    struct wmtcmd_render_setdsso c_dss;
+    struct wmtcmd_render_setbytes c_val;
+    struct wmtcmd_render_setscissorrect c_sc[16];
+    struct wmtcmd_render_draw c_draw[16];
+    obj_handle_t enc, pso, dss = 0;
+    UINT w, h, layers, done, batch, j;
+    UINT8 flags = c->u.clear.flags ? c->u.clear.flags : (UINT8)(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL);
+    float val[4];
+    int i;
+    LONG n;
+    if (!r || !r->texture) return;
+    pso = mad_clear_pso(d, r, is_depth);
+    if (pso && is_depth) dss = mad_clear_dss(d, flags);
+    if (!pso || (is_depth && !dss)) {   /* no clear functions: the whole view, as before */
+        InterlockedIncrement(&g_crect_fallback);
+        if (is_depth) exec_add_clear(e, r, v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags);
+        else exec_add_clear(e, r, v, c->u.clear.rgba, 0.0f, 0, 0, 0);
+        return;
+    }
+    if (e->renc) InterlockedIncrement(&g_pass_end_clear);
+    i = exec_pending_index(e, r, v);
+    if (i >= 0) exec_flush_clear(e, i);   /* an earlier whole clear of this view goes first */
+    exec_end(e);   /* nothing may stay open while this pass's encoder is made */
+    memset(&rpi, 0, sizeof rpi);
+    layers = v->layers > 1 ? v->layers : 1;
+    if (v->layers > 1) rpi.render_target_array_length = v->layers;
+    if (is_depth) {
+        rpi.depth.texture = r->texture;
+        rpi.depth.level = v->level; rpi.depth.slice = v->slice;
+        rpi.depth.load_action = WMTLoadActionLoad; rpi.depth.store_action = WMTStoreActionStore;
+        if (r->has_stencil) {
+            rpi.stencil.texture = r->texture;
+            rpi.stencil.level = v->level; rpi.stencil.slice = v->slice;
+            rpi.stencil.load_action = WMTLoadActionLoad; rpi.stencil.store_action = WMTStoreActionStore;
+        }
+    } else {
+        rpi.colors[0].texture = r->texture;
+        mad_attach_view(&rpi.colors[0], r, v);
+        rpi.colors[0].load_action = WMTLoadActionLoad; rpi.colors[0].store_action = WMTStoreActionStore;
+    }
+    w = r->width >> v->level; h = r->height >> v->level;
+    if (!w) w = 1;
+    if (!h) h = 1;
+    rpi.render_target_width = w; rpi.render_target_height = h;
+    rpi.default_raster_sample_count = r->samples ? r->samples : 1;
+    enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+    if (!enc) return;
+    e->f6_att[0] = r; e->f6_natt = 1;   /* ml1134: what this pass writes */
+    exec_fence_render(e, enc, 0);
+    /* the state: pipeline, the whole target as viewport, the depth-stencil state, the value */
+    if (is_depth) { val[0] = c->u.clear.depth; val[1] = val[2] = val[3] = 0.0f; }
+    else memcpy(val, c->u.clear.rgba, sizeof val);
+    memset(&c_pso, 0, sizeof c_pso); c_pso.type = WMTRenderCommandSetPSO; c_pso.pso = pso;
+    memset(&c_vp, 0, sizeof c_vp); c_vp.type = WMTRenderCommandSetViewport;
+    c_vp.viewport.originX = 0.0; c_vp.viewport.originY = 0.0; c_vp.viewport.width = (double)w; c_vp.viewport.height = (double)h;
+    c_vp.viewport.znear = 0.0; c_vp.viewport.zfar = 1.0;
+    memset(&c_val, 0, sizeof c_val); c_val.type = WMTRenderCommandSetFragmentBytes;
+    c_val.bytes.ptr = val; c_val.length = sizeof val; c_val.index = 0;
+    c_pso.next.ptr = &c_vp;
+    if (is_depth) {
+        memset(&c_dss, 0, sizeof c_dss); c_dss.type = WMTRenderCommandSetDSSO;
+        c_dss.dsso = dss; c_dss.stencil_ref = c->u.clear.stencil;
+        c_vp.next.ptr = &c_dss; c_dss.next.ptr = &c_val;
+    } else c_vp.next.ptr = &c_val;
+    MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&c_pso);
+    /* the rectangles, 16 to a call: scissor, then a triangle over the whole target per layer */
+    for (done = 0; done < c->u.clear.nrect; done += batch) {
+        batch = c->u.clear.nrect - done > 16 ? 16 : c->u.clear.nrect - done;
+        for (j = 0; j < batch; j++) {
+            const UINT32 *q = &l->cdata[c->u.clear.rect_at + (done + j) * 4];
+            memset(&c_sc[j], 0, sizeof c_sc[j]); c_sc[j].type = WMTRenderCommandSetScissorRect;
+            c_sc[j].scissor_rect.x = q[0]; c_sc[j].scissor_rect.y = q[1];
+            c_sc[j].scissor_rect.width = q[2] - q[0]; c_sc[j].scissor_rect.height = q[3] - q[1];
+            memset(&c_draw[j], 0, sizeof c_draw[j]); c_draw[j].type = WMTRenderCommandDraw;
+            c_draw[j].primitive_type = WMTPrimitiveTypeTriangle; c_draw[j].vertex_start = 0; c_draw[j].vertex_count = 3;
+            c_draw[j].instance_count = layers; c_draw[j].base_instance = 0;
+            c_sc[j].next.ptr = &c_draw[j];
+            c_draw[j].next.ptr = j + 1 < batch ? (void *)&c_sc[j + 1] : NULL;
+        }
+        MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&c_sc[0]);
+    }
+    exec_fence_render(e, enc, 1);
+    e->f6_natt = 0;
+    MTLCommandEncoder_endEncoding(enc);
+    InterlockedExchangeAdd(&g_crect_rects, (LONG)c->u.clear.nrect);
+    n = InterlockedIncrement(&g_crect_passes);
+    if (n <= 8 || !(n % 1000))
+        d3d12_log("[madeira-d3d12] clear-rects: %ld rectangle clears so far (%ld rectangles, %ld all outside the view, %ld whole-view "
+                  "fallbacks); this one r#%u %s, %u rectangle(s)\n", (long)n, (long)g_crect_rects, (long)g_crect_empty,
+                  (long)g_crect_fallback, r->serial, is_depth ? "depth-stencil" : "render target", c->u.clear.nrect);
+}
 static void mad_ts_draw(const struct mad_pso *p, UINT instances, UINT count, UINT16 index_type, UINT64 index_buffer,
                         struct mad_gs_drawinfo *di, struct WMTSize *grid, struct WMTSize *obj_tg, struct WMTSize *mesh_tg) {
     UINT overlap = p->dt.out_prim == 1 ? 0 : p->dt.out_prim == 2 ? 1 : 2;
@@ -4449,14 +4718,16 @@ static enum WMTPrimitiveType mad_prim(D3D12_PRIMITIVE_TOPOLOGY t) {
  * its descriptors and is built by the first draw that uses it; unused ones
  * never cost GPU memory. madeira.cfg pso-lazy = 0 restores eager creation. */
 static volatile LONG g_pso_lazy_built, g_pso_lazy_failed;
+static int mad_lzlib_restore(struct mad_pso *p);   /* madeira-bcd pso-lazy-libs */
 static obj_handle_t mad_pso_realize(struct mad_pso *p) {
     if (p->rps || !p->lazy) return p->rps;
     AcquireSRWLockExclusive(&p->rlock);   /* per pipeline: builds of different pipelines run in parallel */
     if (!p->rps && p->lazy) {
         obj_handle_t err = 0;
         LONG64 t0 = mad_qpc();   /* madeira-bcd */
-        p->rps = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
-                           : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
+        if (!p->lz || mad_lzlib_restore(p))   /* madeira-bcd pso-lazy-libs: the libraries come back first */
+            p->rps = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
+                               : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
         if (err) mad_log_nserror(p->vs_name, err);
         InterlockedExchangeAdd64(&g_pt_realize, mad_qpc() - t0); InterlockedIncrement(&g_pn_realize);
         if (p->rps) {
@@ -4480,8 +4751,10 @@ static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
     if (!p->cps && p->lazy_cs) {
         struct WMTComputePipelineInfo ci; obj_handle_t err = 0;
         memset(&ci, 0, sizeof ci);
-        ci.compute_function = p->vs_fn;
-        p->cps = MTLDevice_newComputePipelineState(p->device_handle, &ci, &err);
+        if (!p->lz || mad_lzlib_restore(p)) {   /* madeira-bcd pso-lazy-libs */
+            ci.compute_function = p->vs_fn;
+            p->cps = MTLDevice_newComputePipelineState(p->device_handle, &ci, &err);
+        }
         if (err) mad_log_nserror("compute pipeline", err);
         if (!p->cps) {
             LONG n = InterlockedIncrement(&g_pso_lazy_failed);
@@ -5935,7 +6208,7 @@ tess_go:
         UINT64 vcboff = 0, vargoff = 0, pcboff = 0, pargoff = 0, vbtoff = 0;
         if (!mad_air_build_tables(e, e->rs, e->root, (const UINT32 (*)[64])e->consts,
                                   e->pso, 0, &vcb, &vcboff, &varg, &vargoff)) { MAD_SKIP(e); return; }
-        if (e->pso->ps_fn &&
+        if ((e->pso->ps_fn || e->pso->lz_has_ps) &&   /* madeira-bcd pso-lazy-libs: lz_has_ps is set at creation, ps_fn by another thread's first draw */
             !mad_air_build_tables(e, e->rs, e->root, (const UINT32 (*)[64])e->consts,
                                   e->pso, 1, &pcb, &pcboff, &parg, &pargoff)) { MAD_SKIP(e); return; }
         if (!mad_air_build_vb_table(e, e->pso, &vbt, &vbtoff)) { MAD_SKIP(e); return; }
@@ -7205,8 +7478,14 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             memcpy(e.rt, c->u.rts.rt, sizeof e.rt); e.nrt = c->u.rts.n; e.depth = c->u.rts.depth;
             memcpy(e.rtp, c->u.rts.v, sizeof e.rtp); e.dp = c->u.rts.dv;   /* ml925 */
             break;
-        case MC_CLEAR_RT: exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, c->u.clear.rgba, 0.0f, 0, 0, 0); break;
-        case MC_CLEAR_DS: exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags); break;
+        case MC_CLEAR_RT:
+            if (c->u.clear.nrect) exec_clear_rects(&e, l, c);   /* madeira-bcd clear-rects */
+            else exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, c->u.clear.rgba, 0.0f, 0, 0, 0);
+            break;
+        case MC_CLEAR_DS:
+            if (c->u.clear.nrect) exec_clear_rects(&e, l, c);   /* madeira-bcd clear-rects */
+            else exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags);
+            break;
         case MC_ROOTSIG: e.rs = c->u.rootsig; break;
         case MC_ROOT_CONST:
             if (c->u.rconst.index < MAD_ROOT_PARAM_MAX && c->u.rconst.dst + c->u.rconst.n <= 64)
@@ -11963,6 +12242,11 @@ struct mad_convert_opts {
      * GS, gs_bc the VS). */
     UINT gs_stage, gs_strip;
     const void *gs_bc; SIZE_T gs_bc_len;
+    /* madeira-bcd pso-lazy-libs: set, the conversion's shader-cache key comes
+     * back here (ok = 1 when the cache file is there to be read again) and a new
+     * library is not entered in the shared-library table, so the pipeline can
+     * drop it (mad_lzlib_drop). */
+    struct mad_lzkey { UINT64 key[2]; int ok; } *lz;
 };
 static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_rootsig *rs,
                                       const void *dxil, SIZE_T dxil_len, const char *entry,
@@ -12165,6 +12449,11 @@ static void mad_sc_path(const UINT64 key[2], WCHAR *out, int mkdir) {
         (CreateDirectoryW(sub, NULL) || GetLastError() == ERROR_ALREADY_EXISTS))
         InterlockedOr(&g_sc_made[bucket >> 5], (LONG)(1u << (bucket & 31)));
     _snwprintf(out, MAX_PATH, L"%ls\\%016llx%016llx.msc", sub, (unsigned long long)key[0], (unsigned long long)key[1]);
+}
+static int mad_sc_exists(const UINT64 key[2]) {   /* madeira-bcd pso-lazy-libs: the entry can be read again */
+    WCHAR path[MAX_PATH];
+    mad_sc_path(key, path, 0);
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 static void mad_sc_stats(void) {
     LONG t = g_sc_hit + g_sc_miss;
@@ -12589,6 +12878,111 @@ static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_
         e->k0 = k0; e->k1 = k1; e->lib = lib; e->fn = fn; g_libshare_n++;
     }
     ReleaseSRWLockExclusive(&g_libshare_lock);
+}
+
+/* madeira-bcd pso-lazy-libs (madeira.cfg or the game's own file, off by
+ * default). Horizon Zero Dawn (build 480, 2026-10-09 20:28) created 52,570
+ * pipelines in its menu and drew ~1,500 of them in its first gameplay seconds,
+ * yet every one kept its converted Metal libraries for the whole session, and
+ * the shared-library table one more reference to each: 23,045 libraries,
+ * 432 MB of metallib, and the footprint grew ~32 KB with each new library until
+ * iOS killed the game at 8,189 MB two seconds into play. With the switch, a lazy
+ * pipeline (plain vertex/pixel or compute, built at its first draw or dispatch)
+ * lets its libraries go once it is created; they stay in the shader cache
+ * (%LOCALAPPDATA%\Madeira\ShaderCache, written when the stage was converted),
+ * and the first draw reads them back by key, shares an identical library a
+ * built pipeline already has, and builds the pipeline as before. A stage whose
+ * cache file is not there, or whose entry name would not fit the pipeline's
+ * name field, keeps its library as before. A pipeline whose file is gone by its
+ * first draw is skipped and counted, like any lazy pipeline Metal refuses. */
+static int mad_lzlib_on(void) {
+    if (g_lzlib < 0) {
+        g_lzlib = mad_cfg_int_pe("pso-lazy-libs", 0) ? 1 : 0;   /* madeira.cfg pso-lazy-libs = 1 */
+        if (g_lzlib)
+            d3d12_log("[madeira-d3d12] pso-lazy-libs = 1: a lazy pipeline's shader libraries are let go once it is created "
+                      "and read back from the shader cache at its first draw\n");
+    }
+    return g_lzlib;
+}
+/* The pipeline's stages may be dropped: each has a cache file and a name the
+ * pipeline holds whole. */
+static int mad_lzlib_can_drop(const struct mad_pso *p, const struct mad_lzkey *vs, const struct mad_lzkey *ps) {
+    int ok = p->vs_fn && vs->ok && strlen(p->vs_name) < sizeof p->vs_name - 1 &&
+             (!p->ps_fn || (ps && ps->ok && strlen(p->ps_name) < sizeof p->ps_name - 1));
+    if (!ok) InterlockedIncrement(&g_lzlib_kept);
+    return ok;
+}
+static void mad_lzlib_drop(struct mad_pso *p, const struct mad_lzkey *vs, const struct mad_lzkey *ps) {
+    LONG n;
+    p->lz_vs_key[0] = vs->key[0]; p->lz_vs_key[1] = vs->key[1];
+    p->lz_has_ps = p->ps_fn != 0;
+    if (p->lz_has_ps) { p->lz_ps_key[0] = ps->key[0]; p->lz_ps_key[1] = ps->key[1]; }
+    if (p->vs_fn) NSObject_release(p->vs_fn);
+    if (p->vs_lib) NSObject_release(p->vs_lib);
+    if (p->ps_fn) NSObject_release(p->ps_fn);
+    if (p->ps_lib) NSObject_release(p->ps_lib);
+    p->vs_fn = p->vs_lib = p->ps_fn = p->ps_lib = 0;
+    p->rp.vertex_function = p->rp.fragment_function = 0;
+    p->lz = 1;
+    n = InterlockedIncrement(&g_lzlib_dropped);
+    if (n == 1 || !(n % 5000))
+        d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines let their libraries go at creation (%ld kept them), "
+                  "%ld read them back at first use (%ld failed)\n", (long)n, (long)g_lzlib_kept, (long)g_lzlib_restored,
+                  (long)g_lzlib_failed);
+}
+/* One stage back from the cache: its own references to the library and the
+ * function, the table's if an identical library is already shared. */
+static int mad_lzlib_stage(struct mad_pso *p, const UINT64 key[2], const char *name, obj_handle_t *lib_out, obj_handle_t *fn_out) {
+    unsigned char *blob = NULL; SIZE_T size = 0;
+    struct mad_sc_hdr h;
+    obj_handle_t dd, err = 0, lib = 0, fn = 0;
+    UINT64 k0, k1;
+    *lib_out = 0; *fn_out = 0;
+    if (!mad_sc_read_file(key, &blob, &size)) return 0;
+    memcpy(&h, blob, sizeof h);
+    if (!(h.magic == MAD_SC_MAGIC && h.hdr_size == sizeof h && h.key[0] == key[0] && h.key[1] == key[1] &&
+          h.ret_status == MADEIRA_IR_OK && h.ret_len && h.ret_len <= (UINT64)size - sizeof h)) {
+        free(blob);
+        return 0;
+    }
+    mad_libshare_key(blob + sizeof h, (SIZE_T)h.ret_len, name, &k0, &k1);
+    if (mad_libshare_find(k0, k1, &lib, &fn)) { free(blob); *lib_out = lib; *fn_out = fn; return 1; }
+    dd = DispatchData_alloc_init((uint64_t)(uintptr_t)(blob + sizeof h), (uint64_t)h.ret_len);   /* copies the bytes */
+    if (dd) { lib = MTLDevice_newLibrary(p->device_handle, dd, &err); NSObject_release(dd); }
+    free(blob);
+    if (err) mad_log_nserror("library (pso-lazy-libs)", err);
+    if (!lib) return 0;
+    InterlockedExchangeAdd64(&g_lib_bytes, (LONG64)h.ret_len); InterlockedIncrement(&g_lib_count);   /* ml1060 */
+    fn = MTLLibrary_newFunction(lib, name);
+    if (!fn) { NSObject_release(lib); return 0; }
+    mad_libshare_add(k0, k1, lib, fn);
+    *lib_out = lib; *fn_out = fn;
+    return 1;
+}
+/* Called with p->rlock held, before the pipeline is built. */
+static int mad_lzlib_restore(struct mad_pso *p) {
+    obj_handle_t vl = 0, vf = 0, pl = 0, pf = 0;
+    LONG n;
+    if (!mad_lzlib_stage(p, p->lz_vs_key, p->vs_name, &vl, &vf) ||
+        (p->lz_has_ps && !mad_lzlib_stage(p, p->lz_ps_key, p->ps_name, &pl, &pf))) {
+        if (vf) NSObject_release(vf);
+        if (vl) NSObject_release(vl);
+        n = InterlockedIncrement(&g_lzlib_failed);
+        if (n <= 8)
+            d3d12_log("[madeira-d3d12] pso-lazy-libs: '%s'/'%s' could not be read back from the shader cache; "
+                      "the pipeline's %s are skipped\n", p->vs_name, p->lz_has_ps ? p->ps_name : "-",
+                      p->is_compute ? "dispatches" : "draws");
+        return 0;
+    }
+    p->vs_lib = vl; p->vs_fn = vf; p->ps_lib = pl; p->ps_fn = pf;
+    if (!p->is_compute) { p->rp.vertex_function = vf; p->rp.fragment_function = pf; }
+    p->lz = 0;
+    MemoryBarrier();   /* the functions are in place before the pipeline is published (mad_pso_for_strides reads p->rp) */
+    n = InterlockedIncrement(&g_lzlib_restored);
+    if (n == 1 || !(n % 500))
+        d3d12_log("[madeira-d3d12] pso-lazy-libs: %ld pipelines read their libraries back at first use (%ld failed; "
+                  "%ld let them go at creation)\n", (long)n, (long)g_lzlib_failed, (long)g_lzlib_dropped);
+    return 1;
 }
 
 /* madeira-bcd rsig-miss: the converter's code 4
@@ -13111,6 +13505,10 @@ again:
         }
     }
     if (switched) mad_unb_note(rs, tag, sized, 1);   /* madeira-bcd msc-unbounded-retry */
+    if (o && o->lz) {   /* madeira-bcd pso-lazy-libs: the key the first draw reads this stage back under */
+        o->lz->ok = 0;
+        if (mad_sc_init()) { mad_sc_key(&a, o->lz->key); o->lz->ok = mad_sc_exists(o->lz->key); }
+    }
     free(sized_ranges);   /* the conversion is done; nothing below reads a.ranges */
     mad_convert_note_time(t0, retried);
     if (o && o->air) {   /* ml1008 */
@@ -13228,7 +13626,7 @@ again:
             d3d12_log("[dxil-hex] end\n");
         }
     }
-    mad_libshare_add(share_k0, share_k1, lib, fn);
+    if (!(o && o->lz)) mad_libshare_add(share_k0, share_k1, lib, fn);   /* madeira-bcd pso-lazy-libs: the table would keep it */
     *lib_out = lib;
     free(buf);
     return fn;
@@ -13831,9 +14229,14 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
     unsigned nvsin = 0, i;
     int has_vd = 0, is_depth;
     static unsigned said_inputs, said_pso;
+    struct mad_lzkey lzv, lzp;   /* madeira-bcd pso-lazy-libs */
+    int lz_on;
     HRESULT hr;
     if (!desc || !out) return E_INVALIDARG;
     if (!desc->VS.pShaderBytecode) { d3d12_log("[madeira-d3d12] pipeline has no vertex shader\n"); return E_INVALIDARG; }
+    memset(&lzv, 0, sizeof lzv); memset(&lzp, 0, sizeof lzp);
+    lz_on = mad_lzlib_on() && mad_pso_lazy_on() && !desc->GS.pShaderBytecode && !desc->HS.pShaderBytecode &&
+            !desc->DS.pShaderBytecode;   /* a plain pipeline: built at its first draw */
     if (desc->GS.pShaderBytecode || desc->HS.pShaderBytecode || desc->DS.pShaderBytecode) {   /* ml926: stages this runtime cannot run yet */
         static unsigned said; if (said++ < 12)
             d3d12_log("[madeira-d3d12] pipeline carries %s%s%s (%u/%u/%u bytes) which this runtime DROPS; VS %u B, PS %u B\n",
@@ -13906,6 +14309,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         ov2.layout = LV->n ? LV : NULL;
         ov2.air = &air_vs;
         ov2.name_out = vsentry; ov2.name_cap = sizeof vsentry; vsentry[0] = 0;
+        if (lz_on) ov2.lz = &lzv;   /* madeira-bcd pso-lazy-libs */
         p->vs_fn = mad_convert_stage_opts(d, rs, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, NULL, &p->vs_lib, "VS",
                                      vsin, 32, &nvsin, NULL, locs, &nl, &ov2);
         free(LV);
@@ -13939,6 +14343,7 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
             memset(&op, 0, sizeof op); op.name_out = p->ps_name; op.name_cap = sizeof p->ps_name;   /* ml927b: per-call name */
             memset(&air_ps, 0, sizeof air_ps);
             op.air = &air_ps;   /* ml1011 */
+            if (lz_on) op.lz = &lzp;   /* madeira-bcd pso-lazy-libs */
             {   /* ml1023: what the pixel stage must be compiled against. */
                 UINT k, flags = 0, unorm = 0;
                 const D3D12_RENDER_TARGET_BLEND_DESC *b0 = &desc->BlendState.RenderTarget[0];
@@ -14309,6 +14714,9 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
                   desc->NumRenderTargets, (unsigned)desc->RTVFormats[0], (unsigned)desc->DSVFormat,
                   desc->InputLayout.NumElements, has_vd ? " (vertex descriptor)" : "", p->ps_fn ? "VS+PS" : "VS only");
     }
+    /* madeira-bcd pso-lazy-libs: built at its first draw, so its libraries can go
+     * until then (pso-warm, above, holds its own references to the functions) */
+    if (lz_on && p->lazy && !p->rps && mad_lzlib_can_drop(p, &lzv, &lzp)) mad_lzlib_drop(p, &lzv, &lzp);
     hr = pso_QI((ID3D12PipelineState *)p, riid, out);
     pso_Release((ID3D12PipelineState *)p);
     return hr;
@@ -14366,9 +14774,13 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
     struct WMTComputePipelineInfo ci;
     obj_handle_t err = 0;
     static unsigned said;
+    struct mad_lzkey lzc;   /* madeira-bcd pso-lazy-libs */
+    int lz_on;
     HRESULT hr;
     if (!desc || !out) return E_INVALIDARG;
     if (!desc->CS.pShaderBytecode) return E_INVALIDARG;
+    memset(&lzc, 0, sizeof lzc);
+    lz_on = mad_lzlib_on() && mad_pso_lazy_on();   /* built at its first dispatch */
     mad_resolve_target(d);
     p = calloc(1, sizeof *p);
     if (!p) return E_OUTOFMEMORY;
@@ -14390,6 +14802,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         memset(&o, 0, sizeof o);
         o.air = &air;
         o.name_out = entry; o.name_cap = sizeof entry; entry[0] = 0;   /* madeira-bcd: read by dxil-dump below */
+        if (lz_on) o.lz = &lzc;   /* madeira-bcd pso-lazy-libs */
         p->vs_fn = mad_convert_stage_opts(d, (struct mad_rootsig *)desc->pRootSignature, desc->CS.pShaderBytecode,
                                      desc->CS.BytecodeLength, NULL, &p->vs_lib, "CS", NULL, 0, NULL, p->tg, locs, &nl, &o);
         if (g_dxil_dump_state && mad_dxil_dump_wanted(entry))   /* madeira-bcd: diagnostic, off unless dxil-dump is set */
@@ -14464,6 +14877,7 @@ static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,
         memset(&ci, 0, sizeof ci);   /* the descriptor mad_cpso_realize builds */
         ci.compute_function = p->vs_fn;
         mad_pso_warm(p->device_handle, &ci, NULL, 2);   /* pso-warm */
+        if (lz_on && mad_lzlib_can_drop(p, &lzc, NULL)) mad_lzlib_drop(p, &lzc, NULL);   /* madeira-bcd pso-lazy-libs */
         hr = pso_QI((ID3D12PipelineState *)p, riid, out);
         pso_Release((ID3D12PipelineState *)p);
         return hr;
@@ -14531,13 +14945,20 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(ID3D12GraphicsCommandLi
     struct mad_list *l = (struct mad_list *)This;
     struct mad_resource *rt = mad_slot_resource(rtv.ptr);
     struct mad_cmd *c;
+    struct mad_rtvp v;
+    UINT at = 0;
+    int nr;
     static unsigned said_rects;
     if (!rt) return;
-    if (n && rects && !said_rects++) d3d12_log("[madeira-d3d12] ClearRenderTargetView: rects are ignored; the whole target is cleared\n");
+    v = mad_slot_view(rtv.ptr);
+    nr = mad_clear_rects_record(l, rt, &v, n, rects, 0, &at);   /* madeira-bcd clear-rects */
+    if (nr < 0) return;   /* every rectangle outside the view: nothing to clear */
+    if (n && rects && g_clear_rects != 1 && !said_rects++) d3d12_log("[madeira-d3d12] ClearRenderTargetView: rects are ignored; the whole target is cleared\n");
     c = mad_list_push(l, MC_CLEAR_RT);
     if (!c) return;
-    c->u.clear.res = rt; c->u.clear.v = mad_slot_view(rtv.ptr);
+    c->u.clear.res = rt; c->u.clear.v = v;
     if (rgba) memcpy(c->u.clear.rgba, rgba, sizeof c->u.clear.rgba);
+    if (nr > 0) { c->u.clear.nrect = (UINT)nr; c->u.clear.rect_at = at; }
 }
 static void STDMETHODCALLTYPE list_ClearDepthStencilView(ID3D12GraphicsCommandList *This,
         D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil,
@@ -14545,18 +14966,25 @@ static void STDMETHODCALLTYPE list_ClearDepthStencilView(ID3D12GraphicsCommandLi
     struct mad_list *l = (struct mad_list *)This;
     struct mad_resource *d = mad_slot_resource(dsv.ptr);
     struct mad_cmd *c;
+    struct mad_rtvp v;
+    UINT at = 0;
+    int nr;
     static unsigned said, said_rect;
     if (!d) return;
-    if (n && rects && said_rect++ < 4)
+    v = mad_slot_view(dsv.ptr);
+    nr = mad_clear_rects_record(l, d, &v, n, rects, 1, &at);   /* madeira-bcd clear-rects */
+    if (nr < 0) return;   /* every rectangle outside the view: nothing to clear */
+    if (n && rects && g_clear_rects != 1 && said_rect++ < 4)
         d3d12_log("[madeira-d3d12] ClearDepthStencilView: %u clear rects ignored (whole view cleared)\n", n);
     if (said++ < 24)
         d3d12_log("[madeira-d3d12] ClearDepthStencilView: res %p %ux%u flags %#x depth %g stencil %u\n", (void *)d,
                   d->width, d->height, (unsigned)flags, depth, (unsigned)stencil);
     c = mad_list_push(l, MC_CLEAR_DS);
     if (!c) return;
-    c->u.clear.res = d; c->u.clear.v = mad_slot_view(dsv.ptr); c->u.clear.depth = depth; c->u.clear.stencil = stencil;
+    c->u.clear.res = d; c->u.clear.v = v; c->u.clear.depth = depth; c->u.clear.stencil = stencil;
     c->u.clear.flags = (UINT8)(flags & (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL));
     if (!c->u.clear.flags) c->u.clear.flags = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+    if (nr > 0) { c->u.clear.nrect = (UINT)nr; c->u.clear.rect_at = at; }
 }
 static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso) {
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_PSO);

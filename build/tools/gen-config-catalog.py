@@ -182,6 +182,21 @@ OVERLAY = {
                 "note": "Default off. 1: a graphics pipeline whose vertex or pixel shader did not convert is returned "
                         "to the game as a placeholder whose draws are skipped, instead of a failure. Horizon Zero "
                         "Dawn stopped with an \"Error\" box when its settings menu got such a failure."},
+    # madeira-bcd: Horizon Zero Dawn's 23,045 libraries (build 480, 2026-10-09 20:28).
+    "pso-lazy-libs": {"category": "Direct3D 12", "title": "Shader libraries only for pipelines in use",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a pipeline built at its first draw (or dispatch) lets its converted Metal "
+                        "libraries go once the game has created it, and reads them back from the shader cache at "
+                        "that first draw. Horizon Zero Dawn creates ~52,000 pipelines in its menu and draws a few "
+                        "thousand; their libraries held hundreds of MB until iOS closed the game. Needs the shader "
+                        "cache (on by default); with pso-warm, a library stays until its warm-up compile is done."},
+    # madeira-bcd: Horizon Zero Dawn's corrupted first gameplay frames (build 480, 2026-10-09 20:37).
+    "clear-rects": {"category": "Direct3D 12", "title": "Clear only the rectangles a game asks for",
+                "kind": "bool", "default": "0",
+                "note": "Default off: a render-target or depth-stencil clear with rectangles clears the whole view, as "
+                        "before. 1: only the rectangles are cleared, in a small pass of their own (as DXMT's D3D11 "
+                        "ClearView does); a rectangle that covers the view still clears it the fast way. Horizon Zero "
+                        "Dawn passes rectangles from its first gameplay frames."},
     "msc-fail-memo": {"category": "Direct3D 12", "title": "Remember refused shaders for the session",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: a shader the converter refused is not converted again for the next pipeline "

@@ -63,8 +63,16 @@ BUILDDEF=()
 # skips the draws that need them, as before.
 echo "=== helper kernels (metallib) ==="
 KDEF=""
+# madeira-bcd clear-rects: should its clear functions not compile, the file is
+# compiled again without them, so the other kernels never depend on them.
+mad_kernels_metal() {
+    xcrun -sdk iphoneos metal -std=metal3.0 "$@" -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"
+}
 if command -v xcrun > /dev/null 2>&1 &&
-   xcrun -sdk iphoneos metal -std=metal3.0 -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"; then
+   { mad_kernels_metal ||
+     { echo "::warning::helper kernels: the clear-rects functions did not compile -- built without them"
+       head -20 "$OUT/mad_kernels.err"
+       mad_kernels_metal -DMAD_NO_CLEAR_RECTS; }; }; then
     (cd "$OUT" && xxd -i mad_kernels.metallib > mad_kernels_metallib.h)
     KDEF="-DMAD_HAVE_KERNELS"
     echo "  $(wc -c < "$OUT/mad_kernels.metallib" | tr -d ' ') bytes"

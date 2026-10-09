@@ -154,15 +154,20 @@ assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
 # window is made foreground while none is, XInput pads reach Windows.Gaming.Input, and the
 # shaders the converter refuses are retried with sized ranges, remembered and replaced by
 # placeholder pipelines; pipelines are warmed in the background). Version 5 (build 480): the
-# orphan-lock reaper releases only locks a live thread has stamped.
+# orphan-lock reaper releases only locks a live thread has stamped. Version 6 (build 481): shader
+# libraries only for pipelines in use, rectangle clears, the game's memory in the swap file
+# (broad, from 1 MB), and no pso-warm (its queue held 24,570 pipelines when iOS closed the game).
 hzd = presets['horizon-zero-dawn']
 assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'msc-unbounded-retry = 1', 'msc-fail-memo = 1',
-                            'pso-placeholder = 1', 'pso-warm = 2', 'swap-mb = 3072',
+                            'pso-placeholder = 1', 'pso-lazy-libs = 1', 'clear-rects = 1',
+                            'swap-mb = 6144', 'swap-mode = 2', 'swap-min-mb = 1',
                             'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1',
                             'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1',
                             'env.MADEIRA_LOCK_ORPHAN = stamped', 'env.WINEDEBUG = fixme-input'], hzd['lines']
-assert hzd['version'] == 5 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 480 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 480\'s test list')
+assert hzd['version'] == 6 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
+assert not any(line.startswith(('pso-lazy-libs', 'clear-rects')) for p in presets.values() if p is not hzd for line in p['lines']), \
+    'the build 481 switches are Horizon Zero Dawn\'s only'
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 480 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 481\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')

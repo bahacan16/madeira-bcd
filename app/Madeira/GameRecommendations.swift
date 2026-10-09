@@ -295,9 +295,18 @@ enum GameRecommendations {
     /// frame) is silenced. On build 479 (19:44) the retried shaders converted,
     /// but the game stopped with "Error" at start: the orphan-lock reaper had
     /// released two locks whose owners were alive (one on 475 too). Build 480's
-    /// line lets it release only locks a live thread has stamped.
+    /// line lets it release only locks a live thread has stamped. On build 480
+    /// (20:28) the game reached play, and iOS closed it two seconds in at
+    /// 8,189 MB: in its menu it had created 52,570 pipelines, and their 23,045
+    /// shader libraries stayed in memory although a few thousand are drawn; the
+    /// image was corrupted from the first gameplay frame, when the game began to
+    /// clear rectangles of its targets and the whole targets were cleared. Build
+    /// 481's list lets a pipeline's libraries go until its first draw, clears only
+    /// the rectangles, puts the game's memory in the swap file as Red Dead
+    /// Redemption 2's list does (broad, from 1 MB), and leaves out pso-warm, whose
+    /// queue held 24,570 pipelines (and their libraries) when the game closed.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 5,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 6,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -305,8 +314,11 @@ enum GameRecommendations {
         msc-unbounded-retry = 1
         msc-fail-memo = 1
         pso-placeholder = 1
-        pso-warm = 2
-        swap-mb = 3072
+        pso-lazy-libs = 1
+        clear-rects = 1
+        swap-mb = 6144
+        swap-mode = 2
+        swap-min-mb = 1
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_INPUT_FOREGROUND = 1
