@@ -72,13 +72,18 @@ for ident, p in presets.items():
             assert re.fullmatch(r'env\.[A-Za-z_][A-Za-z0-9_]*', key), (ident, key)
         else:
             assert key in catalog_keys, (ident, 'not a key Madeira reads', key)
-        # Madeira's own settings only: nothing that loads a replaced Social Club.
-        assert 'socialclub' not in line.lower() and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
+        # Madeira's own settings only: nothing that loads a replaced Social Club. SocialClubHelper.exe
+        # may be named as a program in a list (env.DXMT_SMALL_RINGS), never in a DLL override.
+        named = line.lower()
+        if key != 'env.WINEDLLOVERRIDES':
+            named = named.replace('socialclubhelper.exe', '')
+        assert 'socialclub' not in named and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
 print('PASS: six lists, two comment lines each, no key twice, every non-env key in the settings catalog, no Social Club DLL lines')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
 # plus the lines of build 466's test (version 2), build 467's (version 3), build 470's (version 4) and
-# build 472's (version 5: pool-mid) and build 475's (version 6: ring-share).
+# build 472's (version 5: pool-mid), build 475's (version 6: ring-share) and build 476's (version 7:
+# swap-images, small DXMT rings for the launcher and Social Club, the ExecuteIndirect probe off).
 rdr2 = '''d3d12-caps-log = 2
 d3d12-shader-pack = 1
 replay-split = 1
@@ -91,10 +96,12 @@ vram-mb = 2304
 swap-mb = 8192
 swap-mode = 2
 swap-min-mb = 1
+swap-images = 1
 pso-warm = 2
 fence-chain = 6
 avail-phys = 1
 indirect-fast = 1
+ind-probe = 0
 fullscreen-window = 1
 env.WINE_D3D_CONFIG = renderer=no3d
 env.FEX_VECTORTSOENABLED = 0
@@ -110,6 +117,7 @@ env.MADEIRA_DXGI_SRC = 1
 env.MADEIRA_DXGI_BUDGET_EVENTS = 1
 env.DXMT_WSI_MONITOR_IDENTITY = 1
 env.DXMT_WSI_MODE_TABLE = 1
+env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
 env.MADEIRA_EXECREQ_LEAVE = 1
 env.MADEIRA_PIN_GRAPHICS_DLLS = 1
 env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
@@ -125,7 +133,7 @@ env.WINEDLLOVERRIDES = video64=
 env.MADEIRA_DEVICE_STATS = 1
 env.MADEIRA_METAL_HUD_MAIN = 1'''.split('\n')
 assert presets['rdr2-steam']['lines'][2:] == rdr2, 'the RDR2 list differs from the owner\'s'
-assert presets['rdr2-steam']['version'] == 6, presets['rdr2-steam']['version']
+assert presets['rdr2-steam']['version'] == 7, presets['rdr2-steam']['version']
 assert presets['rdr2-steam']['switches'] == ('avx: false, nvidia: false, wineVCRT: false, fastSync: true, '
                                              'semaphoreFastPath: false, resolution: GameRecommendation.screen720, display: "fit"'), presets['rdr2-steam']['switches']
 assert 'static let screen720 = "screen@720"' in lists_src and 'resolution == Self.screen720 ? "this screen\'s shape at 720 lines" : resolution' in lists_src
@@ -145,7 +153,7 @@ assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'swap-mb = 3072',
                             'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1',
                             'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1'], hzd['lines']
 assert hzd['version'] == 3 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472 and 475 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 475\'s test list')
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475 and 476 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 475\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')

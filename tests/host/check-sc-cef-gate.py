@@ -13,7 +13,11 @@ Compiles the production code and checks:
     --single-process, --js-flags=--jitless (unless MADEIRA_JITLESS=0 or its own
     --js-flags=), PartitionAllocBackupRefPtr first in its LAST --disable-features= list
     (a new switch only when it has none) and MADEIRA_SC_CEF_FLAGS; a too small buffer
-    fails; look-alike switches are not taken for the real ones;
+    fails; look-alike switches are not taken for the real ones; a --js-flags= inside
+    MADEIRA_SC_CEF_FLAGS (sc_extra_js_flags) gets --jitless as its first flag instead
+    of a second switch, and Windows' argument splitting (a port of
+    CommandLineToArgvW) then reads the last --js-flags= as "--jitless ..." whether the
+    value was quoted, bare, empty or repeated;
   - virtual_ios.c (ios_sc_name_is, ios_sc_path_is_helper, ios_sc_refused_name, ios_sc_cef_refuse):
     libcef.dll and nvngx_dlss(g).dll are refused only in a Social Club client that is not the
     helper, with the switch on (log 21:26: nvngx_dlss.dll's 28 MB left libcef 1.8 MB short);
@@ -125,6 +129,7 @@ proc_helpers = enums + ''.join(function(proc, sig) for sig in (
     'static int ec_conhost_refuse(',
     'static const char *child_extra_args(',
     'static int sc_helper_kind(',
+    'static int sc_extra_js_flags(',
     'static int sc_browser_cmdline(',
 ))
 virt_helpers = ''.join(function(native, sig) for sig in (
@@ -274,6 +279,42 @@ static void expect( const char *got, const char *want )
     if (strcmp( got, want )) FAIL("got  [%s]\nwant [%s]\n", got, want);
 }
 
+/* The last argument starting with --js-flags= as Windows splits the command line
+ * (Chromium's CommandLine::ParseFromString calls CommandLineToArgvW; this is
+ * Wine's shell32 algorithm for the arguments after the first), or "" */
+static const char *last_js_flags( const char *s )
+{
+    static char arg[4096], last[4096];
+    char *d;
+    int bcount, qcount;
+
+    last[0] = 0;
+    if (*s == '"') { s++; while (*s && *s != '"') s++; if (*s) s++; }   /* the program name */
+    else while (*s && *s != ' ' && *s != '\t') s++;
+    while (*s == ' ' || *s == '\t') s++;
+    while (*s)
+    {
+        d = arg; bcount = qcount = 0;
+        while (*s && !((*s == ' ' || *s == '\t') && !qcount))
+        {
+            if (*s == '\\') { *d++ = *s++; bcount++; }
+            else if (*s == '"')
+            {
+                if (!(bcount & 1)) { d -= bcount / 2; qcount++; }
+                else { d = d - bcount / 2 - 1; *d++ = '"'; }
+                s++; bcount = 0;
+                while (*s == '"') { if (++qcount == 3) { *d++ = '"'; qcount = 0; } s++; }
+                if (qcount == 2) qcount = 0;
+            }
+            else { *d++ = *s++; bcount = 0; }
+        }
+        *d = 0;
+        if (!strncmp( arg, "--js-flags=", 11 )) strcpy( last, arg );
+        while (*s == ' ' || *s == '\t') s++;
+    }
+    return last;
+}
+
 static void gate_and_cmdline( void )
 {
     const char *cl = "\"C:\\Program Files\\Rockstar Games\\Social Club\\SocialClubHelper.exe\"  "
@@ -344,6 +385,58 @@ static void gate_and_cmdline( void )
     printf("PASS: browser command line: BRP off in its last --disable-features list (or a new one), "
            "--single-process, jitless unless asked otherwise, --no-proxy-server unless it has a proxy switch, extra flags "
            "appended, nothing doubled\n");
+
+    /* madeira-bcd: a --js-flags= in MADEIRA_SC_CEF_FLAGS keeps --jitless (sc_extra_js_flags) */
+    {
+        const char *r;
+        r = rewrite( "h.exe --lang=en", 1, "--js-flags=--max-semi-space-size=1 --enable-low-end-device-mode", &how );
+        expect( r, "h.exe --lang=en --disable-features=PartitionAllocBackupRefPtr --single-process --no-proxy-server "
+                   "--js-flags=--jitless\" \"--max-semi-space-size=1 --enable-low-end-device-mode" );
+        if (how != (SC_BRP_NEW | SC_SINGLE_ADDED | SC_NOPROXY_ADDED | SC_EXTRA_ADDED | SC_JITLESS_MERGED)) FAIL("merge how=%x\n", how);
+        expect( last_js_flags( r ), "--js-flags=--jitless --max-semi-space-size=1" );
+        r = rewrite( "h.exe", 1, "--js-flags=\"--max-semi-space-size=1 --optimize-for-size\" --x", &how );
+        expect( r, "h.exe --disable-features=PartitionAllocBackupRefPtr --single-process --no-proxy-server "
+                   "--js-flags=\"--jitless --max-semi-space-size=1 --optimize-for-size\" --x" );
+        expect( last_js_flags( r ), "--js-flags=--jitless --max-semi-space-size=1 --optimize-for-size" );
+        r = rewrite( "h.exe", 1, "--x --js-flags=", &how );
+        expect( last_js_flags( r ), "--js-flags=--jitless" );
+        if (!(how & SC_JITLESS_MERGED) || (how & SC_JITLESS_ADDED)) FAIL("empty value how=%x\n", how);
+        r = rewrite( "h.exe", 1, "--js-flags=--a --js-flags=\"--b --c\"", &how );   /* Chromium keeps the last one */
+        expect( r, "h.exe --disable-features=PartitionAllocBackupRefPtr --single-process --no-proxy-server "
+                   "--js-flags=--a --js-flags=\"--jitless --b --c\"" );
+        expect( last_js_flags( r ), "--js-flags=--jitless --b --c" );
+        r = rewrite( "h.exe --js-flags=--app-own", 1, "--js-flags=--max-old-space-size=96", &how );
+        expect( last_js_flags( r ), "--js-flags=--jitless --max-old-space-size=96" );
+        if (how != (SC_BRP_NEW | SC_SINGLE_ADDED | SC_NOPROXY_ADDED | SC_EXTRA_ADDED | SC_JITLESS_MERGED | SC_OWN_JS_FLAGS))
+            FAIL("own + extra how=%x\n", how);
+        r = rewrite( "h.exe", 0, "--js-flags=--max-semi-space-size=1", &how );   /* MADEIRA_JITLESS=0: verbatim */
+        expect( last_js_flags( r ), "--js-flags=--max-semi-space-size=1" );
+        if (how & (SC_JITLESS_MERGED | SC_JITLESS_ADDED)) FAIL("jitless off how=%x\n", how);
+        r = rewrite( "h.exe", 1, "--no-js-flags=--x a--js-flags=--y", &how );   /* look-alikes: our own switch */
+        expect( r, "h.exe --disable-features=PartitionAllocBackupRefPtr --single-process --js-flags=--jitless "
+                   "--no-proxy-server --no-js-flags=--x a--js-flags=--y" );
+        if (!(how & SC_JITLESS_ADDED) || (how & SC_JITLESS_MERGED)) FAIL("look-alike how=%x\n", how);
+        expect( last_js_flags( r ), "--js-flags=--jitless" );
+        expect( last_js_flags( rewrite( cl, 1, "--enable-low-end-device-mode", &how ) ), "--js-flags=--jitless" );
+        {
+            /* the caller's buffer (cl_len + 160 + strlen(extra)) always holds the merge */
+            static const char *const extras[] = { "--js-flags=", "--js-flags=\"\"", "--js-flags=--a",
+                                                  "--js-flags=\"--a\" --js-flags=--b --js-flags=" };
+            unsigned e;
+            for (e = 0; e < sizeof(extras) / sizeof(extras[0]); e++)
+            {
+                WCHAR out[512];
+                int cll;
+                WCHAR *wc = w( "h.exe", &cll );
+                int cap = cll + 160 + (int)strlen( extras[e] );
+                int n = sc_browser_cmdline( wc, cll, 1, extras[e], out, cap, &how );
+                if (n < 0 || n >= cap) FAIL("caller's buffer too small for [%s]\n", extras[e]);
+                if (strncmp( last_js_flags( a( out, n ) ), "--js-flags=--jitless", 20 )) FAIL("[%s] lost jitless\n", extras[e]);
+            }
+        }
+    }
+    printf("PASS: a --js-flags= in MADEIRA_SC_CEF_FLAGS gets --jitless first (quoted, bare, empty, repeated, next to the "
+           "app's own); Windows' splitting reads it as one argument; MADEIRA_JITLESS=0 leaves it verbatim\n");
 
     if (!ios_sc_cef_refuse( "libcef.dll", 1, 0, 1, 0 ) || !ios_sc_cef_refuse( "LIBCEF.DLL", 1, 0, 1, 0 )) FAIL("client libcef\n");
     if (ios_sc_cef_refuse( "libcef.dll", 1, 1, 1, 0 )) FAIL("helper refused\n");

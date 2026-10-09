@@ -54,7 +54,8 @@ check("replay loop: fast path only after record 0 drew, never for indirect tesse
       "unsigned drawn = e.draws;" in loop
       and "if (!k && mad_indirect_fast_on()) {" in loop
       and "int why = tess ? IFR_TESS_IND : e.draws != drawn + 1 ? IFR_NOT_DRAWN : exec_indirect_fast_why(&e, c);" in loop
-      and "mad_ifr_note(why);" in loop
+      and "mad_ifr_note(why, c->u.ind.count);" in loop
+      and "if (why != IFR_USED) mad_ifr_detail(&e, c, why, (int)(e.draws - drawn));" in loop
       and "if (why == IFR_USED) { exec_indirect_rest(&e, c); break; }" in loop
       and loop.index("exec_draw(&e, &t);") < loop.index("exec_indirect_fast_why(&e, c)"))
 draw = src[src.index("static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {"):]
@@ -79,7 +80,7 @@ harness = r'''
 #include <stdint.h>
 #include <stdarg.h>
 #include "winemetal.h"
-typedef uint64_t UINT64; typedef unsigned UINT; typedef long LONG; typedef unsigned D3D12_PRIMITIVE_TOPOLOGY;
+typedef uint64_t UINT64; typedef unsigned UINT; typedef long LONG; typedef long long LONG64; typedef unsigned D3D12_PRIMITIVE_TOPOLOGY;
 enum mad_ck { MC_DRAW = 1, MC_DRAW_INDIRECT, MC_DRAW_INDEXED_INDIRECT, MC_DISPATCH_INDIRECT };
 #define MADEIRA_IR_BACKEND_MSC 0
 #define MADEIRA_IR_BACKEND_AIRCONV 1
@@ -98,6 +99,7 @@ static long long cfg_value, cfg_reads;
 static long long mad_cfg_int_pe(const char *k, long long d) { cfg_reads++; return strcmp(k, "indirect-fast") ? d : cfg_value; }
 static void d3d12_log(const char *fmt, ...) { (void)fmt; }
 static LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 static LONG InterlockedIncrement(volatile LONG *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
 static enum WMTPrimitiveType mad_prim(D3D12_PRIMITIVE_TOPOLOGY t) { return t == 4 ? WMTPrimitiveTypeTriangle : WMTPrimitiveTypePoint; }
 

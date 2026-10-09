@@ -6947,7 +6947,8 @@ static volatile LONG g_ifast_calls, g_ifast_records;
 /* madeira-bcd: why an ExecuteIndirect replay took the per-record path. Build
  * 470's Red Dead Redemption 2 run (2026-10-09 14:48) spent 37-66 ms a frame in
  * ExecuteIndirect with indirect-fast = 1 and never logged a fast-path call; the
- * tallies below name the condition, every 20000 replays (and at 200). */
+ * tallies below name the condition and the records those replays carried,
+ * every 20000 replays (and at 200). */
 enum { IFR_USED, IFR_TESS_IND, IFR_NOT_DRAWN, IFR_ONE_RECORD, IFR_DIAG, IFR_DUMP, IFR_CAPTURE, IFR_COMPUTE,
        IFR_NO_ENCODER, IFR_GS_EMU, IFR_DXBC_TESS, IFR_BACKEND, IFR_NO_IB, IFR_N };
 static const char *const g_ifr_names[IFR_N] = {
@@ -6955,6 +6956,7 @@ static const char *const g_ifr_names[IFR_N] = {
     "draw dump", "capture", "compute state", "no render encoder or pipeline", "geometry emulation",
     "DXBC tessellation", "other converter", "no index buffer" };
 static volatile LONG g_ifr[IFR_N], g_ifr_total;
+static volatile LONG64 g_ifr_rec[IFR_N];   /* records in those replays */
 
 static int mad_indirect_fast_on(void) {
     if (g_indirect_fast < 0) {
@@ -6966,14 +6968,16 @@ static int mad_indirect_fast_on(void) {
     return g_indirect_fast;
 }
 
-static void mad_ifr_note(int why) {
+static void mad_ifr_note(int why, UINT count) {
     LONG total;
     InterlockedIncrement(&g_ifr[why]);
+    InterlockedExchangeAdd64(&g_ifr_rec[why], (LONG64)count);
     total = InterlockedIncrement(&g_ifr_total);
     if (total == 200 || total % 20000 == 0) {
-        char buf[640]; int pos = 0, r;
+        char buf[960]; int pos = 0, r;
         for (r = 0; r < IFR_N && pos >= 0 && pos < (int)sizeof buf; r++)
-            if (g_ifr[r]) pos += snprintf(buf + pos, sizeof buf - pos, "%s%s %ld", pos ? ", " : "", g_ifr_names[r], (long)g_ifr[r]);
+            if (g_ifr[r]) pos += snprintf(buf + pos, sizeof buf - pos, "%s%s %ld (%lld records)", pos ? ", " : "", g_ifr_names[r],
+                                          (long)g_ifr[r], (long long)g_ifr_rec[r]);
         d3d12_log("[madeira-d3d12] indirect-fast: %ld ExecuteIndirect replays: %s\n", (long)total, buf);
     }
 }
@@ -7053,6 +7057,21 @@ static void exec_indirect_rest(struct mad_exec *e, const struct mad_cmd *c) {
     if ((InterlockedIncrement(&g_ifast_calls) % 20000) == 1)
         d3d12_log("[madeira-d3d12] indirect-fast: %ld calls, %ld records encoded without per-record setup\n",
                   (long)g_ifast_calls, (long)g_ifast_records);
+}
+
+/* madeira-bcd: the first three replays of every refusal reason, with what
+ * decided it (the pipeline, its converter and emulation, the encoders, and
+ * how many draws record 0 encoded). */
+static void mad_ifr_detail(const struct mad_exec *e, const struct mad_cmd *c, int why, int drew) {
+    static volatile LONG said[IFR_N];
+    const struct mad_pso *p = c->kind == MC_DISPATCH_INDIRECT ? e->cpso : e->pso;
+    if (why == IFR_USED || InterlockedIncrement(&said[why]) > 3) return;
+    d3d12_log("[madeira-d3d12] indirect-fast: refused (%s): %s, %u records of stride %u; pipeline '%s' backend %u "
+              "gs_emu %d tess %d/%d/%d; render encoder %s, compute encoder %s, index buffer %s; record 0 encoded %d\n",
+              g_ifr_names[why], c->kind == MC_DISPATCH_INDIRECT ? "dispatch" : c->kind == MC_DRAW_INDEXED_INDIRECT ? "indexed draw" : "draw",
+              c->u.ind.count, c->u.ind.stride, p ? p->vs_name : "-", p ? p->backend : 0u, p ? p->gs_emu : -1,
+              p && p->tess ? 1 : 0, p && p->tess_strip ? 1 : 0, p ? p->has_tess : 0,
+              e->renc ? "open" : "none", e->cenc ? "open" : "none", e->ib && e->ib->buffer ? "bound" : "none", drew);
 }
 
 /* madeira-bcd: during a CAP frame, every clear and copy with its target's
@@ -7196,7 +7215,8 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 /* madeira-bcd: indirect-fast -- record 0 was encoded, the rest share its state */
                 if (!k && mad_indirect_fast_on()) {
                     int why = tess ? IFR_TESS_IND : e.draws != drawn + 1 ? IFR_NOT_DRAWN : exec_indirect_fast_why(&e, c);
-                    mad_ifr_note(why);
+                    mad_ifr_note(why, c->u.ind.count);
+                    if (why != IFR_USED) mad_ifr_detail(&e, c, why, (int)(e.draws - drawn));
                     if (why == IFR_USED) { exec_indirect_rest(&e, c); break; }
                 }
             }

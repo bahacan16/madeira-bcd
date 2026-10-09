@@ -17,6 +17,14 @@
 # links d3d11-src.dll in as C:\windows\system32\d3d11.dll (and sysx64) only
 # when env.MADEIRA_D3D11_SRC = 1 is set (the game's own file, or madeira.cfg).
 #
+# madeira-bcd: the DXMT core (dxmt/src/dxmt) is compiled from a copy too, with
+# small staging rings for the programs env.DXMT_SMALL_RINGS names
+# (tools/patch-d3d11-src-small-rings.py, a run-time switch, off by default).
+# Opt-in per game, so a missed anchor leaves the copy unpatched and the build
+# goes on without it. The d3d11/d3d10 objects of d3d11-src.dll include the
+# copy's headers and link the copy's objects; the unpatched DLL of the recipe
+# check below is built from the submodule alone, as before.
+#
 # Built the way DXMT's meson build does (buildtype=release: -O3 -DNDEBUG, the
 # project's flags and defines, -fmacro-prefix-map so __FILE__ reads
 # "src\d3d11\..." as in upstream's binary, the d3d11 and d3d10 sources in
@@ -168,6 +176,16 @@ fi
 cp -R "$D/src/d3d11" "$D/src/d3d10" "$OUT/tree/src/"
 python3 "$R/tools/patch-dxmt-context-state-swap.py" "$OUT/tree/src/d3d11" || fail "tools/patch-dxmt-context-state-swap.py did not apply"
 grep -q "madeira-bcd: context state swap" "$OUT/tree/src/d3d11/d3d11_context_impl.cpp" || fail "the swap patch left d3d11_context_impl.cpp unchanged"
+# madeira-bcd: the DXMT core on a copy as well, with small staging rings
+# (run-time switch DXMT_SMALL_RINGS). Opt-in per game, so a missed anchor must
+# not cost every game d3d11-src.dll: the copy is left unpatched and the build
+# goes on.
+cp -R "$D/src/dxmt" "$OUT/tree/src/"
+SMALL_RINGS=" + opt-in small staging rings"
+python3 "$R/tools/patch-d3d11-src-small-rings.py" "$OUT/tree/src/dxmt" || {
+    SMALL_RINGS=""
+    echo "::warning::tools/patch-d3d11-src-small-rings.py did not apply: d3d11-src.dll is built without small staging rings (env.DXMT_SMALL_RINGS has no effect)"
+}
 
 # DXMT's meson.build: compiler_args, the project defines, buildtype=release
 # (-O3, b_ndebug=if-release -> NDEBUG), C++20. -fmacro-prefix-map maps the
@@ -183,11 +201,13 @@ COMMON=(
 CXXFLAGS=(-std=c++20 "${COMMON[@]}" -DDXMT_PAGE_SIZE=4096)
 CFLAGS=("${COMMON[@]}")
 # Include paths per meson target (its own directory first, then the
-# dependencies' include_directories, then the generated headers).
+# dependencies' include_directories, then the generated headers). The dxmt
+# directory is the one of the root a file is compiled from: the submodule's
+# ($X) for the unpatched build, the copy's for d3d11-src.dll.
 INC_BASE=(-I"$D/include" -I"$D/libs")
 INC_UTIL=(-I"$U" "${INC_BASE[@]}")
 INC_PARSER=(-I"$P" "${INC_BASE[@]}")
-INC_DXMT=(-I"$X" -I"$U" -I"$D/src/airconv" -I"$D/src/winemetal" "${INC_BASE[@]}" -I"$OUT/gen")
+INC_DXMT=(-I"$U" -I"$D/src/airconv" -I"$D/src/winemetal" "${INC_BASE[@]}" -I"$OUT/gen")
 
 # Compile jobs: one line per object, "<root>\t<source>\t<object>\t<flag set>",
 # run JOBS at a time (plain bash 3 job control: N workers over slices).
@@ -198,8 +218,8 @@ compile_one() {  # compile_one <root> <source> <object> <flag set>
     case "$set" in
         util)   inc=("${INC_UTIL[@]}") ;;
         parser) inc=("${INC_PARSER[@]}" -Wno-extern-c-compat -Wno-unknown-pragmas) ;;
-        dxmt)   inc=("${INC_DXMT[@]}") ;;
-        d3d11)  inc=(-I"$root/src/d3d11" -I"$G" -I"$X" -I"$D/src/airconv" -I"$D/src/winemetal" -I"$U" "${INC_BASE[@]}" -I"$OUT/gen") ;;
+        dxmt)   inc=(-I"$root/src/dxmt" "${INC_DXMT[@]}") ;;
+        d3d11)  inc=(-I"$root/src/d3d11" -I"$G" -I"$root/src/dxmt" -I"$D/src/airconv" -I"$D/src/winemetal" -I"$U" "${INC_BASE[@]}" -I"$OUT/gen") ;;
     esac
     case "$src" in
         *.c) "$CC" "${CFLAGS[@]}" -fmacro-prefix-map="$root/=" -fmacro-prefix-map="$D/=" "${inc[@]}" -c "$src" -o "$obj" ;;
@@ -254,12 +274,13 @@ D3D11_SRC=(d3d11/d3d11_class_linkage d3d11/d3d11_device d3d11/d3d11_input_layout
            d3d10/d3d10_texture d3d10/d3d10_util d3d10/d3d10_view)
 obj_name() { echo "$1" | tr '/.' '__'; }
 
-UTIL_OBJ=(); DXMT_OBJ=(); PARSER_OBJ=(); PLAIN_OBJ=(); PATCHED_OBJ=()
+UTIL_OBJ=(); DXMT_OBJ=(); PLAIN_DXMT_OBJ=(); PARSER_OBJ=(); PLAIN_OBJ=(); PATCHED_OBJ=()
 for s in "${UTIL_SRC[@]}"; do
     o="$OUT/obj/util_$(obj_name "$s").o"; job "$D" "$U/$s" "$o" util; UTIL_OBJ+=("$o")
 done
 for s in "${DXMT_SRC[@]}"; do
-    o="$OUT/obj/dxmt_$s.o"; job "$D" "$X/$s.cpp" "$o" dxmt; DXMT_OBJ+=("$o")
+    o="$OUT/plain/obj/dxmt_$s.o"; job "$D" "$X/$s.cpp" "$o" dxmt; PLAIN_DXMT_OBJ+=("$o")
+    o="$OUT/obj/dxmt_$s.o"; job "$OUT/tree" "$OUT/tree/src/dxmt/$s.cpp" "$o" dxmt; DXMT_OBJ+=("$o")
 done
 for s in "${PARSER_SRC[@]}"; do
     o="$OUT/obj/parser_$s.o"; job "$D" "$P/$s.cpp" "$o" parser; PARSER_OBJ+=("$o")
@@ -272,8 +293,10 @@ echo "compiling $(wc -l < "$OUT/jobs" | tr -d ' ') files, $JOBS at a time"
 run_jobs
 "$WINDRES" -i "$D/src/d3d11/version.rc" -o "$OUT/obj/version.o" 2>> "$OUT/build.err" || fail "windres version.rc failed"
 
-# Thin archives in source order, as meson makes them ("csrDT").
+# Thin archives in source order, as meson makes them ("csrDT"); the DXMT core
+# twice, the submodule's for the unpatched DLL and the copy's for d3d11-src.dll.
 "$AR" csrDT "$OUT/libutil.a" "${UTIL_OBJ[@]}"
+"$AR" csrDT "$OUT/plain/libdxmt.a" "${PLAIN_DXMT_OBJ[@]}"
 "$AR" csrDT "$OUT/libdxmt.a" "${DXMT_OBJ[@]}"
 "$AR" csrDT "$OUT/libDXBCParser.a" "${PARSER_OBJ[@]}"
 
@@ -281,16 +304,16 @@ run_jobs
 # file, the dependency libraries in d3d11's dependency order (dxgi, DXBCParser,
 # dxmt, winemetal, util), util_dep's -lntdll, -static (libc++ in, UCRT through
 # api-ms-win-crt-*), file alignment 4096 and meson's default Windows libraries.
-link_dll() {  # link_dll <output> <objects...>
-    local out="$1"; shift
+link_dll() {  # link_dll <output> <libdxmt.a> <objects...>
+    local out="$1" dxmt="$2"; shift 2
     "$CXX" -shared -o "$out" "$@" "$OUT/obj/version.o" "$D/src/d3d11/d3d11.def" \
-        "$OUT/libdxgi.a" "$OUT/libDXBCParser.a" "$OUT/libdxmt.a" -L"$OUT" -lwinemetal "$OUT/libutil.a" -lntdll \
+        "$OUT/libdxgi.a" "$OUT/libDXBCParser.a" "$dxmt" -L"$OUT" -lwinemetal "$OUT/libutil.a" -lntdll \
         -static -Wl,--file-alignment=4096 \
         -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 \
         2>> "$OUT/build.err" || { grep -m 20 "error" "$OUT/build.err"; fail "linking $(basename "$out") failed"; }
 }
-link_dll "$OUT/plain/d3d11.dll" "${PLAIN_OBJ[@]}"
-link_dll "$OUT/d3d11.dll" "${PATCHED_OBJ[@]}"
+link_dll "$OUT/plain/d3d11.dll" "$OUT/plain/libdxmt.a" "${PLAIN_OBJ[@]}"
+link_dll "$OUT/d3d11.dll" "$OUT/libdxmt.a" "${PATCHED_OBJ[@]}"
 
 # The new DLL must export exactly what upstream's does, and import from the
 # same DLLs (DXGI.DLL, winemetal.dll, the system and UCRT ones).
@@ -307,6 +330,10 @@ diff "$OUT/imports.upstream" "$OUT/imports.built" > "$OUT/imports.diff" \
 "$READOBJ" --file-headers "$OUT/d3d11.dll" | grep -q "IMAGE_FILE_MACHINE_ARM64EC" || fail "the result is not an ARM64EC image"
 LC_ALL=C grep -aqF "$MARK" "$OUT/d3d11.dll" || fail "the SwapDeviceContextState patch is not in the result"
 LC_ALL=C grep -aqF "$MARK" "$OUT/plain/d3d11.dll" && fail "the unpatched build carries the patch marker: the submodule is not pristine"
+if [ -n "$SMALL_RINGS" ]; then
+    LC_ALL=C grep -aqF "[small-rings] madeira-bcd" "$OUT/d3d11.dll" || fail "the small staging rings patch is not in the result"
+fi
+LC_ALL=C grep -aqF "[small-rings] madeira-bcd" "$OUT/plain/d3d11.dll" && fail "the unpatched build carries the small rings marker: the submodule is not pristine"
 LC_ALL=C grep -aqF "$VER" "$OUT/d3d11.dll" || fail "the DXMT version string is not in the result"
 
 # The recipe check: the unpatched link against upstream's binary. Same
@@ -328,8 +355,8 @@ else
 fi
 
 if [ "${D3D11_NO_SHIP:-0}" = "1" ]; then
-    echo "d3d11.dll built at $OUT/d3d11.dll (not shipped, D3D11_NO_SHIP=1; DXMT $VER, $METAL_NOTE); the recipe $MATCH"
+    echo "d3d11.dll built at $OUT/d3d11.dll (not shipped, D3D11_NO_SHIP=1; DXMT $VER$SMALL_RINGS, $METAL_NOTE); the recipe $MATCH"
     exit 0
 fi
 cp "$OUT/d3d11.dll" "$DEST.tmp" && mv -f "$DEST.tmp" "$DEST" || fail "copying into the bundle failed"
-echo "::notice::d3d11-src.dll built from DXMT $VER with SwapDeviceContextState ($(wc -c < "$DEST" | tr -d ' ') bytes, exports and imported DLLs = upstream's; $METAL_NOTE) and shipped next to upstream's d3d11.dll, which stays the default (env.MADEIRA_D3D11_SRC = 1 selects it); the recipe $MATCH"
+echo "::notice::d3d11-src.dll built from DXMT $VER with SwapDeviceContextState$SMALL_RINGS ($(wc -c < "$DEST" | tr -d ' ') bytes, exports and imported DLLs = upstream's; $METAL_NOTE) and shipped next to upstream's d3d11.dll, which stays the default (env.MADEIRA_D3D11_SRC = 1 selects it); the recipe $MATCH"

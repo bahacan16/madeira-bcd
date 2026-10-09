@@ -45,8 +45,8 @@ share = function('static int mad_ring_share_on(void) {')
 assert 'mad_cfg_int_pe("ring-share", 0)' in share, 'off by default'
 release = function('static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {')
 assert 'InterlockedExchangeAdd(&g_ring_chunks, -(LONG)l->nrings);' in release, 'the census counts live chunks'
-site = src[src.index('/* madeira-bcd: indirect-fast -- record 0 was encoded, the rest share its state */'):][:600]
-assert 'if (!k && mad_indirect_fast_on()) {' in site and 'mad_ifr_note(why);' in site
+site = src[src.index('/* madeira-bcd: indirect-fast -- record 0 was encoded, the rest share its state */'):][:800]
+assert 'if (!k && mad_indirect_fast_on()) {' in site and 'mad_ifr_note(why, c->u.ind.count);' in site
 assert 'if (why == IFR_USED) { exec_indirect_rest(&e, c); break; }' in site
 why = function('static int exec_indirect_fast_why(struct mad_exec *e, const struct mad_cmd *c) {')
 for reason in ('IFR_ONE_RECORD', 'IFR_DIAG', 'IFR_CAPTURE', 'IFR_DUMP', 'IFR_COMPUTE', 'IFR_NO_ENCODER',

@@ -18782,8 +18782,14 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
     /* ml1077: never execute from the tier. ml1257: BEFORE set_vprot, not after --
      * the copy-back maps anonymous RW, which used to overwrite the protection
      * set_vprot had just applied (a guard page came back writable), and an EXEC
-     * mprotect on the shared file mapping must not be what decides the outcome. */
-    if (vprot & (VPROT_EXEC | VPROT_WRITECOPY | VPROT_GUARD)) ios_swap_release_range( base, size, 1 );
+     * mprotect on the shared file mapping must not be what decides the outcome.
+     * madeira-bcd swap-images: a pure-x64 image view (VPROT_X64DATA) keeps its
+     * file pages for EXEC and WRITECOPY -- mprotect_exec never gives its pages
+     * host EXEC, and the file range is this view's alone -- so the emulator's SMC
+     * protections and the loader's VirtualProtect calls do not pull its sections
+     * back into anonymous memory; a GUARD request still does. */
+    if ((vprot & VPROT_GUARD) || ((vprot & (VPROT_EXEC | VPROT_WRITECOPY)) && !(view->protect & VPROT_X64DATA)))
+        ios_swap_release_range( base, size, 1 );
     if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED ))
     {
         dprintf(2, "[vmem-denied] set_vprot failed: base=%p size=%p protect=0x%x\n",
@@ -19695,6 +19701,49 @@ done:
 }
 
 
+/* madeira-bcd swap-images (madeira.cfg or the game's own file `swap-images = 1`,
+ * off by default; needs the swap tier, swap-mb, and env.MADEIRA_X64_IMAGE_NOCOPY = 1).
+ *
+ * A PE section is mmapped from its file only when its address and file offset
+ * are 16 KB-aligned; an x64 PE has 4 KB sections at 512-byte file offsets, so
+ * map_file_into_view_ex reads every section into ANONYMOUS memory, which
+ * phys_footprint charges in full for the life of the image (compressed or not).
+ * The 467 run (2026-10-09 13:09, line 38693) had libcef.dll's view at
+ * 0x70d6b40000 228 MB dirty in two regions and both steamclient64.dll copies 22 MB
+ * each; the pure-x64 images mapped before RDR2.exe (Steam's client, the
+ * launcher, Social Club) add up to ~357 MB, and RDR2.exe and its DLLs ~160 MB.
+ *
+ * With the switch, a pure-x64 image (the same images VPROT_X64DATA marks: no
+ * pool copy, the host never executes them) keeps being read exactly as before,
+ * and afterwards each section's host-page interior moves to the swap tier's
+ * file, whose dirty pages are "external" and not charged (ml1076):
+ * map_file_into_view_ex notes the range (ios_swap_image_note, lock held),
+ * virtual_map_image calls ios_swap_image_flush after leaving virtual_mutex, and
+ * the copy into the file is a pwrite made outside the lock -- ml1081: nothing
+ * that can block on the file may run while the lock is held. Edge host pages
+ * shared with the header or a neighbouring section stay anonymous. EXEC and
+ * WRITECOPY requests on such views no longer copy the range back
+ * (set_protection): the host never executes them and every view is private. */
+#define IOS_SWAP_IMAGE_PENDING 32
+static _Thread_local int ios_swap_image_armed;     /* map_image_into_view's sections loop, for this image */
+static _Thread_local unsigned ios_swap_image_npend;
+static _Thread_local struct { char *va; size_t len; void *view_base; } ios_swap_image_pend[IOS_SWAP_IMAGE_PENDING];
+
+/* Remember the host-page interior of [addr, addr+size), just read into the
+ * anonymous memory of image view `view`. virtual_mutex held; no syscalls. */
+static void ios_swap_image_note( const struct file_view *view, char *addr, size_t size )
+{
+    char *hs = (char *)(((uintptr_t)addr + host_page_mask) & ~(uintptr_t)host_page_mask);
+    char *he = (char *)(((uintptr_t)addr + size) & ~(uintptr_t)host_page_mask);
+
+    if (!ios_swap_image_armed || he <= hs || ios_swap_image_npend >= IOS_SWAP_IMAGE_PENDING) return;
+    ios_swap_image_pend[ios_swap_image_npend].va = hs;
+    ios_swap_image_pend[ios_swap_image_npend].len = he - hs;
+    ios_swap_image_pend[ios_swap_image_npend].view_base = view->base;
+    ios_swap_image_npend++;
+}
+
+
 /***********************************************************************
  *           map_file_into_view
  *
@@ -19964,6 +20013,9 @@ static NTSTATUS map_file_into_view_ex( struct file_view *view, int fd, size_t st
 
     mprotect( map_addr, map_size, PROT_READ | PROT_WRITE );
     pread( fd, map_addr, size, offset );
+#ifdef WINE_IOS
+    if (for_image) ios_swap_image_note( view, map_addr, map_size );   /* madeira-bcd swap-images (off: a no-op) */
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -20154,12 +20206,14 @@ static uint64_t ios_swap_cap, ios_swap_bump;
 /* resv: the extent maps a whole reservation (wide at reserve time, broad), so a
  * decommit inside it punches the file in place (ml1257). key: the size asked for
  * (reservation or commit), the churn filter's unit; born: ns when it was backed
- * (ml1258). */
-static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; } ios_swap_ext[16384];
+ * (ml1258). img: an image section's (madeira-bcd swap-images, ios_swap_image_map). */
+static struct { char *va; size_t len; uint64_t off; int resv; size_t key; uint64_t born; int img; } ios_swap_ext[16384];
 static unsigned ios_swap_n;
 static struct { uint64_t off, len; } ios_swap_free[8192];
 static unsigned ios_swap_nfree;
 static unsigned long long ios_swap_bytes, ios_swap_peak, ios_swap_backs, ios_swap_releases, ios_swap_unbacks, ios_swap_refused;
+/* madeira-bcd swap-images: image sections in the file now / at most, sections backed, refused */
+static unsigned long long ios_swap_img_bytes, ios_swap_img_peak, ios_swap_img_backs, ios_swap_img_refused;
 
 /* COVERAGE, FREE-SPACE REUSE AND A LOW-VOLUME CENSUS (only while the tier is on).
  *
@@ -20625,7 +20679,7 @@ static int ios_swap_map( void *base, size_t size, int unix_prot )
     }
 mapped:
     ios_swap_ext[ios_swap_n].va = hs; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
-    ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size;
+    ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = size; ios_swap_ext[ios_swap_n].img = 0;
     ios_swap_ext[ios_swap_n].born = ios_swap_broad ? ios_swap_now_ns() : 0; ios_swap_n++;
     ios_swap_churn_backed( size );   /* ml1226 */
     ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
@@ -20719,6 +20773,7 @@ static void ios_swap_release_range( void *base, size_t size, int copy_back )
             }
             ios_swap_give( ooff, olen );
             ios_swap_bytes -= olen;
+            if (ios_swap_ext[i].img) ios_swap_img_bytes -= olen;   /* madeira-bcd swap-images */
             ios_swap_releases++;
             /* trim the extent: up to two remaining pieces */
             if (oa == a && ob == b)
@@ -20804,6 +20859,9 @@ void ios_swap_stats_line( void )
     if (ios_pool_takes || ios_pool_guarded)
         dprintf( 2, "[swap] ml1150 pool: %llu MB in use (peak %llu), %llu takes, %llu guarded, %llu MB lost to a full free list\n",
                  ios_pool_bytes >> 20, ios_pool_peak >> 20, ios_pool_takes, ios_pool_guarded, ios_pool_lost >> 20 );
+    if (ios_swap_img_backs || ios_swap_img_refused)   /* madeira-bcd swap-images */
+        dprintf( 2, "[swap] swap-images: %llu MB of image sections in the file (peak %llu), %llu sections moved, %llu refused\n",
+                 ios_swap_img_bytes >> 20, ios_swap_img_peak >> 20, ios_swap_img_backs, ios_swap_img_refused );
     /* ml1221: the census (bytes by reason) with every stats line, ~10 s, not only
      * after its own 30 s: Ori and the Will of the Wisps was jetsammed at 26 s and never printed one. */
     ios_swap_tick( 1 );
@@ -20866,6 +20924,13 @@ static void ios_swap_tick( int force )
             p = ios_swap_put( p, end, " " ); p = ios_swap_put( p, end, ios_swap_skip_name[i] );
             p = ios_swap_put( p, end, "=" ); p = ios_swap_put_u( p, end, ios_swap_skip_bytes[i] >> 20 );
         }
+    }
+    if (ios_swap_img_backs || ios_swap_img_refused)   /* madeira-bcd swap-images */
+    {
+        p = ios_swap_put( p, end, " | images=" );     p = ios_swap_put_u( p, end, ios_swap_img_bytes >> 20 );
+        p = ios_swap_put( p, end, "MB peak=" );       p = ios_swap_put_u( p, end, ios_swap_img_peak >> 20 );
+        p = ios_swap_put( p, end, "MB sections=" );   p = ios_swap_put_u( p, end, ios_swap_img_backs );
+        p = ios_swap_put( p, end, " refused=" );      p = ios_swap_put_u( p, end, ios_swap_img_refused );
     }
     p = ios_swap_put( p, end, " | footprint=" );      p = ios_swap_put_u( p, end, ios_swap_footprint_mb() );
     p = ios_swap_put( p, end, "MB coverage=" );       p = ios_swap_put( p, end, ios_swap_mode );
@@ -20946,6 +21011,57 @@ static int ios_swap_whole_resv( struct file_view *view, unsigned int vprot )
     else ios_swap_tick( 0 );
     return 1;
 }
+/* madeira-bcd swap-images (see ios_swap_image_flush): the file side. With the
+ * lock held, ios_swap_image_take reserves a file range for a section's
+ * host-page interior (-1: tier off, extent table or disk full); the caller
+ * copies the section into it with pwrite after leaving the lock, and with the
+ * lock held again ios_swap_image_map maps the range over the anonymous copy
+ * -- a MAP_FIXED that fails leaves the old mapping and its data in place on
+ * Darwin, as for ios_swap_map -- or gives it back. No page is touched here.
+ * Image extents never feed the churn filter (key 0, born 0) and never come
+ * from the ml1150 pool, whose ranges a pwrite cannot reach. */
+static uint64_t ios_swap_image_take( size_t len )
+{
+    uint64_t off;
+    if (ios_swap_fd < 0 || !len || (len & host_page_mask) || ios_swap_n >= 16384) return (uint64_t)-1;
+    if (ios_swap_broad && ios_swap_disk_used() >= ios_swap_cap) { ios_swap_disk_refused++; ios_swap_img_refused++; return (uint64_t)-1; }
+    off = ios_swap_take( len );
+    if (off == (uint64_t)-1) ios_swap_img_refused++;
+    return off;
+}
+static int ios_swap_image_map( char *va, size_t len, uint64_t off )
+{
+    void *p;
+    if (ios_swap_fd < 0) return 0;
+    if (((uintptr_t)va & host_page_mask) || ios_swap_n >= 16384 || ios_swap_overlaps( va, len ))
+    {
+        ios_swap_give( off, len );
+        ios_swap_img_refused++;
+        return 0;
+    }
+    p = mmap( va, len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_SHARED, ios_swap_fd, (off_t)off );
+    if (p == MAP_FAILED)
+    {
+        static int said;
+        if (said++ < 8) dprintf( 2, "[swap] swap-images: mmap MAP_SHARED %p+0x%zx failed errno=%d (section stays anonymous)\n", va, len, errno );
+        ios_swap_give( off, len );
+        ios_swap_img_refused++;
+        return 0;
+    }
+    ios_swap_ext[ios_swap_n].va = va; ios_swap_ext[ios_swap_n].len = len; ios_swap_ext[ios_swap_n].off = off;
+    ios_swap_ext[ios_swap_n].resv = 0; ios_swap_ext[ios_swap_n].key = 0; ios_swap_ext[ios_swap_n].born = 0;
+    ios_swap_ext[ios_swap_n].img = 1; ios_swap_n++;
+    ios_swap_bytes += len; if (ios_swap_bytes > ios_swap_peak) ios_swap_peak = ios_swap_bytes;
+    ios_swap_backs++;
+    ios_swap_img_bytes += len; if (ios_swap_img_bytes > ios_swap_img_peak) ios_swap_img_peak = ios_swap_img_bytes;
+    ios_swap_img_backs++;
+    if (ios_swap_img_backs <= 16 || (ios_swap_img_backs % 64) == 0 || len >= (64u << 20))
+        dprintf( 2, "[swap] swap-images: moved %p+0x%zx (image section, file off %llu MB): %llu MB of images in the file, "
+                    "%llu MB file-backed in %u extents\n", va, len, (unsigned long long)(off >> 20),
+                 ios_swap_img_bytes >> 20, ios_swap_bytes >> 20, ios_swap_n );
+    ios_swap_tick( 0 );
+    return 1;
+}
 /* swap-tier core end */
 static unsigned long long ios_swap_footprint_mb( void )
 {
@@ -20968,6 +21084,82 @@ static void ios_swap_cfg( int *mode, int *min_mb )
 {
     *mode = (int)madeira_cfg_int( "swap-mode", 1 );       /* ml1257: madeira.cfg swap-mode = 2 */
     *min_mb = (int)madeira_cfg_int( "swap-min-mb", 0 );   /* ml1257: madeira.cfg swap-min-mb = N */
+}
+
+/* madeira-bcd swap-images: the switch, read once; on only with the tier on.
+ * virtual_mutex held (the first call starts the tier, as allocate_virtual_memory does). */
+static int ios_swap_images_enabled( void )
+{
+    static int on = -1;
+    if (on < 0)
+    {
+        /* 1: pure-x64 images' sections move to the swap tier's file after they are read (needs swap-mb and env.MADEIRA_X64_IMAGE_NOCOPY = 1). */
+        on = madeira_cfg_bool( "swap-images", 0 );
+        if (on)
+        {
+            ios_swap_init();
+            if (ios_swap_fd < 0) on = 0;
+            dprintf( 2, "[swap] swap-images %s (madeira.cfg swap-images = 1)\n",
+                     on ? "on: sections of pure-x64 images move to the swap file after they are read"
+                        : "requested but the swap tier is off (swap-mb): images stay anonymous" );
+        }
+    }
+    return on;
+}
+
+/* madeira-bcd swap-images: move the sections ios_swap_image_note recorded on
+ * this thread into the swap file. Called by virtual_map_image with
+ * virtual_mutex RELEASED (ml1081). Per range: reserve the file range (lock),
+ * pwrite the section's current bytes there (no lock: may block on the file),
+ * then map it over the anonymous copy and re-apply the pages' protections
+ * (lock), or give it back. Between the two locked steps nothing writes the
+ * range: the view is not returned to its caller yet. Every step re-checks that
+ * the range still lies in the same pure-x64 image view (VPROT_X64DATA) and is
+ * not backed yet; `ok` = 0 (the image failed to map) drops the notes. */
+static void ios_swap_image_flush( int ok )
+{
+    unsigned i, n = ios_swap_image_npend;
+    ios_swap_image_npend = 0;
+    for (i = 0; ok && i < n; i++)
+    {
+        char *va = ios_swap_image_pend[i].va;
+        size_t len = ios_swap_image_pend[i].len;
+        void *view_base = ios_swap_image_pend[i].view_base;
+        struct file_view *view;
+        uint64_t off = (uint64_t)-1;
+        sigset_t sigset;
+        ssize_t written;
+        int err, same;
+
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        view = find_view( va, len );
+        if (view && view->base == view_base && (view->protect & SEC_IMAGE) && (view->protect & VPROT_X64DATA) &&
+            !ios_swap_overlaps( va, len ))
+            off = ios_swap_image_take( len );
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        if (off == (uint64_t)-1) continue;
+
+        written = pwrite( ios_swap_fd, va, len, (off_t)off );
+        err = written < 0 ? errno : 0;
+
+        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+        view = find_view( va, len );
+        same = view && view->base == view_base && (view->protect & VPROT_X64DATA);
+        if (written == (ssize_t)len && same)
+        {
+            if (ios_swap_image_map( va, len, off )) mprotect_range( va, len, 0, 0 );
+        }
+        else
+        {
+            static int said;
+            if (said++ < 8)
+                dprintf( 2, "[swap] swap-images: %p+0x%zx not moved (pwrite %zd of %zu, errno %d; view %s): stays anonymous\n",
+                         va, len, written, len, err, same ? "unchanged" : view ? "changed" : "gone" );
+            ios_swap_give( off, len );
+            ios_swap_img_refused++;
+        }
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    }
 }
 
 /* Replacement for decommit_pages in pinned virtual_ios.c.  The original
@@ -22242,6 +22434,16 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 
     /* map all the sections */
 
+#ifdef WINE_IOS
+    /* madeira-bcd swap-images: the sections of the images [x64-image] marks
+     * below (same test, VPROT_ARM64EC aside: ios_swap_image_flush re-checks the
+     * mark) are noted as they are read; see ios_swap_image_note. */
+    ios_swap_image_npend = 0;
+    ios_swap_image_armed = ios_swap_images_enabled() && ios_x64_image_nocopy_enabled() && !ios_map_resource_view &&
+                           !ios_wow_base() && nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+                           nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+                           !image_info->is_hybrid && !image_info->wine_builtin;
+#endif
     for (i = pos = 0; i < nt->FileHeader.NumberOfSections; i++)
     {
         static const SIZE_T sector_align = 0x1ff;
@@ -22347,6 +22549,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             memset( ptr + sec[i].VirtualAddress + file_size, 0, end - file_size );
         }
     }
+#ifdef WINE_IOS
+    ios_swap_image_armed = 0;   /* madeira-bcd swap-images: only the sections loop notes */
+#endif
 
 #ifdef __aarch64__
     if ((dir = get_data_dir( nt, total_size, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG )))
@@ -22605,6 +22810,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
 #endif
 
 done:
+#ifdef WINE_IOS
+    ios_swap_image_armed = 0;   /* madeira-bcd swap-images: also on the failure paths out of the loop */
+#endif
     free( sections );
     return status;
 }
@@ -22992,6 +23200,9 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
 
 done:
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+#ifdef WINE_IOS
+    ios_swap_image_flush( NT_SUCCESS(status) );   /* madeira-bcd swap-images: outside the lock (ml1081) */
+#endif
     if (needs_close) close( unix_fd );
     if (shared_needs_close) close( shared_fd );
     return status;
@@ -23394,6 +23605,38 @@ void virtual_init(void)
 }
 
 
+/* madeira-bcd: 1 when the calling pseudo-process is a Chromium browser that
+ * judges memory pressure by GlobalMemoryStatusEx: SocialClubHelper.exe or
+ * steamwebhelper.exe (the last component of its PEB's image path, any case).
+ * Used by ios_avail_phys for avail-phys-cef-mb. */
+static int ios_avail_phys_chromium( void )
+{
+    static const char *const names[] = { "socialclubhelper.exe", "steamwebhelper.exe" };
+    PEB *peb = ios_jit_current_peb();
+    RTL_USER_PROCESS_PARAMETERS *pp = peb ? peb->ProcessParameters : NULL;
+    const WCHAR *path;
+    size_t len, base = 0, k, n;
+    unsigned i;
+
+    if (!pp || !(path = pp->ImagePathName.Buffer)) return 0;
+    len = pp->ImagePathName.Length / sizeof(WCHAR);
+    for (k = 0; k < len; k++) if (path[k] == '\\' || path[k] == '/') base = k + 1;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+    {
+        n = strlen( names[i] );
+        if (len - base != n) continue;
+        for (k = 0; k < n; k++)
+        {
+            WCHAR c = path[base + k];
+            if (c >= 'A' && c <= 'Z') c += 32;
+            if (c != (WCHAR)names[i][k]) break;
+        }
+        if (k == n) return 1;
+    }
+    return 0;
+}
+
+
 /***********************************************************************
  *           ios_avail_phys
  *
@@ -23410,38 +23653,67 @@ void virtual_init(void)
  * what remains before the limit (os_proc_available_memory) when that is
  * smaller. Called by the patched get_performance_info
  * (tools/patch-wine-avail-phys.py); off, host_free comes back unchanged.
+ *
+ * madeira-bcd: avail-phys-cef-mb = N (madeira.cfg or the game's own file, MB,
+ * 0 = off, independent of avail-phys) caps what Chromium browsers see -- Social
+ * Club's SocialClubHelper.exe and Steam's steamwebhelper.exe, nothing else (see
+ * ios_avail_phys_chromium) -- at N MB. The 467 run (2026-10-09 13:09) reached
+ * Chromium's moderate level only at 7.3 GB, a minute into play, long after the
+ * helper had grown: at RDR2.exe's start its V8 cage held 167 MB dirty, its
+ * PartitionAlloc 88 MB, and its ANGLE device two 32 MB staging blocks. Below
+ * 400 MB (e.g. 300) Chromium's Windows evaluator reports CRITICAL pressure on
+ * every 5 s check from the helper's start (full V8 GC, PartitionAlloc and
+ * discardable purges, Skia/tile caches dropped); 400-999 MB (e.g. 900)
+ * reports MODERATE every 10 s. The game and the launcher keep the real figure.
  */
 unsigned long long ios_avail_phys( unsigned long long host_free )
 {
     extern size_t os_proc_available_memory( void );
-    static int on = -1, band = -1, said;
-    static unsigned long long memsize;
-    unsigned long long left;
+    static int on = -1, band = -1, said, capped;
+    static unsigned long long memsize, cef;
+    unsigned long long left, value = host_free;
     int now;
 
     if (on < 0)
     {
         size_t len = sizeof(memsize);
+        long long mb;
         if (sysctlbyname( "hw.memsize", &memsize, &len, NULL, 0 )) memsize = 0;
         on = madeira_cfg_bool( "avail-phys", 0 );   /* madeira.cfg avail-phys = 1 */
         if (on) dprintf( 2, "[avail-phys] on: available physical memory is what remains before this "
                          "app's memory limit (madeira.cfg avail-phys = 1)\n" );
+        /* MB of available memory SocialClubHelper.exe / steamwebhelper.exe see at most (0 = off; 300 = Chromium's critical level). */
+        mb = madeira_cfg_int( "avail-phys-cef-mb", 0 );
+        cef = mb > 0 && mb <= 65536 ? (unsigned long long)mb << 20 : 0;
+        if (cef) dprintf( 2, "[avail-phys] Chromium browsers (SocialClubHelper.exe, steamwebhelper.exe) see at most "
+                          "%llu MB available: %s (madeira.cfg avail-phys-cef-mb = %lld)\n", cef >> 20,
+                          mb < 400 ? "Chromium's critical level, purges every 5 s" :
+                          mb < 1000 ? "Chromium's moderate level, purges every 10 s" : "no pressure level", mb );
     }
-    if (!on) return host_free;
-    left = (unsigned long long)os_proc_available_memory();
-    /* rdr61: a "no limit" sentinel larger than the machine is not a measurement */
-    if (!left || (memsize && left > memsize)) return host_free;
-    now = left < (400ull << 20) ? 2 : left < (1000ull << 20) ? 1 : 0;
-    if (now != band && said < 64)
+    if (on && (left = (unsigned long long)os_proc_available_memory()) &&
+        !(memsize && left > memsize))   /* rdr61: a "no limit" sentinel larger than the machine is not a measurement */
     {
-        said++;
-        dprintf( 2, "[avail-phys] %llu MB left before the limit (host free %llu MB): %s\n",
-                 left >> 20, host_free >> 20,
-                 now == 2 ? "below 400 MB, Chromium's critical level" :
-                 now == 1 ? "below 1000 MB, Chromium's moderate level" : "1000 MB or more" );
+        now = left < (400ull << 20) ? 2 : left < (1000ull << 20) ? 1 : 0;
+        if (now != band && said < 64)
+        {
+            said++;
+            dprintf( 2, "[avail-phys] %llu MB left before the limit (host free %llu MB): %s\n",
+                     left >> 20, host_free >> 20,
+                     now == 2 ? "below 400 MB, Chromium's critical level" :
+                     now == 1 ? "below 1000 MB, Chromium's moderate level" : "1000 MB or more" );
+        }
+        band = now;
+        if (left < host_free) value = left;
     }
-    band = now;
-    return left < host_free ? left : host_free;
+    /* madeira-bcd: avail-phys-cef-mb, the Chromium browsers only (see above) */
+    if (cef && value > cef && ios_avail_phys_chromium())
+    {
+        if (capped++ < 4)
+            dprintf( 2, "[avail-phys] a Chromium browser asked: %llu MB reported instead of %llu MB "
+                     "(madeira.cfg avail-phys-cef-mb)\n", cef >> 20, value >> 20 );
+        value = cef;
+    }
+    return value;
 }
 
 

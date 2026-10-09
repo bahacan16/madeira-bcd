@@ -156,6 +156,11 @@ OVERLAY = {
                         "XInput could list it twice. Read when the game first asks for a gamepad.",
                 "sources": ["tools/patch-wine-wgi-host-pads.py"]},
     # madeira-bcd: Red Dead Redemption 2 on build 470, 1.5 GB of argument-ring chunks.
+    "ind-probe": {"category": "Direct3D 12", "title": "ExecuteIndirect probe (diagnostic)",
+                "kind": "bool", "default": "1",
+                "note": "Default on. Every 3 s per pipeline, the first argument record of an ExecuteIndirect is read "
+                        "back by a small compute pass and logged as a [probe] line, 1500 lines at most. Each probe "
+                        "ends the open render pass. 0: no probes (Red Dead Redemption 2's list, build 476)."},
     "ring-share": {"category": "Direct3D 12", "title": "Share argument buffers between command lists",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: a command list gives the argument-buffer chunks its replay wrote back as "
@@ -341,7 +346,8 @@ OVERLAY = {
                         "pool was full. No effect on programs without Social Club."},
     "env.MADEIRA_SC_CEF_FLAGS": {"category": "Wine core (ntdll)", "title": "Extra SocialClubHelper.exe switches",
                 "note": "Appended verbatim to SocialClubHelper.exe's command line while env.MADEIRA_SC_CEF is on, "
-                        "e.g. --disable-gpu or --enable-logging=file --v=1."},
+                        "e.g. --disable-gpu or --enable-logging=file --v=1. A --js-flags= in it gets --jitless as its "
+                        "first flag (Chromium keeps only the last --js-flags=), unless MADEIRA_JITLESS = 0."},
     "env.MADEIRA_SC_PA_POOLS": {"category": "Memory & JIT pool", "title": "Room for Social Club's PartitionAlloc pools",
                 "kind": "choice", "default": "",
                 "choices": [("", "Off"), ("1", "Layout 1 (chrome_elf.dll only)"), ("2", "Layout 2 (chrome_elf, libcef, Oilpan)")],
@@ -363,6 +369,21 @@ OVERLAY = {
                         "remains before Madeira's memory limit instead of the phone's free memory, so Chromium "
                         "(Social Club, Steam) frees caches below 1000 MB and 400 MB left, and a game can see memory "
                         "running out. Set it in the game's own file; read at session start."},
+    # madeira-bcd: the memory before the game (2026-10-09, virtual_ios.c ios_avail_phys / ios_swap_image_flush).
+    "avail-phys-cef-mb": {"category": "Memory & JIT pool", "title": "Available memory Chromium sees (MB)",
+                "kind": "int", "default": "0",
+                "note": "0 (default): off. N: Social Club's SocialClubHelper.exe and Steam's steamwebhelper.exe see at "
+                        "most N MB of available physical memory, nobody else (the game and the launcher keep the real "
+                        "figure). Below 400 (e.g. 300) Chromium reports critical memory pressure every 5 s and purges "
+                        "caches and garbage; 400-999 (e.g. 900), moderate every 10 s. Independent of avail-phys. Set it "
+                        "in the game's own file; read at session start."},
+    "swap-images": {"category": "Memory & JIT pool", "title": "Swap tier: pure-x64 DLLs and programs in the file",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: the sections of pure-x64 images (with env.MADEIRA_X64_IMAGE_NOCOPY = 1: "
+                        "libcef.dll, steamclient64.dll, launchers, the game exe) move to the swap tier's file once they "
+                        "are read, so they stop counting against the memory limit (iOS writes them back and may drop "
+                        "them). Needs swap-mb. Page edges shared with a neighbouring section stay in memory. Set it in "
+                        "the game's own file; read at session start."},
     # madeira-bcd: budget-change events in dxgi-src.dll (tools/patch-dxgi-budget-events.py).
     "env.MADEIRA_DXGI_BUDGET_EVENTS": {"category": "Direct3D 9/10/11 (DXMT)",
                 "title": "Tell the game when its video memory budget changes",
@@ -380,6 +401,16 @@ OVERLAY = {
                         "upstream's DXMT d3d11 plus SwapDeviceContextState, which Wine's Direct2D (d2d1) calls and "
                         "upstream's aborts in (Rockstar Games Launcher exited with code 3). Off (default): upstream's "
                         "committed d3d11.dll. Set it in the game's own file, not for every game; read at session start."},
+    # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
+    "env.DXMT_SMALL_RINGS": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Small DXMT staging rings for these programs",
+                "kind": "text", "default": "", "sources": ["tools/patch-d3d11-src-small-rings.py"],
+                "note": "Needs env.MADEIRA_D3D11_SRC = 1. Program file names separated by ';' (e.g. "
+                        "Launcher.exe;SocialClubHelper.exe), or 1 for every program: in those programs DXMT's staging "
+                        "ring, copy-temp ring and upload heap use 4 MB Metal blocks instead of 32 MB. A ring keeps its "
+                        "blocks until 300 later submissions and an idle program keeps them for good (Rockstar Games "
+                        "Launcher 132 MB, Social Club 68 MB through a whole RDR2 session). Larger uploads still get a "
+                        "block of their own; each named program logs one [small-rings] line. Unset or 0 (default): "
+                        "32 MB as upstream. Set it in the game's own file; read when the program starts."},
     # madeira-bcd: the D3D12/DXGI GPU as a D3DKMT adapter (build/win32u-unix/d3dkmt_ios.c).
     "env.MADEIRA_KMT_ADAPTER": {"category": "Windows, display & input", "title": "D3DKMT adapter for the GPU (WDDM 3.1)",
                 "kind": "bool", "default": "0",

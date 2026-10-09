@@ -394,6 +394,7 @@ jobs:
         run: |
           python3 tests/host/check-pool-low-images.py
           python3 tests/host/check-x64-image-nocopy.py
+          python3 tests/host/check-swap-images.py
           python3 tests/host/check-ec-hook.py
           python3 tests/host/check-x64-graphics-entry.py
           python3 tests/host/check-pool-startup-budget.py --require-swift
@@ -618,6 +619,14 @@ jobs:
         continue-on-error: true
         run: bash tools/build-dxgi-dll.sh
 
+      # env.DXMT_SMALL_RINGS (opt-in): 4 MB staging ring blocks for the
+      # programs it names (tools/patch-d3d11-src-small-rings.py), checked (and
+      # compiled for arm64ec) before the build below applies it.
+      - name: Check opt-in small staging rings
+        env:
+          MINGW: ${{ github.workspace }}/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin
+        run: python3 tests/host/check-d3d11-small-rings.py
+
       # madeira-bcd: DXMT's 64-bit d3d11.dll compiled from the dxmt submodule
       # with SwapDeviceContextState implemented (tools/patch-dxmt-context-state-
       # swap.py, on a copy). The committed arm64ec d3d11.dll aborts there, and
@@ -628,7 +637,10 @@ jobs:
       # which stays the default; a game opts in with env.MADEIRA_D3D11_SRC = 1
       # (WineProcessBridge.m). Runs before every DXMT patch step, so it compiles
       # the pristine pin, and it reports whether the unpatched build reproduces
-      # upstream's binary. A failure only warns: nothing is shipped.
+      # upstream's binary. A failure only warns: nothing is shipped. Since
+      # 2026-10-09 the DXMT core is compiled from a copy as well, with
+      # tools/patch-d3d11-src-small-rings.py: 4 MB staging ring blocks for the
+      # programs env.DXMT_SMALL_RINGS names (a failed patch only warns).
       - name: Build d3d11-src.dll (DXMT d3d11 from source, SwapDeviceContextState)
         continue-on-error: true
         run: bash tools/build-d3d11-dll.sh

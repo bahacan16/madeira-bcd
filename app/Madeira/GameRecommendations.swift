@@ -98,9 +98,14 @@ enum GameRecommendations {
     /// build 472's pool-mid: a mapping between the pool's two regions at image
     /// load cut the pool to 604 MB and the game stopped with ERR_GFX_INIT (14:33);
     /// and ring-share: on build 470 (14:48) the argument-buffer chunks grew to
-    /// 1.5 GB of the 3.6 GB Metal held in play.
+    /// 1.5 GB of the 3.6 GB Metal held in play; and build 476's test: the x64
+    /// program files (libcef.dll 228 MB, steamclient64.dll, the launcher, the
+    /// game) move to the swap file once read, the launcher's and Social Club's
+    /// DXMT upload rings take 4 MB blocks instead of 32 MB (they held 200 MB
+    /// through play on 467), and the ExecuteIndirect probe is off (on 470 it
+    /// split render passes every 3 s per pipeline for the first two minutes).
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 6,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 7,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -116,10 +121,12 @@ enum GameRecommendations {
         swap-mb = 8192
         swap-mode = 2
         swap-min-mb = 1
+        swap-images = 1
         pso-warm = 2
         fence-chain = 6
         avail-phys = 1
         indirect-fast = 1
+        ind-probe = 0
         fullscreen-window = 1
         env.WINE_D3D_CONFIG = renderer=no3d
         env.FEX_VECTORTSOENABLED = 0
@@ -135,6 +142,7 @@ enum GameRecommendations {
         env.MADEIRA_DXGI_BUDGET_EVENTS = 1
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
+        env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
         env.MADEIRA_EXECREQ_LEAVE = 1
         env.MADEIRA_PIN_GRAPHICS_DLLS = 1
         env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
