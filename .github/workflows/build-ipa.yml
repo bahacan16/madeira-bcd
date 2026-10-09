@@ -1288,7 +1288,9 @@ jobs:
             echo "::warning::d3d11-src.dll missing: this IPA has only upstream's d3d11.dll (no SwapDeviceContextState); env.MADEIRA_D3D11_SRC = 1 does nothing"
           fi
 
-      # tools/fetch-vcruntime.md: the twelve VC++ runtime DLLs are Microsoft's
+      # tools/fetch-vcruntime.md: the VC++ runtime DLLs (twelve, and since
+      # 2026-10-09 MFC's mfc140.dll and mfc140u.dll from the same package:
+      # Horizon Zero Dawn imports mfc140.dll) are Microsoft's
       # and are not redistributable under this project's license, so they are
       # gitignored and "you supply them yourself". Fetching them straight from
       # Microsoft at build time honours that -- nothing Microsoft-authored ever
@@ -1306,6 +1308,9 @@ jobs:
       #
       # cabextract is built for exactly this: it scans a file for embedded
       # cabinet headers rather than trusting its container format.
+      - name: Check the VC++ runtime list and the MFC switch
+        run: python3 tests/host/check-vcruntime-mfc.py
+
       - name: Fetch the VC++ runtime DLLs from Microsoft
         shell: bash
         run: |
@@ -1315,7 +1320,8 @@ jobs:
           WANT="concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll
                 msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll vcamp140.dll
                 vccorlib140.dll vcomp140.dll vcruntime140.dll vcruntime140_1.dll
-                vcruntime140_threads.dll"
+                vcruntime140_threads.dll mfc140.dll mfc140u.dll"
+          NWANT=$(echo $WANT | wc -w | tr -d ' ')
           command -v cabextract >/dev/null 2>&1 || brew install cabextract
           command -v msiextract >/dev/null 2>&1 || brew install msitools
 
@@ -1386,7 +1392,7 @@ jobs:
             done
           }
 
-          # Peel containers until all twelve turn up, or nothing new appears.
+          # Peel containers until all of them turn up, or nothing new appears.
           for pass in 1 2 3 4; do
             BEFORE=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
             find /tmp/vcx -type f -size +20k 2>/dev/null | while IFS= read -r f; do
@@ -1399,14 +1405,14 @@ jobs:
             done
             AFTER=$(find /tmp/vcx -type f 2>/dev/null | wc -l | tr -d ' ')
             collect
-            echo "pass $pass: $BEFORE -> $AFTER files, $FOUND of 12 recovered"
-            [ "$FOUND" -eq 12 ] && break
+            echo "pass $pass: $BEFORE -> $AFTER files, $FOUND of $NWANT recovered"
+            [ "$FOUND" -eq "$NWANT" ] && break
             [ "$BEFORE" = "$AFTER" ] && break
           done
 
-          echo "::notice::vcruntime :: recovered $FOUND of 12$([ -n "$MISSING" ] && echo " -- missing:$MISSING")"
+          echo "::notice::vcruntime :: recovered $FOUND of $NWANT$([ -n "$MISSING" ] && echo " -- missing:$MISSING")"
 
-          if [ "$FOUND" -lt 12 ]; then
+          if [ "$FOUND" -lt "$NWANT" ]; then
             echo "-- what the installer actually unpacked to (biggest 40) --"
             find /tmp/vcx -type f -size +20k -exec ls -S {} + 2>/dev/null \
               | head -40 | sed "s|/tmp/vcx/||"
@@ -1431,8 +1437,8 @@ jobs:
         run: |
           shopt -s nullglob
           DLLS=(app/Madeira/x86_64-vcruntime/*.dll)
-          echo "x86_64-vcruntime DLLs present: ${#DLLS[@]} of 12"
-          if [ "${#DLLS[@]}" -lt 12 ]; then
+          echo "x86_64-vcruntime DLLs present: ${#DLLS[@]} of 14 (12 C++ runtime + MFC's 2)"
+          if [ "${#DLLS[@]}" -lt 14 ]; then
             echo "::warning::IPA will build, but games built with MSVC will not \
           start until the VC++ runtime DLLs are added -- see tools/fetch-vcruntime.md"
           fi

@@ -105,6 +105,11 @@ OVERLAY = {
                         "command buffer, each kind of command (draws, dispatches, copies, clears, barriers, render "
                         "targets, queries, state) and the end of each list. For finding why a game's frame is slow "
                         "when the GPU is not busy."},
+    "env.MADEIRA_MFC": {"category": "Wine libraries", "title": "Microsoft MFC (mfc140.dll, mfc140u.dll)",
+                "kind": "bool", "default": "1",
+                "note": "On by default. MFC comes from the same Microsoft VC++ package as the C++ runtime and is "
+                        "linked into the game's system32; games that import it (Horizon Zero Dawn) stop at once "
+                        "without it. Wine has no MFC of its own. 0 leaves it out. Read at session start."},
     "fullscreen-window": {"category": "Direct3D 12", "title": "Full screen moves the game's window over the whole screen",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: when a Direct3D 12 game switches to full screen, its window is moved to the "

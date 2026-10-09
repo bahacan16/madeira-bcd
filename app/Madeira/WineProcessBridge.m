@@ -1638,7 +1638,24 @@ static void *wine_process_thread(void *arg) {
                 NSString *vcrtSource = [bundlePath stringByAppendingPathComponent:@"x86_64-vcruntime"];
                 NSArray *vcrtDlls = [fm contentsOfDirectoryAtPath:vcrtSource error:nil];
                 int vcrtLinked = 0, vcrtSkipped = 0;
+                /* madeira-bcd: MFC (mfc140.dll, mfc140u.dll) comes from the same
+                 * VC_redist.x64.exe since 2026-10-09: Horizon Zero Dawn imports
+                 * mfc140.dll and stopped at once with c0000135 without it (log
+                 * 12:51:47, build 466). Wine has no MFC of its own, so nothing
+                 * else changes. env.MADEIRA_MFC = 0 leaves it out of system32. */
+                const char *mfcEnv = getenv("MADEIRA_MFC");
+                BOOL mfcOff = mfcEnv && mfcEnv[0] == '0';
                 for (NSString *dll in vcrtDlls) {
+                    if ([[dll lowercaseString] hasPrefix:@"mfc"]) {
+                        NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
+                        if (mfcOff) {
+                            [fm removeItemAtPath:dst error:nil];   /* a link from an earlier session */
+                            vcrtSkipped++;
+                            dprintf(STDERR_FILENO, "[WineProc] %s left out (MADEIRA_MFC=0)\n", dll.UTF8String);
+                            continue;
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] MFC %s linked (MADEIRA_MFC=0 leaves it out)\n", dll.UTF8String);
+                    }
                     /* NOTE 2026-07-03 (late): retried lifting BOTH exemptions
                      * below after the fast-write bisect, hoping trap-mode had
                      * fixed the corruption class (and to keep hot CRT calls

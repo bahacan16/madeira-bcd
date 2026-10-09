@@ -4,14 +4,17 @@ Games built with MSVC need the Visual C++ runtime. Those DLLs are authored by
 Microsoft and are **not** redistributable under this project's license, so they
 are not committed here. You supply them yourself.
 
-Twelve files are expected in `app/Madeira/x86_64-vcruntime/`:
+Fourteen files are expected in `app/Madeira/x86_64-vcruntime/`, the twelve
+C++ runtime DLLs and MFC's two from the same package (madeira-bcd,
+2026-10-09: Horizon Zero Dawn imports mfc140.dll; `env.MADEIRA_MFC = 0` keeps
+MFC out of a game's system32):
 
 ```
 concrt140.dll              msvcp140_codecvt_ids.dll   vcruntime140.dll
 msvcp140.dll               vcamp140.dll               vcruntime140_1.dll
 msvcp140_1.dll             vccorlib140.dll            vcruntime140_threads.dll
-msvcp140_2.dll             vcomp140.dll
-msvcp140_atomic_wait.dll
+msvcp140_2.dll             vcomp140.dll               mfc140.dll
+msvcp140_atomic_wait.dll                              mfc140u.dll
 ```
 
 ## How to get them
@@ -25,8 +28,8 @@ brew install sevenzip
 7zz x /tmp/vcredist/.rsrc/1033/CABINET/*.cab -oapp/Madeira/x86_64-vcruntime
 ```
 
-Exact layout varies by redistributable version; the goal is simply the twelve
-files above, **byte-for-byte as Microsoft shipped them**.
+Exact layout varies by redistributable version; the goal is simply the
+fourteen files above, **byte-for-byte as Microsoft shipped them**.
 
 ## Do not modify them
 
