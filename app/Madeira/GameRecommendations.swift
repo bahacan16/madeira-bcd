@@ -274,17 +274,30 @@ enum GameRecommendations {
     /// language menu at 56 FPS with no input at all: no window was foreground,
     /// so its raw keyboard and mouse input went nowhere, and it reads its pad
     /// only through Windows.Gaming.Input; build 475's two switches cover both.
+    /// On build 475 (2026-10-09 16:20) the game played for seven minutes, then
+    /// stopped with an "Error" box when its settings menu was refused a
+    /// pipeline: the converter refused ~4,900 of its shaders with code 4 (they
+    /// read a "t4-unbounded" range), each of them again for every pipeline.
+    /// Build 477's switches retry those with sized ranges, remember what stays
+    /// refused, and hand the game a placeholder instead of a failure; Wine's
+    /// "controller_get_User stub" line (12,747 of them, the game asks every
+    /// frame) is silenced.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 3,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 4,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         dxbc-register-spaces = 1
+        msc-unbounded-retry = 1
+        msc-fail-memo = 1
+        pso-placeholder = 1
+        pso-warm = 2
         swap-mb = 3072
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_INPUT_FOREGROUND = 1
         env.MADEIRA_WGI_HOST_PADS = 1
+        env.WINEDEBUG = fixme-input
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
 

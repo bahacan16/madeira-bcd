@@ -1211,6 +1211,12 @@ jobs:
           python3 tests/host/check-null-fragment.py
           python3 tests/host/check-rsig-miss.py
 
+      # Horizon Zero Dawn's refused shaders (build 475): a code-4 retry with
+      # sized unbounded ranges, a session memo of refusals and placeholder
+      # pipelines (msc-unbounded-retry, msc-fail-memo, pso-placeholder; all off).
+      - name: Check the refused-shader retry, memo and placeholder
+        run: python3 tests/host/check-msc-unbounded-retry.py
+
       # madeira-bcd: Horizon Zero Dawn got no input (build 471): XInput pads as
       # Windows.Gaming.Input gamepads (MADEIRA_WGI_HOST_PADS=1) and the opt-in
       # foreground for a process when no window is foreground

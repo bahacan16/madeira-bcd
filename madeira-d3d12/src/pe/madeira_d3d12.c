@@ -855,6 +855,10 @@ struct mad_rootsig {
      * the table it points at (nsamplers sampler descriptors, built once). */
     obj_handle_t stab; UINT64 stab_gpu;
     const struct mad_descriptor *stab_cpu;   /* the same table, for the DXBC backend's copies (mad_air_resolve) */
+    /* madeira-bcd msc-unbounded-retry: 1 once a shader of this root signature
+     * converted only with its unbounded ranges given a size, 2 once that did not
+     * help MAD_UNB_FAILS_MAX times; unb_fails counts those. */
+    volatile LONG unb_state, unb_fails;
 };
 struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
@@ -12367,6 +12371,85 @@ done:
     free(buf); free(buf2); free(vsin); free(locs);
     return ok;
 }
+/* madeira-bcd msc-fail-memo (madeira.cfg or the game's own file, off by
+ * default): the converter's refusals, remembered for the session under the
+ * shader cache's key (the bytecode, the root signature's content, the stage
+ * options). A refused stage was converted again for every pipeline that used
+ * it: Horizon Zero Dawn's build 475 run (2026-10-09 16:20) made ~30,000 refused
+ * conversions of ~4,900 shaders, most of the 278 s of conversion time behind
+ * its 10 FPS first minutes and the stall before its settings menu failed. Only
+ * MADEIRA_IR_COMPILE_FAILED is remembered (the converter's own verdict, which
+ * the same inputs repeat); memory, buffer and service failures are not. A
+ * remembered refusal comes back with g_failmemo_note in ret_note, so the
+ * caller logs it once per shader, not once per pipeline. */
+#define MAD_FAILMEMO_N 16384u
+static struct { UINT64 k0, k1; UINT32 code, backend; } g_failmemo[MAD_FAILMEMO_N];
+static unsigned g_failmemo_n;
+static SRWLOCK g_failmemo_lock = SRWLOCK_INIT;
+static int g_failmemo_on = -1;
+static volatile LONG g_failmemo_hits;
+static const char g_failmemo_note[] = "refused before (msc-fail-memo)";
+
+static int mad_failmemo_on(void) {
+    if (g_failmemo_on < 0) {
+        g_failmemo_on = mad_cfg_int_pe("msc-fail-memo", 0) ? 1 : 0;   /* madeira.cfg msc-fail-memo = 1 */
+        if (g_failmemo_on)
+            d3d12_log("[madeira-d3d12] msc-fail-memo = 1: a stage the converter refused is not converted again "
+                      "in this session (same bytecode, root signature and options)\n");
+    }
+    return g_failmemo_on;
+}
+
+static unsigned mad_failmemo_slot(const UINT64 key[2]) {
+    return (unsigned)(key[0] ^ (key[1] >> 17) ^ (key[1] << 7)) & (MAD_FAILMEMO_N - 1);
+}
+
+/* 1, with the remembered verdict in *a, when this key was refused before. */
+static int mad_failmemo_find(const UINT64 key[2], struct madeira_ir_convert_args *a) {
+    unsigned i, h = mad_failmemo_slot(key);
+    int hit = 0;
+    AcquireSRWLockShared(&g_failmemo_lock);
+    for (i = 0; i < MAD_FAILMEMO_N; i++) {
+        unsigned j = (h + i) & (MAD_FAILMEMO_N - 1);
+        if (!g_failmemo[j].k0 && !g_failmemo[j].k1) break;
+        if (g_failmemo[j].k0 == key[0] && g_failmemo[j].k1 == key[1]) {
+            a->ret_status = MADEIRA_IR_COMPILE_FAILED;
+            a->ret_error_code = g_failmemo[j].code;
+            a->ret_backend = g_failmemo[j].backend;
+            a->ret_len = 0;
+            snprintf(a->ret_note, sizeof a->ret_note, "%s", g_failmemo_note);
+            hit = 1;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_failmemo_lock);
+    if (hit) {
+        LONG n = InterlockedIncrement(&g_failmemo_hits);
+        if (n == 1 || !(n % 2000))
+            d3d12_log("[madeira-d3d12] msc-fail-memo: %ld conversions of refused stages skipped (%u refusals remembered)\n",
+                      (long)n, g_failmemo_n);
+    }
+    return hit;
+}
+
+static void mad_failmemo_add(const UINT64 key[2], const struct madeira_ir_convert_args *a) {
+    unsigned i, h = mad_failmemo_slot(key);
+    if (!key[0] && !key[1]) return;   /* the empty-slot mark */
+    AcquireSRWLockExclusive(&g_failmemo_lock);
+    if (g_failmemo_n < MAD_FAILMEMO_N / 4 * 3)   /* keep the probe chains short; past that, convert as before */
+        for (i = 0; i < MAD_FAILMEMO_N; i++) {
+            unsigned j = (h + i) & (MAD_FAILMEMO_N - 1);
+            if (g_failmemo[j].k0 == key[0] && g_failmemo[j].k1 == key[1]) break;
+            if (!g_failmemo[j].k0 && !g_failmemo[j].k1) {
+                g_failmemo[j].k0 = key[0]; g_failmemo[j].k1 = key[1];
+                g_failmemo[j].code = a->ret_error_code; g_failmemo[j].backend = a->ret_backend;
+                g_failmemo_n++;
+                break;
+            }
+        }
+    ReleaseSRWLockExclusive(&g_failmemo_lock);
+}
+
 static void mad_ir_convert_cached_impl(struct madeira_ir_convert_args *a);
 static void mad_ir_convert_cached(struct madeira_ir_convert_args *a) {   /* madeira-bcd: timed */
     LONG64 t0 = mad_qpc();
@@ -12381,6 +12464,7 @@ static void mad_ir_convert_cached_impl(struct madeira_ir_convert_args *a) {
         if (a->out_buf && !fresh) { InterlockedIncrement(&g_sc_hit); mad_sc_stats(); }
         return;
     }
+    if (mad_failmemo_on() && mad_failmemo_find(key, a)) return;   /* madeira-bcd msc-fail-memo */
     if (!a->out_buf) {
         int r = mad_sc_convert_full(a, key);
         if (r < 0 || (r > 0 && mad_sc_load(a, key, &fresh))) return;
@@ -12390,6 +12474,8 @@ static void mad_ir_convert_cached_impl(struct madeira_ir_convert_args *a) {
         InterlockedIncrement(&g_sc_miss);
         mad_sc_save(a, key);
         mad_sc_stats();
+    } else if (a->ret_status == MADEIRA_IR_COMPILE_FAILED && mad_failmemo_on()) {
+        mad_failmemo_add(key, a);   /* madeira-bcd msc-fail-memo */
     }
 }
 
@@ -12698,6 +12784,100 @@ static void mad_rsig_miss_log(const char *tag, const struct mad_rootsig *rs, con
               (unsigned long long)h, desc);
 }
 
+/* madeira-bcd msc-unbounded-retry (madeira.cfg or the game's own file, off by
+ * default). Horizon Zero Dawn's build 475 run (2026-10-09 16:20) lost ~4,900
+ * DXIL vertex and pixel shaders to the converter's code 4
+ * (IRErrorCodeResourceNotReferencedByRootSignature) although rsig-miss found
+ * every binding in the root signature, and the game stopped with an "Error"
+ * box when its settings menu built more of them. Every refused shader reads
+ * t4-t7 of a table range "SRV t4-unbounded" (spaces 7 and 8) and samplers of
+ * "sampler s0-unbounded space 0"; the ones that convert do not. An unbounded
+ * range is NumDescriptors 0xffffffff, and base + count wraps to 3 in 32 bits
+ * when the base is 4 -- the likely reason the converter finds no range for t4
+ * (games whose unbounded ranges start at register 0 convert). With the switch,
+ * a code-4 refusal is converted once more with every unbounded range given the
+ * largest size a shader-visible D3D12 heap allows (2048 samplers, 1,000,000
+ * other descriptors), which addresses the same descriptors. Once that works for
+ * a root signature, its later shaders take the sized ranges first (and the
+ * original ones if those are refused); after MAD_UNB_FAILS_MAX retries that did
+ * not help, the root signature is left alone. The runtime's own tables and
+ * bindings are unchanged: only the converter's copy of the ranges differs. */
+#define MAD_UNB_FAILS_MAX 4
+static int g_unb_retry = -1;
+static volatile LONG g_unb_tries, g_unb_fixed, g_unb_first, g_unb_fallback;
+
+static int mad_unb_retry_on(void) {
+    if (g_unb_retry < 0) {
+        g_unb_retry = mad_cfg_int_pe("msc-unbounded-retry", 0) ? 1 : 0;   /* madeira.cfg msc-unbounded-retry = 1 */
+        if (g_unb_retry)
+            d3d12_log("[madeira-d3d12] msc-unbounded-retry = 1: a DXIL shader the converter refuses with code 4 is "
+                      "converted again with its root signature's unbounded ranges given a size (2048 samplers, "
+                      "1000000 other descriptors)\n");
+    }
+    return g_unb_retry;
+}
+
+/* rs's ranges with every unbounded one sized, or NULL when it has none (or no memory). */
+static struct madeira_ir_root_range *mad_unb_sized_copy(const struct mad_rootsig *rs) {
+    struct madeira_ir_root_range *c;
+    UINT i, n = 0;
+    if (!rs || !rs->ranges || !rs->nranges) return NULL;
+    for (i = 0; i < rs->nranges; i++) if (rs->ranges[i].num_descriptors == 0xffffffffu) n++;
+    if (!n || !(c = malloc((SIZE_T)rs->nranges * sizeof *c))) return NULL;
+    memcpy(c, rs->ranges, (SIZE_T)rs->nranges * sizeof *c);
+    for (i = 0; i < rs->nranges; i++)
+        if (c[i].num_descriptors == 0xffffffffu)
+            c[i].num_descriptors = c[i].range_type == MADEIRA_IR_RANGE_SAMPLER ? 2048u : 1000000u;
+    return c;
+}
+
+/* Which ranges the first attempt takes: 1 = sized, once they worked for rs. */
+static int mad_unb_sized_first(const struct mad_rootsig *rs) {
+    return rs && mad_unb_retry_on() && rs->unb_state == 1;
+}
+
+/* After a refusal: 1 when the other set of ranges is worth one more attempt.
+ * From the original ranges only for code 4 from the DXIL backend, while rs has
+ * not given up; from the sized ones always (back to what converted before). */
+static int mad_unb_retry_wanted(const struct mad_rootsig *rs, const struct madeira_ir_convert_args *a, int sized) {
+    if (!rs || !mad_unb_retry_on()) return 0;
+    if (sized) return 1;
+    return a->ret_backend != MADEIRA_IR_BACKEND_AIRCONV && a->ret_status == MADEIRA_IR_COMPILE_FAILED &&
+           a->ret_error_code == 4 && rs->unb_state != 2;
+}
+
+/* The outcome of a retry: ok with sized = the sized ranges helped. */
+static void mad_unb_note(struct mad_rootsig *rs, const char *tag, int sized, int ok) {
+    if (sized && ok) {
+        LONG n = InterlockedIncrement(&g_unb_fixed);
+        InterlockedCompareExchange(&rs->unb_state, 1, 0);
+        if (n <= 8 || !(n % 500))
+            d3d12_log("[madeira-d3d12] msc-unbounded-retry: %s converted with sized unbounded ranges after code 4 "
+                      "(%ld shaders so far, %ld retries)\n", tag, (long)n, (long)g_unb_tries);
+    } else if (sized) {
+        if (InterlockedIncrement(&rs->unb_fails) >= MAD_UNB_FAILS_MAX) InterlockedCompareExchange(&rs->unb_state, 2, 0);
+        if (InterlockedIncrement(&g_unb_first) <= 8)
+            d3d12_log("[madeira-d3d12] msc-unbounded-retry: %s refused with sized ranges too\n", tag);
+    } else if (ok) {
+        if (InterlockedIncrement(&g_unb_fallback) <= 8)
+            d3d12_log("[madeira-d3d12] msc-unbounded-retry: %s refused with sized ranges, converted with the "
+                      "original ones\n", tag);
+    }
+}
+
+/* madeira-bcd pso-placeholder: see device_CreateGraphicsPipelineState. */
+static int g_pso_placeholder = -1;
+static volatile LONG g_pso_placeholders;
+static int mad_pso_placeholder_on(void) {
+    if (g_pso_placeholder < 0) {
+        g_pso_placeholder = mad_cfg_int_pe("pso-placeholder", 0) ? 1 : 0;   /* madeira.cfg pso-placeholder = 1 */
+        if (g_pso_placeholder)
+            d3d12_log("[madeira-d3d12] pso-placeholder = 1: a graphics pipeline whose vertex or pixel stage does not "
+                      "convert is returned as a placeholder whose draws are skipped, not as E_FAIL\n");
+    }
+    return g_pso_placeholder;
+}
+
 /* ml1990: the inputs of one conversion request, shared by the first call and
  * any retry so the two can never disagree about what is being converted. */
 static void mad_fill_convert_inputs(struct madeira_ir_convert_args *a, struct mad_rootsig *rs,
@@ -12788,6 +12968,11 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     const int onepass = mad_onepass_enabled();
     int retried = 0;
     LONG64 t0 = mad_qpc();
+    /* madeira-bcd msc-unbounded-retry: the converter's copy of the ranges with
+     * the unbounded ones sized (sized = in use), and whether the other set was
+     * tried after a refusal. */
+    struct madeira_ir_root_range *sized_ranges = NULL;
+    int sized = 0, switched = 0;
 
     if (o && o->air) memset(o->air, 0, sizeof *o->air);   /* ml1008 */
     if (o && o->tess_stage && o->air2) memset(o->air2, 0, sizeof *o->air2);   /* ml1083 */
@@ -12798,10 +12983,13 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         if (!buf) return 0;
         if (o && o->layout) { buf2 = malloc(cap2); if (!buf2) { free(buf); return 0; } }   /* ml927: the stage-in metallib */
     }
+    if (mad_unb_sized_first(rs) && (sized_ranges = mad_unb_sized_copy(rs))) sized = 1;
 
     /* Size-then-fill (rollback) asks with no buffer; one-pass converts
      * straight into the first buffer and only comes back if it was too small. */
+again:
     mad_fill_convert_inputs(&a, rs, dxil, dxil_len, entry, o);
+    if (sized) a.ranges = (uint64_t)(uintptr_t)sized_ranges;   /* madeira-bcd msc-unbounded-retry */
     a.out_entry = (uint64_t)(uintptr_t)name;
     if (onepass) {
         a.out_buf = (uint64_t)(uintptr_t)buf; a.out_cap = (uint64_t)need;
@@ -12812,6 +13000,23 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
     mad_ir_convert_cached(&a);   /* madeira-bcd: persistent shader cache */
     if (a.ret_status != MADEIRA_IR_BUFFER_TOO_SMALL && a.ret_status != MADEIRA_IR_OK) {
         const unsigned char *b = (const unsigned char *)dxil;
+        const int memo = !strcmp(a.ret_note, g_failmemo_note);   /* madeira-bcd msc-fail-memo: refused before */
+        /* madeira-bcd msc-unbounded-retry: once more with the other set of ranges */
+        if (!switched && mad_unb_retry_wanted(rs, &a, sized)) {
+            switched = 1;
+            if (!sized && !sized_ranges) sized_ranges = mad_unb_sized_copy(rs);
+            if (sized || sized_ranges) {
+                sized = !sized;
+                if (sized) InterlockedIncrement(&g_unb_tries);
+                if (o && o->air) memset(o->air, 0, sizeof *o->air);
+                if (o && o->tess_stage && o->air2) memset(o->air2, 0, sizeof *o->air2);
+                name[0] = 0;
+                goto again;
+            }
+        }
+        if (switched && !memo) mad_unb_note(rs, tag, sized, 0);
+        free(sized_ranges);
+        if (memo) { free(buf); free(buf2); return 0; }   /* madeira-bcd msc-fail-memo: logged when it was refused */
         d3d12_log("[madeira-d3d12] %s conversion failed: %s (%s backend, code %u); %llu bytes, head "
                   "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
                   tag, mad_ir_status_name(a.ret_status),
@@ -12840,16 +13045,17 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         need = (SIZE_T)a.ret_len;
         if (!need) {
             d3d12_log("[madeira-d3d12] %s conversion produced no bytes\n", tag);
-            free(buf); free(buf2);
+            free(buf); free(buf2); free(sized_ranges);
             return 0;
         }
         free(buf);
         buf = malloc(need);
-        if (!buf) { free(buf2); return 0; }
-        if (!buf2 && o && o->layout) { buf2 = malloc(cap2); if (!buf2) { free(buf); return 0; } }   /* ml927 */
+        if (!buf) { free(buf2); free(sized_ranges); return 0; }
+        if (!buf2 && o && o->layout) { buf2 = malloc(cap2); if (!buf2) { free(buf); free(sized_ranges); return 0; } }   /* ml927 */
         retried = onepass;
 
         mad_fill_convert_inputs(&a, rs, dxil, dxil_len, entry, o);
+        if (sized) a.ranges = (uint64_t)(uintptr_t)sized_ranges;   /* madeira-bcd msc-unbounded-retry: the same ranges */
         a.out_buf = (uint64_t)(uintptr_t)buf;
         a.out_cap = (uint64_t)need;
         a.out_vs_inputs = (uint64_t)(uintptr_t)vsin;
@@ -12862,10 +13068,12 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         if (a.ret_status != MADEIRA_IR_OK) {
             d3d12_log("[madeira-d3d12] %s conversion failed: %s (converter code %u)\n",
                       tag, mad_ir_status_name(a.ret_status), a.ret_error_code);
-            free(buf); free(buf2);
+            free(buf); free(buf2); free(sized_ranges);
             return 0;
         }
     }
+    if (switched) mad_unb_note(rs, tag, sized, 1);   /* madeira-bcd msc-unbounded-retry */
+    free(sized_ranges);   /* the conversion is done; nothing below reads a.ranges */
     mad_convert_note_time(t0, retried);
     if (o && o->air) {   /* ml1008 */
         o->air->backend    = a.ret_backend;
@@ -13783,7 +13991,24 @@ static HRESULT device_CreateGraphicsPipelineState_impl(ID3D12Device *This,
         mad_dxil_dump_one("gs", en, desc->GS.pShaderBytecode, desc->GS.BytecodeLength);
         mad_dxil_dump_one("ps", en, desc->PS.pShaderBytecode, desc->PS.BytecodeLength);
     }
-    if (!p->vs_fn || (desc->PS.pShaderBytecode && !p->ps_fn)) { pso_Release((ID3D12PipelineState *)p); return E_FAIL; }
+    if (!p->vs_fn || (desc->PS.pShaderBytecode && !p->ps_fn)) {
+        /* madeira-bcd pso-placeholder (madeira.cfg or the game's own file, off by
+         * default): the ml1138 placeholder rule for a vertex or pixel stage the
+         * converter refused -- the pipeline exists, has no Metal pipeline, and its
+         * draws are skipped and counted. Horizon Zero Dawn (build 475, 2026-10-09
+         * 16:20) played on with thousands of refused pipelines, then stopped with
+         * an "Error" box when its settings menu was refused one. */
+        if (mad_pso_placeholder_on()) {
+            LONG n = InterlockedIncrement(&g_pso_placeholders);
+            if (n <= 16 || !(n % 500))
+                d3d12_log("[madeira-d3d12] pso-placeholder: the %s stage did not convert; returning a placeholder "
+                          "pipeline whose draws are skipped (%ld so far)\n", !p->vs_fn ? "vertex" : "pixel", (long)n);
+            hr = pso_QI((ID3D12PipelineState *)p, riid, out);
+            pso_Release((ID3D12PipelineState *)p);
+            return hr;
+        }
+        pso_Release((ID3D12PipelineState *)p); return E_FAIL;
+    }
 
     /* Input layout -> vertex descriptor, through the attribute indices the
      * converted vertex shader reports. Element offsets follow D3D's append

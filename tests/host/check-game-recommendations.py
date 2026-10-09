@@ -145,15 +145,19 @@ assert 'semaphoreFastPath: true, fpsMode: 4' in gta['switches'] and 'nvidia: tru
 assert 'env.MADEIRA_FASTSYNC_SEM = 1' in presets['gta5e-other']['lines']
 assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']
 assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
-# Horizon Zero Dawn, still being brought up: build 475's test list (register spaces other than 0,
+# Horizon Zero Dawn, still being brought up: build 477's test list (register spaces other than 0,
 # DXGI lists the virtual monitor's own modes so the game can pick this screen's resolution, its
-# window is made foreground while none is, and XInput pads reach Windows.Gaming.Input).
+# window is made foreground while none is, XInput pads reach Windows.Gaming.Input, and the
+# shaders the converter refuses are retried with sized ranges, remembered and replaced by
+# placeholder pipelines; pipelines are warmed in the background).
 hzd = presets['horizon-zero-dawn']
-assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'swap-mb = 3072',
+assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'msc-unbounded-retry = 1', 'msc-fail-memo = 1',
+                            'pso-placeholder = 1', 'pso-warm = 2', 'swap-mb = 3072',
                             'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1',
-                            'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1'], hzd['lines']
-assert hzd['version'] == 3 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475 and 476 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 475\'s test list')
+                            'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1',
+                            'env.WINEDEBUG = fixme-input'], hzd['lines']
+assert hzd['version'] == 4 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475 and 476 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 477\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')

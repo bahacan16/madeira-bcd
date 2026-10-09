@@ -161,6 +161,24 @@ OVERLAY = {
                 "note": "Default on. Every 3 s per pipeline, the first argument record of an ExecuteIndirect is read "
                         "back by a small compute pass and logged as a [probe] line, 1500 lines at most. Each probe "
                         "ends the open render pass. 0: no probes (Red Dead Redemption 2's list, build 476)."},
+    # madeira-bcd: Horizon Zero Dawn's refused shaders (build 475, 2026-10-09 16:20).
+    "msc-unbounded-retry": {"category": "Direct3D 12", "title": "Retry refused shaders with sized unbounded ranges",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a DXIL shader the converter refuses with code 4 (a resource not in the root "
+                        "signature) is converted once more with the root signature's unbounded descriptor ranges "
+                        "given a size (2048 samplers, 1000000 others). Horizon Zero Dawn's ranges start at register 4 "
+                        "and ~4,900 of its shaders were refused. Once that works for a root signature, its later "
+                        "shaders take the sized ranges first."},
+    "pso-placeholder": {"category": "Direct3D 12", "title": "Placeholder for pipelines whose shaders did not convert",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a graphics pipeline whose vertex or pixel shader did not convert is returned "
+                        "to the game as a placeholder whose draws are skipped, instead of a failure. Horizon Zero "
+                        "Dawn stopped with an \"Error\" box when its settings menu got such a failure."},
+    "msc-fail-memo": {"category": "Direct3D 12", "title": "Remember refused shaders for the session",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a shader the converter refused is not converted again for the next pipeline "
+                        "that uses it (same bytecode, root signature and options) until the game exits. Horizon Zero "
+                        "Dawn converted each refused shader ~6 times, ~30,000 conversions in its first minutes."},
     "ring-share": {"category": "Direct3D 12", "title": "Share argument buffers between command lists",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: a command list gives the argument-buffer chunks its replay wrote back as "
