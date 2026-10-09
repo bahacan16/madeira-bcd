@@ -59,7 +59,6 @@ struct LaunchRequest {
     private static var forcedFastsyncOff = false
 
     func apply() {
-        ExperimentalSettings.exportToEnvironment()
         setenv("MADEIRA_EXE", exe, 1)
         if let a = args, !a.isEmpty { setenv("MADEIRA_ARGS", a, 1) } else { unsetenv("MADEIRA_ARGS") }
         if let d = desktop {
@@ -89,7 +88,6 @@ struct LaunchRequest {
             LaunchRequest.forcedFastsyncOff = true
         } else if LaunchRequest.forcedFastsyncOff {
             unsetenv("MADEIRA_FASTSYNC")   // ours from an earlier launch; the cfg export above re-sets its own
-            ExperimentalSettings.exportToEnvironment()
             LaunchRequest.forcedFastsyncOff = false
         }
         LogStore.shared.startSessionLog(program: programName)
@@ -140,13 +138,6 @@ enum ExperimentalSettings {
         get { (Int(MadeiraConfig.get("swap-mb") ?? "") ?? 0) >= 64 }
         set { MadeiraConfig.set("swap-mb", newValue ? String(storageBackedMemoryMB) : nil) }
     }
-
-    /// Must run before runWineFullSequence. Everything here is read from
-    /// madeira.cfg by the native side; what is exported is the update pack
-    /// (UpdatePacks.swift) and the shader cache identity its DLL needs.
-    static func exportToEnvironment() {
-        UpdatePacks.exportEnvironment()
-    }
 }
 
 // MARK: - Root
@@ -166,10 +157,7 @@ struct RootView: View {
             switch screen {
             case .home:
                 HomeView(onLaunch: { screen = .session($0) },
-                         onDeveloper: {
-                             ExperimentalSettings.exportToEnvironment()
-                             screen = .session(nil)
-                         })
+                         onDeveloper: { screen = .session(nil) })
             case .session(let request):
                 ContentView(pendingLaunch: request)
             }
@@ -412,7 +400,6 @@ struct HomeView: View {
 
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var controllers = GameControllerManager.shared
-    @ObservedObject private var packs = UpdatePacks.shared
     @ObservedObject private var shortcuts = ShortcutRouter.shared
     @AppStorage("wine_desktop_res") private var desktopRes = "960x540"
 
@@ -458,7 +445,6 @@ struct HomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     statusRow
-                    UpdateBanner()
                     if !jitOn { jitBanner }
                     if search.isEmpty, let g = recent { continueCard(g) }
                     desktopCard
@@ -484,10 +470,7 @@ struct HomeView: View {
                 }
             }
             .onAppear {
-                if !scannedOnce {
-                    rescan()
-                    UpdatePacks.shared.refresh(silent: true)
-                }
+                if !scannedOnce { rescan() }
             }
             .onChange(of: scenePhase) { _, phase in
                 // StikDebug enables JIT from outside the app, so re-read the
@@ -526,9 +509,6 @@ struct HomeView: View {
                            text: controllers.activeControllerName ?? "Controller", tint: .green)
             }
             StatusChip(icon: "square.stack.3d.up.fill", text: "\(games.count) games", tint: .blue)
-            if packs.installedUsable, let p = packs.installed {
-                StatusChip(icon: "shippingbox.fill", text: "Pack \(p.build)", tint: .teal)
-            }
             Spacer()
         }
         }
@@ -1359,8 +1339,6 @@ struct AppSettingsSheet: View {
                 } footer: {
                     Text("Library is upstream's game library (the default). Applies after Madeira restarts.")
                 }
-                UpdatesSection()
-
                 SavesSection()
 
                 StorageSection()

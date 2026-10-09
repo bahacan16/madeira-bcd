@@ -141,7 +141,6 @@
 		A1000204 /* GameControllerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000204 /* GameControllerManager.swift */; };
 		A1000205 /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000205 /* HomeView.swift */; };
 		A1000206 /* SessionUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000206 /* SessionUI.swift */; };
-		A1000207 /* UpdatePacks.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000207 /* UpdatePacks.swift */; };
 		A1000208 /* GameProfiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000208 /* GameProfiles.swift */; };
 		A1000911 /* GameRecommendations.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000911 /* GameRecommendations.swift */; };
 		A1000912 /* GameRecommendationsApply.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000912 /* GameRecommendationsApply.swift */; };
@@ -359,7 +358,6 @@
 		A2000204 /* GameControllerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameControllerManager.swift; sourceTree = "<group>"; };
 		A2000205 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		A2000206 /* SessionUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionUI.swift; sourceTree = "<group>"; };
-		A2000207 /* UpdatePacks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdatePacks.swift; sourceTree = "<group>"; };
 		A2000208 /* GameProfiles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameProfiles.swift; sourceTree = "<group>"; };
 		A2000911 /* GameRecommendations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameRecommendations.swift; sourceTree = "<group>"; };
 		A2000912 /* GameRecommendationsApply.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameRecommendationsApply.swift; sourceTree = "<group>"; };
@@ -532,7 +530,6 @@
 				A2000204 /* GameControllerManager.swift */,
 				A2000205 /* HomeView.swift */,
 				A2000206 /* SessionUI.swift */,
-				A2000207 /* UpdatePacks.swift */,
 				A2000208 /* GameProfiles.swift */,
 				A2000911 /* GameRecommendations.swift */,
 				A2000912 /* GameRecommendationsApply.swift */,
@@ -908,7 +905,6 @@
 				A1000204 /* GameControllerManager.swift in Sources */,
 				A1000205 /* HomeView.swift in Sources */,
 				A1000206 /* SessionUI.swift in Sources */,
-				A1000207 /* UpdatePacks.swift in Sources */,
 				A1000208 /* GameProfiles.swift in Sources */,
 				A1000911 /* GameRecommendations.swift in Sources */,
 				A1000912 /* GameRecommendationsApply.swift in Sources */,

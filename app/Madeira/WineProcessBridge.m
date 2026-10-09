@@ -559,38 +559,6 @@ static void madeira_link_syswow64(NSFileManager *fm, NSString *prefix, NSString 
     dprintf(STDERR_FILENO, "[WineProc] Farm syswow64: %d links -> i386-windows\n", linked);
 }
 
-/***********************************************************************
- *           madeira_pe_source
- *
- * madeira-bcd update packs (UpdatePacks.swift, docs/madeira-bcd.md): the file
- * a farm link for `name` should point at -- the installed pack's copy when it
- * has one for this arch, else the bundle's. On iOS the loader maps the PE file
- * the system32 link resolves to (loader_ios.c, load_builtin), so this is the
- * whole overlay. The app sets MADEIRA_PACK_DIR only for a pack it verified
- * (file hashes) and whose native ABI equals this build's; nothing else here
- * trusts the directory.
- */
-static int g_pack_overlaid;
-static NSString *madeira_pe_source(NSString *archSource, const char *arch, NSString *name) {
-    static NSString *packDir;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        const char *p = getenv("MADEIRA_PACK_DIR");
-        if (p && *p) packDir = [NSString stringWithUTF8String:p];
-    });
-    if (packDir) {
-        NSString *cand = [[packDir stringByAppendingPathComponent:[NSString stringWithUTF8String:arch]]
-                          stringByAppendingPathComponent:name];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:cand]) {
-            if (g_pack_overlaid++ < 16)
-                dprintf(STDERR_FILENO, "[pack] %s/%s from the update pack (%s)\n", arch, name.UTF8String,
-                        getenv("MADEIRA_PACK_ID") ?: "?");
-            return cand;
-        }
-    }
-    return [archSource stringByAppendingPathComponent:name];
-}
-
 /* <system_dir>\wbem: syswow64\wbem from the i386 farm for 32-bit targets,
  * system32\wbem from the session's farm for 64-bit ones. The farms are flat,
  * but WMI's registered InprocServer32 paths are C:\windows\system32\wbem\<name>
@@ -1371,7 +1339,7 @@ static void *wine_process_thread(void *arg) {
             NSArray *dlls = [fm contentsOfDirectoryAtPath:dllSource error:nil];
             int linked = 0;
             for (NSString *dll in dlls) {
-                NSString *src = madeira_pe_source(dllSource, bundle_subdir, dll);
+                NSString *src = [dllSource stringByAppendingPathComponent:dll];
                 NSString *dst = [sys32Dir stringByAppendingPathComponent:dll];
                 // Remove stale symlinks and re-create (bundle path changes on reinstall)
                 [fm removeItemAtPath:dst error:nil];
@@ -1407,7 +1375,7 @@ static void *wine_process_thread(void *arg) {
                     // from Wine's dir enumeration. Clear then recreate, like
                     // the main pass does.
                     [fm removeItemAtPath:dst error:nil];
-                    NSString *src = madeira_pe_source(otherSource, other_subdir, f);
+                    NSString *src = [otherSource stringByAppendingPathComponent:f];
                     if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
                         crossLinked++;
                 }
@@ -1437,7 +1405,7 @@ static void *wine_process_thread(void *arg) {
                     for (NSString *f in files) {
                         NSString *dst = [farmDir stringByAppendingPathComponent:f];
                         [fm removeItemAtPath:dst error:nil];  // self-heal stale links on reinstall
-                        NSString *src = madeira_pe_source(archSource, farms[i].arch, f);
+                        NSString *src = [archSource stringByAppendingPathComponent:f];
                         if ([fm createSymbolicLinkAtPath:dst withDestinationPath:src error:nil])
                             farmLinked++;
                     }
@@ -1499,7 +1467,7 @@ static void *wine_process_thread(void *arg) {
                 const char *dxgiSrc = getenv("MADEIRA_DXGI_SRC");
                 if (dxgiSrc && dxgiSrc[0] == '1') {
                     NSString *ecDir = [bundlePath stringByAppendingPathComponent:@"arm64ec-windows"];
-                    NSString *srcDll = madeira_pe_source(ecDir, "arm64ec-windows", @"dxgi-src.dll");
+                    NSString *srcDll = [ecDir stringByAppendingPathComponent:@"dxgi-src.dll"];
                     if ([fm fileExistsAtPath:srcDll]) {
                         NSMutableArray *dirs = [NSMutableArray arrayWithObject:
                             [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];
@@ -1530,7 +1498,7 @@ static void *wine_process_thread(void *arg) {
                 const char *d3d11Src = getenv("MADEIRA_D3D11_SRC");
                 if (d3d11Src && d3d11Src[0] == '1') {
                     NSString *ecDir = [bundlePath stringByAppendingPathComponent:@"arm64ec-windows"];
-                    NSString *srcDll = madeira_pe_source(ecDir, "arm64ec-windows", @"d3d11-src.dll");
+                    NSString *srcDll = [ecDir stringByAppendingPathComponent:@"d3d11-src.dll"];
                     if ([fm fileExistsAtPath:srcDll]) {
                         NSMutableArray *dirs = [NSMutableArray arrayWithObject:
                             [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"]];

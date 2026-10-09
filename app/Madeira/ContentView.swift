@@ -2830,7 +2830,7 @@ struct ContentView: View {
             library.error = "The executable path or launch arguments are too long."; return
         }
         entry.configureLaunch()
-        // madeira-bcd: update pack, the game's own options (LibraryBCD.swift); this run's
+        // madeira-bcd: the game's own options (LibraryBCD.swift); this run's
         // log is named below, by upstream's rule (the program a launch starts).
         BCDLaunch.applyLibrary(entry, sessionLog: false)
         exportBCDDesktopProfile(entry)

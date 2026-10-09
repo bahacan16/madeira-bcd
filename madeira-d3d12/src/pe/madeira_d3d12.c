@@ -37,11 +37,10 @@
 #include "madeira_ir_abi.h"
 #include "madeira_graphics_entry.h"
 
-/* madeira-bcd: MAD_PACK_ID names the CI run that built this DLL ("ipa 215" or
- * "pack 7 (abc1234)"), so a log says which runtime ran -- the IPA's own or one
- * an update pack installed over it. */
-#ifdef MAD_PACK_ID
-#define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " MAD_PACK_ID ", " __DATE__ " " __TIME__
+/* madeira-bcd: MAD_BUILD_ID names the CI run that built this DLL ("ipa 215"),
+ * so a log says which runtime ran. */
+#ifdef MAD_BUILD_ID
+#define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " MAD_BUILD_ID ", " __DATE__ " " __TIME__
 #else
 #define MADEIRA_D3D12_BUILD "madeira-d3d12 M2 " __DATE__ " " __TIME__
 #endif
@@ -11704,15 +11703,6 @@ static char g_sc_stamp[96] = "madeira_d3d12 bc1 converter " MAD_SC_CONVERTER_ID;
 #else
 static char g_sc_stamp[96] = "madeira_d3d12 bc1 " __DATE__ " " __TIME__;
 #endif
-/* madeira-bcd: the converter is the app's native half, so its identity is the
- * app's too. The IPA build stamps it into Info.plist and the app exports it as
- * MADEIRA_SC_ID; an update pack's DLL (built without the converter at hand)
- * takes it from there and keeps the device's cache. Fed as strlen + 1 bytes,
- * exactly what the old const array fed, so existing caches stay valid. */
-static void mad_sc_stamp_init(void) {
-    char v[40]; DWORD n = GetEnvironmentVariableA("MADEIRA_SC_ID", v, sizeof v);
-    if (n && n < sizeof v) snprintf(g_sc_stamp, sizeof g_sc_stamp, "madeira_d3d12 bc1 converter %s", v);
-}
 static char g_sc_rt[96];
 
 struct mad_sc_hash { UINT64 a, b; };
@@ -11824,7 +11814,6 @@ static int mad_sc_init(void) {
                      mad_cfg_int_pe("msc-sampler-lod-bias", 1) ? 1 : 0,
                      mad_cfg_int_pe("msc-sample-nan-zero", 1) ? 1 : 0,       /* madeira-bcd: madeira_ir_unix.mm, build 217 */
                      mad_cfg_int_pe("msc-position-inf-nan", 1) ? 1 : 0);
-            mad_sc_stamp_init();
             mad_sc_feed(&h, g_sc_stamp, strlen(g_sc_stamp) + 1);
             mad_sc_feed(&h, g_sc_rt, sizeof g_sc_rt);
             n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);

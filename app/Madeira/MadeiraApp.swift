@@ -12,6 +12,13 @@ struct MadeiraApp: App {
         // ml1172: read the screen on the main thread; library entries, whose
         // default Resolution comes from it, are also made on other threads.
         _ = ResolutionChoices.screen
+        // madeira-bcd: update packs are gone (owner's decision 2026-10-09, as
+        // upstream); a pack an earlier build installed is deleted.
+        if let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let packs = base.appendingPathComponent("MadeiraPacks", isDirectory: true)
+            if FileManager.default.fileExists(atPath: packs.path) { try? FileManager.default.removeItem(at: packs) }
+        }
+        UserDefaults.standard.removeObject(forKey: "madeira.packs.enabled")
     }
 
     var body: some Scene {

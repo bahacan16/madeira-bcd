@@ -52,13 +52,11 @@ scid_inputs() {
 }
 SCID=$(cd "$R" && scid_inputs | shasum -a 256 | cut -c1-16)
 echo "  shader cache converter identity $SCID"
-# madeira-bcd: the IPA build stamps it into Info.plist (MadeiraShaderCacheID);
-# the app exports it as MADEIRA_SC_ID, which wins over the compiled-in value,
-# so an update pack's DLL keeps the cache of the app it is installed into.
+# The IPA build prints it in its notices.
 echo "$SCID" > "$OUT/scid.txt"
-# MAD_PACK_ID (set by the workflow) names this build in the device log.
-PACKDEF=()
-[ -n "${MAD_PACK_ID:-}" ] && PACKDEF=(-DMAD_PACK_ID="\"$MAD_PACK_ID\"")
+# MAD_BUILD_ID (set by the workflow) names this build in the device log.
+BUILDDEF=()
+[ -n "${MAD_BUILD_ID:-}" ] && BUILDDEF=(-DMAD_BUILD_ID="\"$MAD_BUILD_ID\"")
 
 # madeira-bcd: helper kernels (mad_kernels.metal) as an embedded metallib. A
 # build without xcrun (or a failed compile) leaves them out; the runtime then
@@ -76,7 +74,7 @@ else
 fi
 
 echo "=== madeira_d3d12.dll (arm64ec) ==="
-"$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall -DMAD_SC_CONVERTER_ID="\"$SCID\"" $KDEF ${PACKDEF[@]+"${PACKDEF[@]}"} \
+"$MINGW/arm64ec-w64-mingw32-clang" -shared -O2 -Wall -DMAD_SC_CONVERTER_ID="\"$SCID\"" $KDEF ${BUILDDEF[@]+"${BUILDDEF[@]}"} \
     -o "$OUT/madeira_d3d12.dll" "$SRC/madeira_d3d12.c" "$SRC/d3d12.def" \
     -I"$SRC" -I"$OUT" -I"$R/madeira-d3d12/src" -I"$R/dxmt/src/winemetal" \
     -L"$OUT" -lwinemetal -luuid -lole32 2> "$OUT/madeira_d3d12.err" \

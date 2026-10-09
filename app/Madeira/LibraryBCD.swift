@@ -67,14 +67,13 @@ enum BCDLaunch {
         else { setenv("MADEIRA_DXMT_EXTRA", dxmtExtra.joined(separator: ";"), 1)   /* DXMT splits on ";" */ }
     }
 
-    /// A start from upstream's library: the update pack, this game's
-    /// madeira-bcd options and its own session log. The FPS limit is the
-    /// entry's (upstream's FPS picker, which offers 40 FPS too).
+    /// A start from upstream's library: this game's madeira-bcd options and
+    /// its own session log. The FPS limit is the entry's (upstream's FPS
+    /// picker, which offers 40 FPS too).
     /// `sessionLog: false` for a Steam game started through Madeira Dock: the
     /// native side names that log after the program Valve's client starts
     /// (process_ios.c, madeira_steam_session_log).
     static func applyLibrary(_ entry: LibraryEntry, sessionLog: Bool = true) {
-        ExperimentalSettings.exportToEnvironment()
         if entry.desktop == true {
             applyExtras(avx: false, wineVCRT: false, nvidia: false, profile: nil)
             LogStore.shared.startSessionLog(program: "explorer.exe")

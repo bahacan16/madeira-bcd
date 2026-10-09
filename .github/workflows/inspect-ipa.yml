@@ -78,7 +78,7 @@ jobs:
               echo '```'
               for k in CFBundleIdentifier CFBundleShortVersionString CFBundleVersion MinimumOSVersion \
                        DTXcode DTXcodeBuild DTSDKName DTSDKBuild DTPlatformBuild DTCompiler BuildMachineOSBuild \
-                       MadeiraNativeABI MadeiraShaderCacheID MadeiraCommit MadeiraRepo MadeiraBuilt; do
+                       MadeiraCommit MadeiraRepo MadeiraBuilt; do
                 printf '%-28s %s\n' "$k" "$(/usr/libexec/PlistBuddy -c "Print :$k" "$APP/Info.plist" 2>/dev/null || echo '-')"
               done
               echo "signature: $(codesign -dv "$APP" 2>&1 | grep -E 'Authority|TeamIdentifier|Signature=' | tr '\n' ' ' || true)"
