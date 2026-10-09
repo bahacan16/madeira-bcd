@@ -64,13 +64,25 @@ extension GameRecommendations {
     }
 
     /// A madeira-bcd home screen game (its program's path), before its settings or a start.
-    /// Lines in a library entry's upstream `config` field for the same program count as
-    /// the game's own.
     static func prepare(windowsPath: String, title: String) {
-        let key = windowsPath.lowercased()
-        let ownLines = LibraryModel.shared.entries.first { $0.desktop != true && $0.windowsPath.lowercased() == key }?.config
-        guard let found = due(windowsPath, steamAppID: nil, ownLines: ownLines, title: title) else { return }
+        guard let found = due(windowsPath, steamAppID: nil, ownLines: libraryLines(for: windowsPath), title: title) else { return }
         put(found.rec, to: windowsPath, found.kind, title: title)
+    }
+
+    /// The game's own lines in the library, which count as the home screen game's own:
+    /// upstream's `config` field of the entry for the same program, and the config of the
+    /// library Steam game whose install folder holds the program.
+    private static func libraryLines(for windowsPath: String) -> String {
+        let key = windowsPath.lowercased()
+        var lines = ""
+        for entry in LibraryModel.shared.entries where entry.desktop != true {
+            let path = entry.windowsPath.lowercased()
+            if path == key { lines += (entry.config ?? "") + "\n" }
+            if entry.steamAppID != nil, key.hasPrefix(path + "\\") {
+                lines += (entry.config ?? "") + "\n" + GameProfile(windowsPath: entry.windowsPath).text
+            }
+        }
+        return lines
     }
 
     /// Game details › Reset to Recommended. Returns what was written; nil when the
@@ -84,11 +96,18 @@ extension GameRecommendations {
         return rec
     }
 
-    /// The madeira-bcd home screen's Reset to Recommended.
+    /// The madeira-bcd home screen's Reset to Recommended; the library entry for the same
+    /// program takes the list's fields too.
     @discardableResult
     static func reset(windowsPath: String, title: String) -> GameRecommendation? {
         guard let rec = recommendation(windowsPath: windowsPath, steamAppID: nil) else { clear(windowsPath, title: title); return nil }
         put(rec, to: windowsPath, .reset, title: title)
+        let key = windowsPath.lowercased()
+        if var entry = LibraryModel.shared.entries.first(where: { $0.desktop != true && $0.windowsPath.lowercased() == key }) {
+            entry.config = nil
+            takeEntryFields(rec, &entry)
+            LibraryModel.shared.save(entry)
+        }
         return rec
     }
 

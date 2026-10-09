@@ -127,7 +127,8 @@ print('PASS: RDR2 (Steam) is the owner\'s 463 list line for line with its switch
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')
 assert 'rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500' in lists_src
-assert 'steamFolder == "red dead redemption 2"' in match and 'steamFolder == "grand theft auto v enhanced"' in match
+assert 'let installFolder = last == steamFolder ? steamFolder : nil' in match
+assert 'installFolder == "red dead redemption 2"' in match and 'installFolder == "grand theft auto v enhanced"' in match
 assert 'case "ghostoftsushima.exe":' in match and 'case "gow.exe":' in match and 'case "rdr2.exe", "playrdr2.exe":' in match
 assert 'case "playgtav.exe", "gta5_enhanced.exe":' in match and 'return inSteam ? gta5EnhancedSteam : gta5EnhancedOther' in match
 assert 'guard fileExists(folder + "\\\\GTA5_Enhanced.exe") else { return nil }' in match and 'default:\n            return nil' in match
@@ -172,6 +173,9 @@ assert '!(text + (ownLines ?? "")).trimmingCharacters(in: .whitespacesAndNewline
 put = block(apply_src, '    private static func put(', '\n    }\n')
 assert 'guard file.text == rec.fileText' in put and 'if kind != .updated {' in put
 assert 'LibraryPrefs.setSafeSync(!on, for: windowsPath)' in put and 'LibraryPrefs.setScreen(size, for: windowsPath)' in put
+home_lines = block(apply_src, '    private static func libraryLines(for windowsPath: String) -> String {', '\n    }\n')
+assert 'if entry.steamAppID != nil, key.hasPrefix(path + "\\\\")' in home_lines and 'GameProfile(windowsPath: entry.windowsPath).text' in home_lines
+assert 'takeEntryFields(rec, &entry)\n            LibraryModel.shared.save(entry)' in apply_src
 print('PASS: first sight in the library (start-up, save, Game details, start) and the home screen; Reset to Recommended last on both pages')
 
 # The Swift fixture: the real files with small stand-ins for the app types they use.
@@ -188,6 +192,9 @@ enum DisplayMode: String { case fit, fill, stretch, aspect }
 final class LibraryModel {
     static let shared = LibraryModel()
     var entries: [LibraryEntry] = []
+    func save(_ entry: LibraryEntry) {
+        if let i = entries.firstIndex(where: { $0.windowsPath == entry.windowsPath }) { entries[i] = entry } else { entries.append(entry) }
+    }
     static var drive: URL { URL(fileURLWithPath: ProcessInfo.processInfo.environment["MADEIRA_TEST_DRIVE"]!, isDirectory: true) }
 }
 
@@ -261,6 +268,8 @@ check(id("D:\\SteamLibrary\\steamapps\\common\\Red Dead Redemption 2\\") == "rdr
 check(id(#"C:\Games\Red Dead Redemption 2\RDR2.exe"#) == "none", "RDR2 outside Steam has no list")
 check(id(rdr2 + #"\RDR2.exe"#) == "rdr2-steam" && id(rdr2 + #"\PlayRDR2.exe"#) == "rdr2-steam", "RDR2's programs inside Steam")
 check(id(rdr2 + #"\Redistributables\vc_redist.x64.exe"#) == "none", "a redistributable in a game's Steam folder")
+check(id(rdr2 + #"\start.bat"#) == "none" && id(steam + #"\Grand Theft Auto V Enhanced\launch.cmd"#) == "none",
+      "a batch file inside a Steam game's folder")
 let gta = steam + #"\Grand Theft Auto V Enhanced"#
 check(id(gta, 3240220) == "gta5e-steam", "GTA V Enhanced by its App ID")
 check(id(gta) == "gta5e-steam", "GTA V Enhanced by its Steam folder")
@@ -399,6 +408,17 @@ let otherGoW = #"C:\Other\GoW.exe"#
 LibraryModel.shared.entries = [LibraryEntry(title: "God of War", windowsPath: otherGoW, config: "dxmt = d3d11.mipClampBC=1")]
 R.prepare(windowsPath: otherGoW, title: "God of War")
 check(file(otherGoW).isEmpty && mark(otherGoW) == "" && LibraryPrefs.screen(otherGoW).isEmpty, "the library's own lines count on the home screen")
+let lib2 = #"D:\Library2\steamapps\common\Red Dead Redemption 2"#
+GameProfile(windowsPath: lib2).text = "vram-mb = 2304\n"
+LibraryModel.shared.entries = [LibraryEntry(title: "Red Dead Redemption 2", windowsPath: lib2, steamAppID: 1174180)]
+R.prepare(windowsPath: lib2 + #"\RDR2.exe"#, title: "Red Dead Redemption 2")
+check(file(lib2 + #"\RDR2.exe"#).isEmpty && mark(lib2 + #"\RDR2.exe"#) == "",
+      "the library Steam game's own config counts for its program on the home screen")
+let gowHome = #"C:\Home\GoW.exe"#
+LibraryModel.shared.entries = [LibraryEntry(title: "God of War", windowsPath: gowHome, config: "dxmt = d3d11.mipClampBC=1")]
+check(R.reset(windowsPath: gowHome, title: "God of War")?.id == "god-of-war" && file(gowHome) == R.godOfWar.fileText
+      && LibraryModel.shared.entries[0].resolution == "1920x1080" && LibraryModel.shared.entries[0].config == nil,
+      "a home screen Reset reaches the library entry for the same program")
 check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v1 written (first sight)") }, "log line")
 UserDefaults.standard.removeObject(forKey: key)
 print("PASS: the home screen shares the files and records; Safe thread sync and Screen size take the list's values")

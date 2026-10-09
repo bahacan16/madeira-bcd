@@ -251,9 +251,11 @@ enum GameRecommendations {
         guard let last = parts.last else { return nil }
         let steamFolder = steamCommonFolder(parts)
         guard last.hasSuffix(".exe") else {
-            // A library Steam game: its App ID, or its folder under steamapps\common.
-            if steamAppID == rdr2AppID || steamFolder == "red dead redemption 2" { return rdr2Steam }
-            if steamAppID == gta5EnhancedAppID || steamFolder == "grand theft auto v enhanced" { return gta5EnhancedSteam }
+            // A library Steam game: its App ID, or its install folder right under
+            // steamapps\common (not a batch file inside it).
+            let installFolder = last == steamFolder ? steamFolder : nil
+            if steamAppID == rdr2AppID || installFolder == "red dead redemption 2" { return rdr2Steam }
+            if steamAppID == gta5EnhancedAppID || installFolder == "grand theft auto v enhanced" { return gta5EnhancedSteam }
             if steamAppID == ghostAppID { return ghostOfTsushima }
             if steamAppID == godOfWarAppID { return godOfWar }
             return nil
