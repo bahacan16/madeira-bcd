@@ -197,6 +197,25 @@ OVERLAY = {
                         "before. 1: only the rectangles are cleared, in a small pass of their own (as DXMT's D3D11 "
                         "ClearView does); a rectangle that covers the view still clears it the fast way. Horizon Zero "
                         "Dawn passes rectangles from its first gameplay frames."},
+    "skin-check": {"category": "Direct3D 12", "title": "Diagnostic: check meshes skinned on the GPU",
+                "kind": "int", "default": "0",
+                "note": "Default 0 (off). N: windows of N frames (1 = 8) log every draw that reads a vertex buffer a "
+                        "compute shader wrote, the dispatches that wrote it with every binding, a summary of up to "
+                        "32 KB of each such stream copied just before the draw, and the shaders' bytecode. For "
+                        "characters drawn with missing faces or spikes (Horizon Zero Dawn); costs time in those frames."},
+    "skin-check-every": {"category": "Direct3D 12", "title": "Diagnostic: presents between skin-check windows",
+                "kind": "int", "default": "300",
+                "note": "With skin-check on: a window starts this many presents after the previous one began "
+                        "(at least 30); the first starts 60 presents after the first such draw."},
+    "skin-check-capture": {"category": "Direct3D 12", "title": "Diagnostic: skin-check copies the streams",
+                "kind": "bool", "default": "1",
+                "note": "On by default with skin-check. 0: log only, with no GPU copies, which add a copy between "
+                        "the skinning dispatches and the draw (to compare what the frames look like)."},
+    "view-census": {"category": "Direct3D 12", "title": "Diagnostic: report buffer views that fall back",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: typed buffer views that cannot become a Metal texture buffer (the shader then "
+                        "sees no data), views cut short at the end of their resource, and views or constant buffer "
+                        "views past their resource are counted and named in the log. Changes nothing else."},
     "msc-fail-memo": {"category": "Direct3D 12", "title": "Remember refused shaders for the session",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: a shader the converter refused is not converted again for the next pipeline "

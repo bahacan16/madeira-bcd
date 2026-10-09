@@ -1239,6 +1239,13 @@ jobs:
           python3 tests/host/check-pso-lazy-libs.py
           python3 tests/host/check-clear-rects.py
 
+      # madeira-bcd: Horizon Zero Dawn's compute-skinned characters lose faces,
+      # hair or whole bodies every few frames on build 481 (gpu-sync or not):
+      # skin-check and view-census log what those draws read and which buffer
+      # views fall back. Both diagnostics, off by default.
+      - name: Check the skin-check and view-census diagnostics
+        run: python3 tests/host/check-skin-check.py
+
       # madeira-bcd: RDR2 froze on build 476 (16:55:52) when the guest RIP
       # profile took libpthread's thread-list lock with a thread suspended.
       - name: Check that no sampler takes a lock with a thread suspended

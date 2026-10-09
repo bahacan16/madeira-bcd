@@ -305,8 +305,15 @@ enum GameRecommendations {
     /// the rectangles, puts the game's memory in the swap file as Red Dead
     /// Redemption 2's list does (broad, from 1 MB), and leaves out pso-warm, whose
     /// queue held 24,570 pipelines (and their libraries) when the game closed.
+    /// On build 481 (21:52, 21:55) the game played without closing, but its
+    /// characters, which it skins in compute shaders, came out with missing
+    /// faces, missing hair or collapsed to spikes every few frames, with
+    /// gpu-sync = 1 as without it. Build 482's list adds two diagnostics:
+    /// skin-check logs those draws, the dispatches that wrote their vertices and
+    /// copies of the vertices themselves; view-census names buffer views that
+    /// fall back or are cut short.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 6,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 7,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -316,6 +323,8 @@ enum GameRecommendations {
         pso-placeholder = 1
         pso-lazy-libs = 1
         clear-rects = 1
+        skin-check = 1
+        view-census = 1
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1
