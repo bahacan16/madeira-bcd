@@ -84,7 +84,8 @@ print('PASS: six lists, two comment lines each, no key twice, every non-env key 
 # plus the lines of build 466's test (version 2), build 467's (version 3), build 470's (version 4) and
 # build 472's (version 5: pool-mid), build 475's (version 6: ring-share), build 476's (version 7:
 # swap-images, small DXMT rings for the launcher and Social Club, the ExecuteIndirect probe off)
-# and build 478's (version 8: 192 MB of image headroom in the JIT pool, so xinput1_4.dll loads).
+# and build 479's (version 8: xinput1_4.dll loaded with the D3D12 device, 192 MB of image headroom
+# in the JIT pool).
 rdr2 = '''d3d12-caps-log = 2
 d3d12-shader-pack = 1
 replay-split = 1
@@ -121,6 +122,7 @@ env.DXMT_WSI_MODE_TABLE = 1
 env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
 env.MADEIRA_EXECREQ_LEAVE = 1
 env.MADEIRA_PIN_GRAPHICS_DLLS = 1
+env.MADEIRA_PRELOAD_DLLS = xinput1_4.dll
 env.MADEIRA_POOL_HEAD_RESERVE_MB = 192
 env.MADEIRA_POOL_LOW_IMAGES = 1
 env.MADEIRA_POOL_RECYCLE_IMAGES = 1
@@ -146,19 +148,19 @@ assert 'semaphoreFastPath: true, fpsMode: 4' in gta['switches'] and 'nvidia: tru
 assert 'env.MADEIRA_FASTSYNC_SEM = 1' in presets['gta5e-other']['lines']
 assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']
 assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
-# Horizon Zero Dawn, still being brought up: build 478's test list (register spaces other than 0,
+# Horizon Zero Dawn, still being brought up: build 477's test list (register spaces other than 0,
 # DXGI lists the virtual monitor's own modes so the game can pick this screen's resolution, its
-# window is made foreground while none is, XInput pads reach Windows.Gaming.Input with the local
-# user as every controller's user, and the shaders the converter refuses are retried with sized
-# ranges, remembered and replaced by placeholder pipelines; pipelines are warmed in the
-# background). Version 5 drops build 477's WINEDEBUG line.
+# window is made foreground while none is, XInput pads reach Windows.Gaming.Input, and the
+# shaders the converter refuses are retried with sized ranges, remembered and replaced by
+# placeholder pipelines; pipelines are warmed in the background).
 hzd = presets['horizon-zero-dawn']
 assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'msc-unbounded-retry = 1', 'msc-fail-memo = 1',
                             'pso-placeholder = 1', 'pso-warm = 2', 'swap-mb = 3072',
                             'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1',
-                            'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1'], hzd['lines']
-assert hzd['version'] == 5 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 478 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 478\'s test list')
+                            'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1',
+                            'env.WINEDEBUG = fixme-input'], hzd['lines']
+assert hzd['version'] == 4 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 479 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 477\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')

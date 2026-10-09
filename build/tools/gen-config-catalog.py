@@ -50,6 +50,14 @@ OVERLAY = {
                         "data live; does not recycle executable ranges or change GPU capabilities. Restart the "
                         "session after changing it.",
                 "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"]},
+    "env.MADEIRA_PRELOAD_DLLS": {"category": "Memory & JIT pool", "title": "Load these DLLs with the D3D12 device",
+                "kind": "text", "default": "",
+                "note": "Default empty. DLL names separated by ';' (e.g. xinput1_4.dll): each program loads and pins "
+                        "them at its first D3D12 device or probe call, while the JIT pool still has room for their "
+                        "copies. RDR2 loads xinput1_4.dll only at its first controller read, and on build 476 the "
+                        "pool was full by then: no controller and no on-screen controls. Restart the session after "
+                        "changing it.",
+                "sources": ["madeira-d3d12/src/pe/madeira_d3d12.c"]},
     "env.MADEIRA_POOL_RECYCLE_IMAGES": {"category": "Memory & JIT pool", "title": "Images in retired code-buffer space",
                 "kind": "bool", "default": "0",
                 "note": "Default off. If other image allocations fail, retired region-C code buffers up to 64 MB "

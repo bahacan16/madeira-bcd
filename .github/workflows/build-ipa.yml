@@ -365,6 +365,11 @@ jobs:
       - name: Check opt-in graphics DLL lifetime
         run: python3 tests/host/check-graphics-pin.py
 
+      # madeira-bcd: RDR2 on build 476 loaded xinput1_4.dll only at its first
+      # controller read, with the JIT pool full (MADEIRA_PRELOAD_DLLS).
+      - name: Check opt-in DLL preload with the D3D12 device
+        run: python3 tests/host/check-preload-dlls.py
+
       - name: Check ARM64EC allocator span geometry
         run: python3 tests/host/check-rpmalloc-span8.py
 

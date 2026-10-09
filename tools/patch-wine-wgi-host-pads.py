@@ -20,15 +20,6 @@ goes to the pad through XInputSetState (rumble = left motor, buzz = right motor)
 as Madeira's xinput already passes it to the controller. The HID providers are
 untouched.
 
-manager.c: IGameController.User and UserChanged were stubs (E_NOTIMPL).
-Horizon Zero Dawn (build 475, 2026-10-09 16:20) asked every controller's User
-every frame (12,746 times), subscribed to UserChanged, and never took input
-from the gamepad the patch published. With the switch on, every controller
-belongs to one local user (a static Windows.System.User, locally
-authenticated, LocalUser) and a UserChanged handler is accepted and never
-called. A host pad's NonRoamableId is "madeira-xinput-<slot>". Readings are
-logged: the first per slot, then a count every 30 s.
-
 Opt-in at run time: MADEIRA_WGI_HOST_PADS=1 in the game's environment
 (env.MADEIRA_WGI_HOST_PADS = 1). Without it the DLL behaves exactly as before:
 no xinput1_4.dll load, no provider, the monitor thread waits as it did.
@@ -142,154 +133,6 @@ static void madeira_host_state( const struct madeira_xstate *in, struct WineGame
     out->switches[0] = hat[in->buttons & 0xf];
 }
 
-/* Does the game read the pad, and what does it get? The first reading of a
- * slot, then one line per 30 s with the count and the last state. */
-static void madeira_host_reading_note( DWORD index, const struct madeira_xstate *state, ULONGLONG now )
-{
-    static LONG reads[4];
-    static ULONGLONG last_line[4];
-    LONG n;
-
-    if (index >= ARRAY_SIZE(reads)) return;
-    n = InterlockedIncrement( &reads[index] );
-    if (n == 1)
-        ERR( "[wgi-host] slot %lu: first reading -- the game reads this gamepad (buttons 0x%04x)\n",
-             index, state->buttons );
-    else if (now - last_line[index] >= 30000)
-        ERR( "[wgi-host] slot %lu: %ld readings so far, last buttons 0x%04x left stick %d,%d triggers %u,%u\n",
-             index, n, state->buttons, state->lx, state->ly, state->left_trigger, state->right_trigger );
-    else return;
-    last_line[index] = now;
-}
-
-/* IGameController.User: Wine's is a stub (E_NOTIMPL). Horizon Zero Dawn asks
- * for it every frame (12,746 times in one run, 2026-10-09 16:20) and subscribed
- * to UserChanged, and never took input from its gamepad. With the switch on,
- * every controller belongs to one local user: a static Windows.System.User,
- * locally authenticated, of type LocalUser. */
-static const GUID madeira_iid_user = { 0xdf9a26c6, 0xe746, 0x4bcd, { 0xb5, 0xd4, 0x12, 0x01, 0x03, 0xc4, 0x20, 0x9b } };
-
-static HRESULT WINAPI madeira_user_QueryInterface( __x_ABI_CWindows_CSystem_CIUser *iface, REFIID iid, void **out )
-{
-    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IInspectable ) ||
-        IsEqualGUID( iid, &IID_IAgileObject ) || IsEqualGUID( iid, &madeira_iid_user ))
-    {
-        *out = iface;
-        return S_OK;
-    }
-    *out = NULL;
-    return E_NOINTERFACE;
-}
-
-static ULONG WINAPI madeira_user_AddRef( __x_ABI_CWindows_CSystem_CIUser *iface )
-{
-    return 2;   /* static object */
-}
-
-static ULONG WINAPI madeira_user_Release( __x_ABI_CWindows_CSystem_CIUser *iface )
-{
-    return 1;
-}
-
-static HRESULT WINAPI madeira_user_GetIids( __x_ABI_CWindows_CSystem_CIUser *iface, ULONG *iid_count, IID **iids )
-{
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI madeira_user_GetRuntimeClassName( __x_ABI_CWindows_CSystem_CIUser *iface, HSTRING *class_name )
-{
-    static const WCHAR name[] = L"Windows.System.User";
-    return WindowsCreateString( name, wcslen( name ), class_name );
-}
-
-static HRESULT WINAPI madeira_user_GetTrustLevel( __x_ABI_CWindows_CSystem_CIUser *iface, TrustLevel *trust_level )
-{
-    *trust_level = BaseTrust;
-    return S_OK;
-}
-
-static HRESULT WINAPI madeira_user_get_NonRoamableId( __x_ABI_CWindows_CSystem_CIUser *iface, HSTRING *value )
-{
-    static const WCHAR id[] = L"madeira-local-user";
-    return WindowsCreateString( id, wcslen( id ), value );
-}
-
-static HRESULT WINAPI madeira_user_get_AuthenticationStatus( __x_ABI_CWindows_CSystem_CIUser *iface,
-                                                             __x_ABI_CWindows_CSystem_CUserAuthenticationStatus *value )
-{
-    *value = 1;   /* LocallyAuthenticated */
-    return S_OK;
-}
-
-static HRESULT WINAPI madeira_user_get_Type( __x_ABI_CWindows_CSystem_CIUser *iface, __x_ABI_CWindows_CSystem_CUserType *value )
-{
-    *value = 0;   /* LocalUser */
-    return S_OK;
-}
-
-static HRESULT WINAPI madeira_user_GetPropertyAsync( __x_ABI_CWindows_CSystem_CIUser *iface, HSTRING value,
-                                                     __FIAsyncOperation_1_IInspectable **operation )
-{
-    *operation = NULL;
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI madeira_user_GetPropertiesAsync( __x_ABI_CWindows_CSystem_CIUser *iface, __FIVectorView_1_HSTRING *values,
-                                                       __FIAsyncOperation_1_Windows__CFoundation__CCollections__CIPropertySet **operation )
-{
-    *operation = NULL;
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI madeira_user_GetPictureAsync( __x_ABI_CWindows_CSystem_CIUser *iface,
-                                                    __x_ABI_CWindows_CSystem_CUserPictureSize desired_size,
-                                                    __FIAsyncOperation_1_Windows__CStorage__CStreams__CIRandomAccessStreamReference **operation )
-{
-    *operation = NULL;
-    return E_NOTIMPL;
-}
-
-static const struct __x_ABI_CWindows_CSystem_CIUserVtbl madeira_user_vtbl =
-{
-    madeira_user_QueryInterface,
-    madeira_user_AddRef,
-    madeira_user_Release,
-    /* IInspectable methods */
-    madeira_user_GetIids,
-    madeira_user_GetRuntimeClassName,
-    madeira_user_GetTrustLevel,
-    /* IUser methods */
-    madeira_user_get_NonRoamableId,
-    madeira_user_get_AuthenticationStatus,
-    madeira_user_get_Type,
-    madeira_user_GetPropertyAsync,
-    madeira_user_GetPropertiesAsync,
-    madeira_user_GetPictureAsync,
-};
-
-static __x_ABI_CWindows_CSystem_CIUser madeira_user = { &madeira_user_vtbl };
-
-/* manager.c's IGameController User and UserChanged, with the switch on:
- * S_OK and the local user; a UserChanged handler is accepted and never called
- * (the user never changes). Without the switch: E_NOTIMPL, as before. */
-HRESULT madeira_host_user( __x_ABI_CWindows_CSystem_CIUser **value )
-{
-    static LONG logged;
-
-    if (!madeira_host_pads_enabled()) return E_NOTIMPL;
-    if (!InterlockedExchange( &logged, 1 ))
-        ERR( "[wgi-host] the game asked for a controller's User: answered with the local user\n" );
-    *value = &madeira_user;
-    return S_OK;
-}
-
-HRESULT madeira_host_user_changed( EventRegistrationToken *token )
-{
-    if (!madeira_host_pads_enabled()) return E_NOTIMPL;
-    token->value = 0;
-    return S_OK;
-}
-
 struct host_provider
 {
     IWineGameControllerProvider IWineGameControllerProvider_iface;
@@ -360,11 +203,7 @@ static HRESULT WINAPI host_provider_GetTrustLevel( IWineGameControllerProvider *
 
 static HRESULT WINAPI host_provider_get_NonRoamableId( IWineGameControllerProvider *iface, HSTRING *value )
 {
-    struct host_provider *impl = host_impl_from_IWineGameControllerProvider( iface );
-    WCHAR id[] = L"madeira-xinput-0";
-
-    id[ARRAY_SIZE(id) - 2] = L'0' + impl->index % 10;
-    return WindowsCreateString( id, wcslen( id ), value );
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI host_provider_get_DisplayName( IWineGameControllerProvider *iface, HSTRING *value )
@@ -405,7 +244,6 @@ static HRESULT WINAPI host_provider_get_State( IWineGameControllerProvider *ifac
     if (!madeira_xget || madeira_xget( impl->index, &state )) memset( &state, 0, sizeof(state) );
     madeira_host_state( &state, out );
     out->timestamp = GetTickCount64();
-    madeira_host_reading_note( impl->index, &state, out->timestamp );
     return S_OK;
 }
 
@@ -577,40 +415,17 @@ extern void madeira_host_pads_poll( void );
 extern BOOL madeira_host_pads_wait( void );
 '''
 
-MANAGER_DECL = '''
-/* madeira-bcd: tools/patch-wine-wgi-host-pads.py (provider.c): with
- * MADEIRA_WGI_HOST_PADS=1 a controller's User is the local user. */
-extern HRESULT madeira_host_user( __x_ABI_CWindows_CSystem_CIUser **value );
-extern HRESULT madeira_host_user_changed( EventRegistrationToken *token );
-'''
-
-# manager.c: the first line of each IGameController user stub, then its own
-# FIXME and E_NOTIMPL as before.
-MANAGER_ADD_CHANGED = ('static HRESULT WINAPI controller_add_UserChanged( IGameController *iface,\n'
-                       '                                                  ITypedEventHandler_IGameController_UserChangedEventArgs *handler,\n'
-                       '                                                  EventRegistrationToken *token )\n{\n')
-MANAGER_STUBS = (
-    (MANAGER_ADD_CHANGED,
-     '    if (SUCCEEDED(madeira_host_user_changed( token ))) return S_OK;   /* madeira_host_pads */\n'),
-    ('static HRESULT WINAPI controller_remove_UserChanged( IGameController *iface, EventRegistrationToken token )\n{\n',
-     '    if (SUCCEEDED(madeira_host_user_changed( &token ))) return S_OK;   /* madeira_host_pads */\n'),
-    ('static HRESULT WINAPI controller_get_User( IGameController *iface, __x_ABI_CWindows_CSystem_CIUser **value )\n{\n',
-     '    if (SUCCEEDED(madeira_host_user( value ))) return S_OK;   /* madeira_host_pads */\n'),
-)
-
 
 def patch(directory):
     provider_path = os.path.join(directory, "provider.c")
     main_path = os.path.join(directory, "main.c")
-    manager_path = os.path.join(directory, "manager.c")
     provider = open(provider_path).read()
     main = open(main_path).read()
-    manager = open(manager_path).read()
-    if MARK in provider and MARK in main and MARK in manager:
+    if MARK in provider and MARK in main:
         print("already patched")
         return
-    if MARK in provider or MARK in main or MARK in manager:
-        sys.exit("patch-wine-wgi-host-pads: provider.c, main.c and manager.c are not all patched")
+    if MARK in provider or MARK in main:
+        sys.exit("patch-wine-wgi-host-pads: only one of provider.c and main.c is patched")
 
     # provider.c: the host providers at the end, after the HID providers.
     if "void provider_remove( const WCHAR *device_path )" not in provider:
@@ -635,17 +450,8 @@ def patch(directory):
         sys.exit("patch-wine-wgi-host-pads: the monitor thread's wait not found in main.c")
     main = main.replace(wait, "    } while (madeira_host_pads_wait());\n")
 
-    # manager.c: a controller's User and UserChanged (the local user with the
-    # switch on; the stubs as before without it).
-    for anchor, line in MANAGER_STUBS:
-        if manager.count(anchor) != 1:
-            sys.exit("patch-wine-wgi-host-pads: %r not found once in manager.c" % anchor.splitlines()[0])
-        manager = manager.replace(anchor, anchor + line)
-    manager = manager.replace(MANAGER_ADD_CHANGED, MANAGER_DECL.lstrip("\n") + "\n" + MANAGER_ADD_CHANGED)
-
     open(provider_path, "w").write(provider)
     open(main_path, "w").write(main)
-    open(manager_path, "w").write(manager)
     print("patched windows.gaming.input: host pads as gamepads (MADEIRA_WGI_HOST_PADS=1)")
 
 
