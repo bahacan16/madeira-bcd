@@ -5322,8 +5322,8 @@ static void mad_rs_report(double presents) {
 struct mad_skinx {
     unsigned list, ndisp, ndraw;          /* list number, dispatches and draws replayed so far */
     UINT64 cs[4]; unsigned ncs;           /* compute shaders since the last draw, oldest first */
-    char dl[4][1400]; unsigned ndl;       /* their lines, held until a draw says whether they fed it */
-    char tok[2048]; unsigned ntok;        /* range tokens the bridge appends while tab_on */
+    char dl[4][3200]; unsigned ndl;       /* their lines, held until a draw says whether they fed it */
+    char tok[3000]; unsigned ntok;        /* range tokens the bridge appends while tab_on */
     int tab_on, tab_cs, draw_gpu;         /* tab_cs: the tables being built are a dispatch's */
     struct { struct mad_resource *r; UINT64 off; UINT len; } in[6]; unsigned nin;   /* inputs the bridge resolved */
 };
@@ -5516,6 +5516,14 @@ static void mad_skin_where(struct mad_device *d, UINT64 va, char *o, size_t cap,
     else if (!r) mad_sk_cat(o, cap, n, "va:%llx?", (unsigned long long)va);
     else mad_sk_cat(o, cap, n, "r#%u+%llu", r->serial, (unsigned long long)off);
 }
+/* A UAV a dispatch binds in a check frame: remembered for mad_skin_draw. */
+static void mad_skin_note_write(struct mad_exec *e, const struct mad_resource *r, UINT64 off) {
+    struct mad_skw *w;
+    AcquireSRWLockExclusive(&g_sk_lock);
+    w = &g_skin_w[g_skin_wn++ & 255];
+    w->r = r; w->off = off; w->cs = e->cpso ? e->cpso->cs_hash : 0; w->frame = g_skin_frame; w->list = e->sk->list; w->disp = e->sk->ndisp + 1;
+    ReleaseSRWLockExclusive(&g_sk_lock);
+}
 /* One declared range of the stage whose tables are being built. */
 static void mad_skin_tok(struct mad_exec *e, const struct madeira_ir_air_range *rg, const struct mad_descriptor *de, UINT64 direct) {
     static const char cls[4] = { 'b', 's', 't', 'u' };
@@ -5543,15 +5551,88 @@ static void mad_skin_tok(struct mad_exec *e, const struct madeira_ir_air_range *
     if (r && rg->type != MADEIRA_IR_AIR_UAV && s->nin < 6) {
         s->in[s->nin].r = r; s->in[s->nin].off = off; s->in[s->nin].len = 256; s->nin++;
     }
-    if (r && rg->type == MADEIRA_IR_AIR_UAV && s->tab_cs && e->cpso) {
-        struct mad_skw *w;
-        AcquireSRWLockExclusive(&g_sk_lock);
-        w = &g_skin_w[g_skin_wn++ & 255];
-        w->r = r; w->off = off; w->cs = e->cpso->cs_hash; w->frame = g_skin_frame; w->list = s->list; w->disp = s->ndisp + 1;
-        ReleaseSRWLockExclusive(&g_sk_lock);
-    }
+    if (r && rg->type == MADEIRA_IR_AIR_UAV && s->tab_cs) mad_skin_note_write(e, r, off);
     if (s->ntok + (unsigned)n + 1 < sizeof s->tok) { memcpy(s->tok + s->ntok, t, (size_t)n); s->ntok += (unsigned)n; s->tok[s->ntok] = 0; }
     else if (s->ntok + 5 < sizeof s->tok && (!s->ntok || s->tok[s->ntok - 1] != '.')) { memcpy(s->tok + s->ntok, " ...", 5); s->ntok += 4; }
+}
+/* One descriptor of a table (the converter's layout: address, texture id,
+ * metadata with bit 63 for a typed buffer). */
+static void mad_skin_desc(struct mad_exec *e, const struct mad_descriptor *de, UINT range_type, char *t, size_t cap, int *n) {
+    struct mad_skinx *s = e->sk; struct mad_resource *r = NULL; UINT64 off = 0;
+    if (!de->gpu_va && !de->texture_view_id) { mad_sk_cat(t, cap, n, "0"); return; }
+    if (de->metadata & MAD_DESC_TYPEDBUF) {
+        mad_sk_cat(t, cap, n, "T{");
+        mad_skin_where(e->q->device, de->gpu_va, t, cap, n, &r, &off);
+        mad_sk_cat(t, cap, n, "/%u e%u%s}", (unsigned)(de->metadata & 0xffffffffu), (unsigned)((de->metadata >> 32) & 0xff),
+                   de->texture_view_id ? "" : " NO-TEXTURE");
+    } else if (de->texture_view_id) { mad_sk_cat(t, cap, n, "tex"); return; }
+    else {
+        mad_skin_where(e->q->device, de->gpu_va, t, cap, n, &r, &off);
+        mad_sk_cat(t, cap, n, "/%u", (unsigned)(de->metadata & 0xffffffffu));
+    }
+    if (!r) return;
+    if (range_type == MADEIRA_IR_RANGE_UAV) { if (s->tab_cs) mad_skin_note_write(e, r, off); }
+    else if (s->nin < 6) { s->in[s->nin].r = r; s->in[s->nin].off = off; s->in[s->nin].len = 256; s->nin++; }
+}
+/* The converter (DXIL) path binds the root signature as it is: tables point
+ * into the descriptor heap, which the shader indexes itself. Every parameter
+ * the stage can see, and the first descriptors of each table range. */
+static void mad_skin_rs_tok(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root, const UINT32 (*consts)[64], unsigned vis_mask) {
+    static const char cls[4] = { 't', 'u', 'b', 's' };
+    struct mad_skinx *s = e->sk; struct mad_heap *h = e->srv;
+    unsigned i, j, k;
+    if (!rs) { int n0 = (int)s->ntok; mad_sk_cat(s->tok, sizeof s->tok, &n0, " no root signature"); s->ntok = (unsigned)n0; return; }
+    for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
+        const struct madeira_ir_root_param *pp = &rs->params[i];
+        char t[1024]; int n = 0;
+        if (pp->visibility < 32 && !((1u << pp->visibility) & vis_mask)) continue;
+        if (pp->type == MADEIRA_IR_PARAM_CONSTANTS)
+            mad_sk_cat(t, sizeof t, &n, " p%u:b%u%s=%x,%x,%x,%x", i, pp->shader_register, pp->register_space ? "s" : "",
+                       consts[i][0], consts[i][1], consts[i][2], consts[i][3]);
+        else if (pp->type != MADEIRA_IR_PARAM_TABLE) {
+            struct mad_resource *r = NULL; UINT64 off = 0;
+            mad_sk_cat(t, sizeof t, &n, " p%u:root-%s%u=", i, pp->type == MADEIRA_IR_PARAM_CBV ? "b" : pp->type == MADEIRA_IR_PARAM_SRV ? "t" : "u",
+                       pp->shader_register);
+            mad_skin_where(e->q->device, root[i], t, sizeof t, &n, &r, &off);
+            if (r && pp->type == MADEIRA_IR_PARAM_UAV) { if (s->tab_cs) mad_skin_note_write(e, r, off); }
+            else if (r && s->nin < 6) { s->in[s->nin].r = r; s->in[s->nin].off = off; s->in[s->nin].len = 256; s->nin++; }
+        } else {
+            UINT64 base = root[i]; unsigned running = 0, tidx;
+            mad_sk_cat(t, sizeof t, &n, " p%u:{", i);
+            if (!base) { mad_sk_cat(t, sizeof t, &n, "unset}"); goto add; }
+            if (!h || !h->cpu || base < h->gpu_address || (base - h->gpu_address) % sizeof(struct mad_descriptor) ||
+                (base - h->gpu_address) / sizeof(struct mad_descriptor) >= h->count) {
+                mad_sk_cat(t, sizeof t, &n, "not in the bound heap}"); goto add;
+            }
+            tidx = (unsigned)((base - h->gpu_address) / sizeof(struct mad_descriptor));
+            mad_sk_cat(t, sizeof t, &n, "@%u", tidx);
+            for (j = 0; j < pp->num_ranges; j++) {
+                unsigned ri = pp->first_range + j, roff, cnt;
+                const struct madeira_ir_root_range *rr;
+                if (ri >= rs->nranges) break;
+                rr = &rs->ranges[ri];
+                roff = rr->table_offset == 0xffffffffu ? running : rr->table_offset;
+                if (rr->num_descriptors != ~0u) running = roff + rr->num_descriptors;
+                if (rr->range_type == MADEIRA_IR_RANGE_SAMPLER) continue;
+                cnt = rr->num_descriptors == ~0u ? 2 : rr->num_descriptors < 6 ? rr->num_descriptors : 6;
+                mad_sk_cat(t, sizeof t, &n, " %c%u", rr->range_type < 4 ? cls[rr->range_type] : '?', rr->base_register);
+                if (rr->register_space) mad_sk_cat(t, sizeof t, &n, "s%u", rr->register_space);
+                if (rr->num_descriptors == ~0u) mad_sk_cat(t, sizeof t, &n, "x*");
+                else if (rr->num_descriptors != 1) mad_sk_cat(t, sizeof t, &n, "x%u", rr->num_descriptors);
+                mad_sk_cat(t, sizeof t, &n, "=");
+                for (k = 0; k < cnt; k++) {
+                    unsigned idx = tidx + roff + k;
+                    if (k) mad_sk_cat(t, sizeof t, &n, ",");
+                    if (idx >= h->count) { mad_sk_cat(t, sizeof t, &n, "past-heap"); break; }
+                    mad_skin_desc(e, &h->cpu[idx], rr->range_type, t, sizeof t, &n);
+                }
+            }
+            mad_sk_cat(t, sizeof t, &n, "}");
+        }
+    add:
+        if (s->ntok + (unsigned)n + 1 < sizeof s->tok) { memcpy(s->tok + s->ntok, t, (size_t)n); s->ntok += (unsigned)n; s->tok[s->ntok] = 0; }
+        else if (s->ntok + 5 < sizeof s->tok && (!s->ntok || s->tok[s->ntok - 1] != '.')) { memcpy(s->tok + s->ntok, " ...", 5); s->ntok += 4; }
+    }
 }
 static int mad_skin_is_prod(UINT64 h) {
     LONG i; int hit = 0;
@@ -5597,6 +5678,12 @@ static void mad_skin_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
                      (unsigned long long)h, i, s->in[i].r->serial, (unsigned long long)s->in[i].off);
             mad_skin_capture(e, lab, s->in[i].r, s->in[i].off, s->in[i].len, 21, 0);
         }
+}
+/* The vertex stage's ranges of the draw mad_skin_draw just logged. */
+static void mad_skin_vs_line(struct mad_exec *e) {
+    struct mad_skinx *s = e->sk; char line[3200]; int n = 0;
+    mad_sk_cat(line, sizeof line, &n, "[skin-check] f%ld L%u D%u vertex stage |%s", (long)g_skin_frame, s->list, s->ndraw, s->tok);
+    mad_skin_line(line);
 }
 /* Before a draw begins its render pass. Outside check frames it only notices
  * the first draw of this kind. */
@@ -5687,15 +5774,15 @@ static void mad_skin_draw(struct mad_exec *e, const struct mad_cmd *c) {
                  (unsigned long long)off, st);
         mad_skin_capture(e, lab, r, off, (UINT)len, 20, st);
     }
+    if (s->draw_gpu == 2 && p->backend != MADEIRA_IR_BACKEND_AIRCONV) {   /* the DXBC path logs its ranges as it builds them */
+        s->ntok = 0; s->tok[0] = 0; s->nin = 0;
+        mad_skin_rs_tok(e, e->rs, e->root, (const UINT32 (*)[64])e->consts,
+                        (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_VERTEX) | (1u << MADEIRA_IR_VIS_GEOMETRY));
+        mad_skin_vs_line(e);
+    }
     for (i = 0; i < s->ncs; i++) mad_bc_dump("cs", s->cs[i]);
     if (s->ncs) mad_bc_dump("vs", p->vs_hash);   /* the dump budget is 48 blobs: compute skinning's draws only */
     s->ncs = s->ndl = 0;
-}
-/* The vertex stage's ranges of the draw mad_skin_draw just logged. */
-static void mad_skin_vs_line(struct mad_exec *e) {
-    struct mad_skinx *s = e->sk; char line[2300]; int n = 0;
-    mad_sk_cat(line, sizeof line, &n, "[skin-check] f%ld L%u D%u vertex stage |%s", (long)g_skin_frame, s->list, s->ndraw, s->tok);
-    mad_skin_line(line);
 }
 /* At every Present. */
 static void mad_skin_present(UINT64 presents) {
@@ -7612,6 +7699,11 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         if (!exec_arg_slot_for(e, e->crs, e->croot, (const UINT32 (*)[64])e->cconsts, &argbuf, &argoff,
                                e->cpso->has_root_off ? e->cpso->root_off : NULL, e->cpso)) { MAD_SKIP(e); return; }
         if (g_census_on) exec_desc_check(e, e->crs, e->croot, e->cpso->vs_name);   /* ml913 */
+        if (e->sk) {   /* madeira-bcd skin-check: the converter reads the root signature as bound */
+            e->sk->tab_cs = 1;
+            mad_skin_rs_tok(e, e->crs, e->croot, (const UINT32 (*)[64])e->cconsts, ~0u);
+            e->sk->tab_cs = 0;
+        }
     }
 
     if (((g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && g_dump_draws < 40000) {   /* ml893 census + ml898 in-game window */

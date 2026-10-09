@@ -39,18 +39,34 @@ def check(what, cond):
 
 
 def body(sig):
+    """A function's text, braces matched outside strings, characters and comments."""
     start = pe.index(sig)
     while pe.index(';', start) < pe.index('{', start):
         start = pe.index(sig, start + 1)
-    brace = pe.index('{', start)
-    depth = 0
-    for i in range(brace, len(pe)):
-        if pe[i] == '{':
+    i, depth, quote = pe.index('{', start), 0, None
+    while i < len(pe):
+        ch = pe[i]
+        if quote:
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif pe.startswith('/*', i):
+            i = pe.index('*/', i) + 2
+            continue
+        elif pe.startswith('//', i):
+            i = pe.index('\n', i)
+            continue
+        elif ch in '"\'':
+            quote = ch
+        elif ch == '{':
             depth += 1
-        elif pe[i] == '}':
+        elif ch == '}':
             depth -= 1
             if depth == 0:
                 return pe[start:i + 1]
+        i += 1
     raise AssertionError('unterminated: ' + sig)
 
 
@@ -86,6 +102,13 @@ check('pending captures force the synchronous Signal (its fence wait completes t
 sr = body('static HRESULT mad_signal_run(struct mad_queue *q, ID3D12Fence *fence, UINT64 value)')
 check('the signalling queue prints its own captures after the wait',
       sr.index('mad_cb_retire(q->device, q->pending[i])') < sr.index('if (g_sk_n) mad_skin_flush(q);') < sr.index('return ID3D12Fence_Signal(fence, value);'))
+check('dispatch, converter (DXIL) path: the root signature as bound is named after its argument slot',
+      disp.index('e->cpso->has_root_off ? e->cpso->root_off : NULL, e->cpso)) { MAD_SKIP(e); return; }') <
+      disp.index('mad_skin_rs_tok(e, e->crs, e->croot, (const UINT32 (*)[64])e->cconsts, ~0u);'))
+sdr = body('static void mad_skin_draw(struct mad_exec *e, const struct mad_cmd *c)')
+check('draw, converter (DXIL) path: the vertex stage\'s parameters from the root signature',
+      'if (s->draw_gpu == 2 && p->backend != MADEIRA_IR_BACKEND_AIRCONV) {' in sdr and
+      '(1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_VERTEX) | (1u << MADEIRA_IR_VIS_GEOMETRY));' in sdr)
 cs = body('static HRESULT device_CreateComputePipelineState_impl(ID3D12Device *This,')
 check('compute bytecode kept by its fault-report hash, only with the switch',
       'if (mad_skin_on()) mad_bc_keep(hh, b, p->cs_len);' in cs)
@@ -276,6 +299,109 @@ int main(void) {
 }
 '''
 
+
+def src_block(start, end_marker='};'):
+    a = pe.index(start)
+    return pe[a:pe.index(end_marker, a) + len(end_marker)]
+
+
+harness2 = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdarg.h>
+typedef uint32_t UINT32; typedef unsigned UINT; typedef long LONG; typedef uint64_t UINT64;
+typedef struct { int x; } SRWLOCK;
+#define SRWLOCK_INIT { 0 }
+static void AcquireSRWLockExclusive(SRWLOCK *l) { (void)l; }
+static void ReleaseSRWLockExclusive(SRWLOCK *l) { (void)l; }
+#define MAD_DESC_TYPEDBUF (1ull << 63)
+#define MAD_ROOT_PARAM_MAX 64
+enum { MADEIRA_IR_PARAM_TABLE = 0, MADEIRA_IR_PARAM_CONSTANTS = 1, MADEIRA_IR_PARAM_CBV = 2, MADEIRA_IR_PARAM_SRV = 3, MADEIRA_IR_PARAM_UAV = 4 };
+enum { MADEIRA_IR_RANGE_SRV = 0, MADEIRA_IR_RANGE_UAV = 1, MADEIRA_IR_RANGE_CBV = 2, MADEIRA_IR_RANGE_SAMPLER = 3 };
+enum { MADEIRA_IR_VIS_ALL = 0, MADEIRA_IR_VIS_VERTEX = 1, MADEIRA_IR_VIS_PIXEL = 5 };
+struct madeira_ir_root_param { uint32_t type, shader_register, register_space, num_constants, visibility, num_ranges, first_range, reserved; };
+struct madeira_ir_root_range { uint32_t range_type, num_descriptors, base_register, register_space, table_offset, reserved; };
+struct mad_rootsig { unsigned nparams, nranges; struct madeira_ir_root_param params[8]; struct madeira_ir_root_range ranges[8]; };
+struct mad_descriptor { UINT64 gpu_va, texture_view_id, metadata; };
+struct mad_heap { struct mad_descriptor *cpu; UINT64 gpu_address; unsigned count; };
+struct mad_resource { unsigned serial; UINT64 gpu_address, size; };
+struct mad_device { int x; };
+struct mad_queue { struct mad_device *device; };
+struct mad_pso { UINT64 cs_hash; };
+""" + src_block('struct mad_skinx {') + r"""
+struct mad_exec { struct mad_queue *q; struct mad_heap *srv; struct mad_pso *cpso; struct mad_skinx *sk; };
+static volatile LONG g_skin_frame = 7;
+static SRWLOCK g_sk_lock = SRWLOCK_INIT;
+""" + src_block('static struct mad_skw {', ';\n') + r"""
+static unsigned g_skin_wn;
+static struct mad_resource res[2] = { { 41, 0x100000000ull, 16u << 20 }, { 42, 0x200000000ull, 4 } };
+static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 va, UINT64 *off) {
+    int i; (void)d;
+    for (i = 0; i < 2; i++) if (va >= res[i].gpu_address && va < res[i].gpu_address + res[i].size) { *off = va - res[i].gpu_address; return &res[i]; }
+    return NULL;
+}
+""" + body('static void mad_sk_cat(char *o, size_t cap, int *n, const char *fmt, ...)') + '\n' + \
+    body('static void mad_skin_where(struct mad_device *d, UINT64 va, char *o, size_t cap, int *n, struct mad_resource **out, UINT64 *out_off)') + '\n' + \
+    body('static void mad_skin_note_write(struct mad_exec *e, const struct mad_resource *r, UINT64 off)') + '\n' + \
+    body('static void mad_skin_desc(struct mad_exec *e, const struct mad_descriptor *de, UINT range_type, char *t, size_t cap, int *n)') + '\n' + \
+    body('static void mad_skin_rs_tok(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root, const UINT32 (*consts)[64], unsigned vis_mask)') + r"""
+static int bad;
+#define EXPECT(c, what) do { if (!(c)) { printf("FAIL %s\n", what); bad = 1; } else printf("ok   %s\n", what); } while (0)
+int main(void) {
+    static struct mad_descriptor heap[64];
+    struct mad_heap h = { heap, 0x900000000ull, 64 };
+    struct mad_device dev; struct mad_queue q = { &dev }; struct mad_pso pso = { 0xabcdef };
+    struct mad_skinx *s = calloc(1, sizeof *s);
+    struct mad_exec e = { &q, &h, &pso, s };
+    struct mad_rootsig rs; UINT64 root[8] = { 0 }; static UINT32 consts[64][64];
+    memset(&rs, 0, sizeof rs);
+    /* p0: table at heap[10]: t0..t1 (offset 0), u0 (appended), CBV b3 at offset 5; p1: constants b1; p2: root UAV u4; p3: pixel only */
+    rs.nparams = 4; rs.nranges = 3;
+    rs.params[0] = (struct madeira_ir_root_param){ MADEIRA_IR_PARAM_TABLE, 0, 0, 0, MADEIRA_IR_VIS_ALL, 3, 0, 0 };
+    rs.ranges[0] = (struct madeira_ir_root_range){ MADEIRA_IR_RANGE_SRV, 2, 0, 0, 0, 0 };
+    rs.ranges[1] = (struct madeira_ir_root_range){ MADEIRA_IR_RANGE_UAV, 1, 0, 0, 0xffffffffu, 0 };
+    rs.ranges[2] = (struct madeira_ir_root_range){ MADEIRA_IR_RANGE_CBV, 1, 3, 0, 5, 0 };
+    rs.params[1] = (struct madeira_ir_root_param){ MADEIRA_IR_PARAM_CONSTANTS, 1, 0, 4, MADEIRA_IR_VIS_ALL, 0, 0, 0 };
+    rs.params[2] = (struct madeira_ir_root_param){ MADEIRA_IR_PARAM_UAV, 4, 0, 0, MADEIRA_IR_VIS_ALL, 0, 0, 0 };
+    rs.params[3] = (struct madeira_ir_root_param){ MADEIRA_IR_PARAM_CBV, 0, 0, 0, MADEIRA_IR_VIS_PIXEL, 0, 0, 0 };
+    root[0] = h.gpu_address + 10 * sizeof(struct mad_descriptor);
+    root[2] = res[0].gpu_address + 4096; root[3] = res[0].gpu_address;
+    consts[1][0] = 0x11; consts[1][1] = 0x22; consts[1][2] = 0x33; consts[1][3] = 0x44;
+    heap[10] = (struct mad_descriptor){ res[0].gpu_address + 256, 77, (1ull << 63) | (2ull << 32) | 1048576 };   /* typed SRV t0 */
+    heap[11] = (struct mad_descriptor){ res[0].gpu_address + 512, 0, 4096 };                                     /* raw SRV t1 */
+    heap[12] = (struct mad_descriptor){ res[1].gpu_address + 65536, 0, (1ull << 63) | 1048576 };                /* typed UAV u0, no texture, past r#42 */
+    heap[15] = (struct mad_descriptor){ res[0].gpu_address + 8192, 0, 256 };                                     /* CBV b3 at offset 5 */
+    s->tab_cs = 1;
+    mad_skin_rs_tok(&e, &rs, root, (const UINT32 (*)[64])consts, ~0u);
+    printf("%s\n", s->tok);
+    EXPECT(strstr(s->tok, " p0:{@10 t0x2=T{r#41+256/1048576 e2},r#41+512/4096 u0=T{va:200010000?/1048576 e0 NO-TEXTURE} b3=r#41+8192/256}") != NULL,
+           "a table: ranges at their offsets (appended after the previous one), typed and plain views, a view with no texture");
+    EXPECT(strstr(s->tok, " p1:b1=11,22,33,44") != NULL, "root constants");
+    EXPECT(strstr(s->tok, " p2:root-u4=r#41+4096") != NULL, "a root UAV");
+    EXPECT(strstr(s->tok, "p3:") != NULL, "compute sees pixel-only parameters too (all visibilities)");
+    EXPECT(s->nin == 4 && s->in[0].off == 256 && s->in[1].off == 512 && s->in[2].off == 8192 && s->in[3].off == 0,
+           "inputs: the SRVs and the CBVs (table and root)");
+    EXPECT(g_skin_wn == 1 && g_skin_w[0].r == &res[0] && g_skin_w[0].off == 4096 && g_skin_w[0].cs == 0xabcdef && g_skin_w[0].frame == 7,
+           "writes: the root UAV (the unresolved table UAV cannot be)");
+    s->ntok = 0; s->tok[0] = 0; s->nin = 0; s->tab_cs = 0;
+    mad_skin_rs_tok(&e, &rs, root, (const UINT32 (*)[64])consts, (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_VERTEX));
+    EXPECT(strstr(s->tok, "p3:") == NULL && g_skin_wn == 1, "a draw: pixel-only parameters left out, no writes noted");
+    root[0] = h.gpu_address + 70 * sizeof(struct mad_descriptor); s->ntok = 0; s->tok[0] = 0;
+    mad_skin_rs_tok(&e, &rs, root, (const UINT32 (*)[64])consts, ~0u);
+    EXPECT(strstr(s->tok, " p0:{not in the bound heap}") != NULL, "a table outside the heap is named, not read");
+    root[0] = h.gpu_address + 62 * sizeof(struct mad_descriptor); s->ntok = 0; s->tok[0] = 0;
+    mad_skin_rs_tok(&e, &rs, root, (const UINT32 (*)[64])consts, ~0u);
+    EXPECT(strstr(s->tok, "past-heap") != NULL, "a range running past the heap stops there");
+    root[0] = 0; s->ntok = 0; s->tok[0] = 0;
+    mad_skin_rs_tok(&e, &rs, root, (const UINT32 (*)[64])consts, ~0u);
+    EXPECT(strstr(s->tok, " p0:{unset}") != NULL, "an unset table");
+    printf("%s\n", bad ? "harness FAILED" : "harness ok");
+    return bad;
+}
+"""
+
 cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
 if not cc:
     check('a host C compiler', False)
@@ -293,6 +419,18 @@ else:
             run = subprocess.run([str(exe)], capture_output=True, text=True)
             print(run.stdout, end='')
             check('the helpers behave', run.returncode == 0)
+        src2 = Path(tmp) / 'skin2.c'
+        exe2 = Path(tmp) / 'skin2'
+        src2.write_text(harness2)
+        b = subprocess.run([cc, '-std=gnu11', '-Wall', '-Wno-unused-function', '-Wno-unused-variable', str(src2), '-o', str(exe2)],
+                           capture_output=True, text=True)
+        check('the root-signature walk compiles on the host', b.returncode == 0)
+        if b.returncode:
+            print(b.stderr[-3000:])
+        else:
+            run = subprocess.run([str(exe2)], capture_output=True, text=True)
+            print(run.stdout, end='')
+            check('the root-signature walk behaves', run.returncode == 0)
 
 if not ok:
     sys.exit(1)
