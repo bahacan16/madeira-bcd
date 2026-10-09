@@ -333,7 +333,7 @@ check(R.gta5EnhancedSteam.switchSummary == "AVX off, NVIDIA on, Wine's C++ runti
 check(R.gta5EnhancedSteam.summary(home: true) == "AVX off, NVIDIA on, Wine's C++ runtime off", R.gta5EnhancedSteam.summary(home: true))
 check(R.note(R.ghostOfTsushima, home: true).contains("1280x720") && !R.note(R.ghostOfTsushima, home: true).contains("semaphore"),
       R.note(R.ghostOfTsushima, home: true))
-check(R.note(R.rdr2Steam).contains("43 config lines") && R.note(R.rdr2Steam).contains("this screen's shape at 720 lines") && R.note(nil).contains("no recommended settings"), R.note(R.rdr2Steam))
+check(R.note(R.rdr2Steam).contains("@RDR2_CONFIG_LINES@ config lines") && R.note(R.rdr2Steam).contains("this screen's shape at 720 lines") && R.note(nil).contains("no recommended settings"), R.note(R.rdr2Steam))
 
 // First sight, the player's changes, newer lists and Reset to Recommended.
 let key = "madeira.recommended.applied"
@@ -457,7 +457,10 @@ with tempfile.TemporaryDirectory(prefix='madeira-recommended-') as directory:
     compiler = shutil.which('swiftc')
     if compiler:
         (temporary / 'Stubs.swift').write_text(stubs)
-        (temporary / 'main.swift').write_text(main)
+        # the RDR2 list's config lines (its two comment lines are not config)
+        rdr2_config_lines = sum(1 for line in presets['rdr2-steam']['lines']
+                                if line.strip() and not line.strip().startswith('#'))
+        (temporary / 'main.swift').write_text(main.replace('@RDR2_CONFIG_LINES@', str(rdr2_config_lines)))
         (temporary / 'drive').mkdir()
         (temporary / 'configs').mkdir()
         binary = temporary / 'recommended'
