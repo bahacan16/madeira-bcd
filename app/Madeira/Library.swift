@@ -699,6 +699,20 @@ final class LibraryModel: ObservableObject {
             }
         }
         resetPhoneResolution()
+        applyRecommendations()
+    }
+
+    /// madeira-bcd: games already in the library get Madeira's recommended settings
+    /// when they are due (GameRecommendationsApply.swift); the entries' own fields
+    /// are saved here.
+    private func applyRecommendations() {
+        guard !readOnly else { return }
+        var next = entries
+        var changed = false
+        for i in next.indices {
+            if GameRecommendations.prepare(&next[i]) { changed = true }
+        }
+        if changed { persist(next) }
     }
 
     /// ml1172: every new entry used to get 1408x648, a 19.5:9 phone's shape.
@@ -733,6 +747,9 @@ final class LibraryModel: ObservableObject {
         guard !readOnly else { error = "The library file could not be read. Preserve or repair it before making changes."; return }
         var next = entries
         var entry = entry
+        // madeira-bcd: a game seen for the first time gets Madeira's recommended settings
+        // (GameRecommendationsApply.swift): a finished Steam download, a new or saved entry.
+        GameRecommendations.prepare(&entry)
         // A Steam game has one entry: a details page opened before its card first saved
         // one (refreshSteamMetadata) updates that entry.
         if let i = next.firstIndex(where: { $0.id == entry.id }) ??
@@ -2897,6 +2914,10 @@ struct LibraryDetail: View {
     @State private var bcd = BCDGameValues()
     @State private var findCover = false
     @State private var remove = false
+    /// madeira-bcd: Madeira's recommended settings for this game, nil for none
+    /// (GameRecommendations.swift), and the question before Reset to Recommended.
+    @State private var recommended: GameRecommendation?
+    @State private var confirmReset = false
     @State private var leaving = false
     @State private var error: String?
     @State private var copiedLink = false
@@ -2945,6 +2966,18 @@ struct LibraryDetail: View {
         entry.avx = nil; entry.reportNVIDIA = nil; entry.frameGeneration = nil; entry.metalFXUpscale = nil; entry.config = nil
         model.save(entry)
         LogStore.shared.log("[bcd] \(entry.title): moved \(moved.joined(separator: ",")) into the game's own settings")
+    }
+    /// madeira-bcd: a game seen for the first time gets Madeira's recommended settings,
+    /// which this page then shows (GameRecommendationsApply.swift).
+    private func prepareRecommendation() {
+        recommended = GameRecommendations.recommendation(for: entry)
+        if GameRecommendations.prepare(&entry) { model.save(entry) }
+    }
+    /// Reset to Recommended: the recommendation's config and switches, written at once.
+    private func resetToRecommended() {
+        recommended = GameRecommendations.reset(&entry)
+        model.save(entry)
+        reloadBCD()
     }
     /// "None", or how many keys this game's own config sets.
     static func configSummary(_ config: String?) -> String {
@@ -3246,6 +3279,17 @@ struct LibraryDetail: View {
                     Section("Executable") { Text(entry.windowsPath).font(.caption.monospaced()).textSelection(.enabled) }
                     Section { Button("Remove from library", role: .destructive) { remove = true } }
                 }
+                // madeira-bcd: always last, for every game (GameRecommendationsApply.swift).
+                if entry.desktop != true {
+                    Section {
+                        Button("Reset to Recommended", systemImage: "arrow.counterclockwise") { confirmReset = true }
+                            .confirmationDialog(GameRecommendations.question(recommended), isPresented: $confirmReset, titleVisibility: .visible) {
+                                Button("Reset", role: .destructive) { resetToRecommended() }
+                            }
+                    } footer: {
+                        Text(GameRecommendations.note(recommended))
+                    }
+                }
                 if let error { Section { Text(error).foregroundStyle(.red) } }
             }
             .navigationTitle("Game details").navigationBarTitleDisplayMode(.inline)
@@ -3273,10 +3317,10 @@ struct LibraryDetail: View {
             .task {
                 if entry.graphicsAPI == nil, entry.desktop != true, let url = try? LibraryModel.executable(entry.relativePath) { entry.graphicsAPI = LibraryModel.graphicsImports(url) }
             }
-            .onAppear { migrateEntryOptions(); reloadBCD() }
+            .onAppear { migrateEntryOptions(); prepareRecommendation(); reloadBCD() }
             .onDisappear { if !leaving { model.save(entry) } }
             .onReceive(LibraryController.shared.commands) { command in
-                guard !leaving, !findCover, !importCover, !remove else { return }
+                guard !leaving, !findCover, !importCover, !remove, !confirmReset else { return }
                 if command == "back" { model.save(entry); dismiss() }
                 if command == "accept" { start() }
             }

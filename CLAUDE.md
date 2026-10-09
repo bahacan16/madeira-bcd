@@ -20,6 +20,20 @@ without code changes are recorded too.
 config lines that worked (or failed) in a device test, newest build first,
 nothing deleted.
 
+**Also mandatory (owner's decision, 2026-10-09):** every game we get working
+gets its tested settings built into the app, in
+`app/Madeira/GameRecommendations.swift`: the game's config lines and its
+switches (AVX, NVIDIA, Wine's C++ runtime, fastsync, FPS limit, resolution).
+A Steam game is recognised by its App ID or its folder under
+`steamapps\common`; any other game by its program's file name, never by the
+folder it was installed in. Raise the list's `version` when it changes, and
+keep `tests/host/check-game-recommendations.py` passing. Bring the lists up
+to date before every build, unasked: the newest lines that worked, or for a
+game still being brought up, the list for that build's test. A game gets its
+list the first time Madeira sees it with no config of its own; "Reset to
+Recommended" at the bottom of its settings brings the list back. This
+feature goes into the next pull request to upstream (willfaust/madeira).
+
 **Keep progress out of this repository:** no handoff or investigation
 documents in `docs/`, and commit messages stay one short line (no logs,
 evidence or analysis).

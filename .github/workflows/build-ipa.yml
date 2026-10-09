@@ -53,6 +53,11 @@ jobs:
       - name: Check generated settings catalog
         run: python3 tests/host/check-config-catalog.py
 
+      # madeira-bcd: the games' built-in recommended settings and where the app
+      # applies them (GameRecommendations.swift; owner's decision 2026-10-09).
+      - name: Check built-in recommended game settings
+        run: python3 tests/host/check-game-recommendations.py --require-swift
+
       # --- UNVERIFIED: exact configure invocation for the wine fork's
       # iOS/arm64 cross target isn't documented anywhere in the repo.
       # This is a best guess and will likely need correcting once we see

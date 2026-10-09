@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Madeira's built-in recommended settings per game (owner's decision 2026-10-09).
+
+Source checks (every host): the lists in app/Madeira/GameRecommendations.swift
+match the working lists they were taken from (Red Dead Redemption 2's line for
+line), every key that is not env.NAME is one Madeira reads (the generated
+settings catalog), no list carries DLL overrides for Rockstar's Social Club,
+and the app applies them where the owner asked: a game's first sight (library
+start-up, saving an entry, Game details, a start, the madeira-bcd home screen)
+and Reset to Recommended at the bottom of both settings pages.
+
+The Swift fixture (macOS CI) compiles the real GameRecommendations.swift and
+GameRecommendationsApply.swift against small stand-ins for the app types and
+checks how games are recognised (Steam games by App ID or by their folder
+under steamapps\\common, every other game by its program's name, GTA V
+Enhanced inside or outside a Steam library) and the first-sight, update and
+reset rules. Linux hosts without Swift run the source checks; --require-swift
+turns a missing compiler into a failure.
+"""
+from pathlib import Path
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--require-swift', action='store_true')
+args = parser.parse_args()
+root = Path(__file__).resolve().parents[2]
+app = root / 'app/Madeira'
+lists_src = (app / 'GameRecommendations.swift').read_text()
+apply_src = (app / 'GameRecommendationsApply.swift').read_text()
+library = (app / 'Library.swift').read_text()
+home = (app / 'HomeView.swift').read_text()
+content = (app / 'ContentView.swift').read_text()
+profiles = (app / 'GameProfiles.swift').read_text()
+catalog = (app / 'ConfigCatalog.generated.swift').read_text()
+project = (root / 'app/Madeira.xcodeproj/project.pbxproj').read_text()
+
+
+def block(source, start, end):
+    i = source.index(start)
+    return source[i:source.index(end, i) + len(end)]
+
+
+# The lists, as Swift sees them: the multi-line literal loses its closing
+# delimiter's indentation.
+presets = {}
+for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)", title: "([^"]+)", version: (\d+),\n'
+                     r'\s*config: """\n(.*?)\n( *)""",\n(.*?)\)\n', lists_src, re.S):
+    name, ident, title, version, body, indent, switches = m.groups()
+    lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
+    presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join(switches.split()))
+assert set(presets) == {'rdr2-steam', 'gta5e-steam', 'gta5e-other', 'ghost-of-tsushima', 'god-of-war'}, sorted(presets)
+assert 'static let all = [rdr2Steam, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar]' in lists_src
+
+catalog_keys = set(re.findall(r'ConfigOption\(key: "([^"]+)"', catalog))
+for ident, p in presets.items():
+    assert p['version'] >= 1, ident
+    assert p['lines'][0].startswith('# Madeira') and p['lines'][1].startswith('# Game details'), ident
+    seen = set()
+    for line in p['lines'][2:]:
+        assert line == line.strip() and not line.startswith('#'), (ident, line)
+        key, sep, value = line.partition(' = ')
+        assert sep and key and value, (ident, line)
+        assert key not in seen, (ident, 'twice', key)
+        seen.add(key)
+        if key.startswith('env.'):
+            assert re.fullmatch(r'env\.[A-Za-z_][A-Za-z0-9_]*', key), (ident, key)
+        else:
+            assert key in catalog_keys, (ident, 'not a key Madeira reads', key)
+        # Madeira's own settings only: nothing that loads a replaced Social Club.
+        assert 'socialclub' not in line.lower() and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
+print('PASS: five lists, two comment lines each, no key twice, every non-env key in the settings catalog, no Social Club DLL lines')
+
+# Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line.
+rdr2 = '''d3d12-caps-log = 2
+d3d12-shader-pack = 1
+replay-split = 1
+pool-low = 1
+pool-page-fit = 1
+pool-split = 1
+vram-mb = 2304
+swap-mb = 8192
+swap-mode = 2
+pso-warm = 2
+fence-chain = 6
+env.WINE_D3D_CONFIG = renderer=no3d
+env.FEX_VECTORTSOENABLED = 0
+env.MADEIRA_BAND_CENSUS = 1
+env.MADEIRA_RDR2_VA_HOLD = 1
+env.MADEIRA_SWAP_RESERVE_MAX_MB = 9216
+env.MADEIRA_THREAD_STACK_SPILL = 1
+env.MADEIRA_SMALL_STACK_EXES = RDR2.exe
+env.MADEIRA_D3D11_SRC = 1
+env.MADEIRA_DOCK_GAME_SCM = 1
+env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe
+env.MADEIRA_DXGI_SRC = 1
+env.MADEIRA_EXECREQ_LEAVE = 1
+env.MADEIRA_PIN_GRAPHICS_DLLS = 1
+env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+env.MADEIRA_POOL_LOW_IMAGES = 1
+env.MADEIRA_POOL_RECYCLE_IMAGES = 1
+env.MADEIRA_SC_PA_POOLS = 2
+env.MADEIRA_SPAWN_BLOCK = RockstarErrorHandler
+env.MADEIRA_TOUCH_MOUSE = 1
+env.MADEIRA_WOW_MIN_FREE_GB = 2
+env.MADEIRA_X64_GRAPHICS_ENTRY = 1
+env.MADEIRA_X64_IMAGE_NOCOPY = 1
+env.WINEDLLOVERRIDES = video64=
+env.MADEIRA_DEVICE_STATS = 1
+env.MADEIRA_METAL_HUD_MAIN = 1'''.split('\n')
+assert presets['rdr2-steam']['lines'][2:] == rdr2, 'the RDR2 list differs from the owner\'s'
+assert presets['rdr2-steam']['switches'] == ('avx: false, nvidia: false, wineVCRT: false, fastSync: true, '
+                                             'semaphoreFastPath: false, display: "fit"'), presets['rdr2-steam']['switches']
+gta = presets['gta5e-steam']
+assert 'env.MADEIRA_CHILD_ARGS = PlayGTAV.exe -nobattleye' in gta['lines']
+assert 'env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;GTA5_Enhanced.exe' in gta['lines']
+assert 'semaphoreFastPath: true, fpsMode: 4' in gta['switches'] and 'nvidia: true' in gta['switches']
+assert 'env.MADEIRA_FASTSYNC_SEM = 1' in presets['gta5e-other']['lines']
+assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']
+assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
+print('PASS: RDR2 (Steam) is the owner\'s 463 list line for line with its switches; GTA V Enhanced, GoT and GoW keep their tested lines')
+
+# Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
+match = block(lists_src, 'static func match(', '\n    }\n')
+assert 'rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500' in lists_src
+assert 'steamFolder == "red dead redemption 2"' in match and 'steamFolder == "grand theft auto v enhanced"' in match
+assert 'exe == "ghostoftsushima.exe"' in match and 'exe == "gow.exe"' in match
+assert 'if !inSteam, let exe, exe == "playgtav.exe" || exe == "gta5_enhanced.exe", fileExists(folder + "\\\\GTA5_Enhanced.exe")' in match
+assert match.index('gta5EnhancedSteam }') < match.index('return gta5EnhancedOther')
+
+# Where the app applies them.
+save = block(library, '    func save(_ entry: LibraryEntry) {', '\n    }\n')
+assert save.index('GameRecommendations.prepare(&entry)') < save.index('persist(next)')
+init = block(library, '    private init() {', '\n    }\n')
+assert init.index('resetPhoneResolution()') < init.index('applyRecommendations()')
+apply_all = block(library, '    private func applyRecommendations() {', '\n    }\n')
+assert 'guard !readOnly' in apply_all and 'GameRecommendations.prepare(&next[i])' in apply_all and 'persist(next)' in apply_all
+detail = block(library, 'struct LibraryDetail: View {', '\n/// madeira-bcd: a game\'s own options as the fork stores them')
+assert '.onAppear { migrateEntryOptions(); prepareRecommendation(); reloadBCD() }' in detail
+assert 'if GameRecommendations.prepare(&entry) { model.save(entry) }' in detail
+assert 'recommended = GameRecommendations.reset(&entry)' in detail
+reset_section = detail[detail.index('Button("Reset to Recommended", systemImage: "arrow.counterclockwise")'):]
+assert reset_section.index('Button("Reset", role: .destructive) { resetToRecommended() }') < reset_section.index('Text(GameRecommendations.note(recommended))')
+# Last in the form, after the Executable section and Remove from library.
+assert detail.index('Button("Remove from library"') < detail.index('Button("Reset to Recommended"') < detail.index('if let error { Section')
+assert '!remove, !confirmReset else { return }' in detail
+launch = block(content, '    private func launchLibraryEntry(_ entry: LibraryEntry) {', '\n    }\n')
+assert launch.index('if GameRecommendations.prepare(&entry) { library.save(entry) }') < launch.index('BCDLaunch.applyLibrary(entry, sessionLog: false)')
+home_launch = block(home, '    private func launch(_ game: LibraryGame) {', '\n    }\n')
+assert home_launch.index('GameRecommendations.prepare(windowsPath: exe.windowsPath, title: game.title)') < home_launch.index('request.avx = LibraryPrefs.avx')
+sheet = block(home, 'struct GameSettingsSheet: View {', '\n// MARK: - App settings')
+assert 'recommended = GameRecommendations.reset(windowsPath: exePath, title: game.title)' in sheet
+assert sheet.index('Label("Save and play"') < sheet.index('Label("Reset to Recommended", systemImage: "arrow.counterclockwise")')
+assert 'guard !prepared else { return }' in sheet and sheet.count('prepareRecommendation()') == 3
+for name in ('GameRecommendations.swift', 'GameRecommendationsApply.swift'):
+    assert project.count(f'/* {name} in Sources */') == 2, name   # PBXBuildFile and the Sources phase
+    assert project.count(f'/* {name} */') == 3, name              # fileRef, PBXFileReference and the group
+# The rules: first sight only for a game with nothing of its own; switches only on first sight or a reset.
+due = block(apply_src, '    private static func due(', '\n    }\n')
+assert 'guard !mark.isEmpty, mark.hasSuffix("#" + fileHash(text))' in due
+assert '!(text + (ownLines ?? "")).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty' in due and 'setMark("", windowsPath)' in due
+put = block(apply_src, '    private static func put(', '\n    }\n')
+assert 'guard file.text == rec.fileText' in put and 'if kind != .updated {' in put
+print('PASS: first sight in the library (start-up, save, Game details, start) and the home screen; Reset to Recommended last on both pages')
+
+# The Swift fixture: the real files with small stand-ins for the app types they use.
+stable_hash = block(home, '    static func stableHash(_ s: String) -> UInt64 {', '\n    }\n')
+profile_text = block(profiles, '    var text: String {', '\n    }\n')
+profile_parse = block(profiles, '    static func parse(_ text: String) -> [String: String] {', '\n    }\n')
+stubs = r'''import Foundation
+
+enum CoverStore {
+''' + stable_hash + r'''}
+
+enum DisplayMode: String { case fit, fill, stretch, aspect }
+
+enum LibraryModel {
+    static var drive: URL { URL(fileURLWithPath: ProcessInfo.processInfo.environment["MADEIRA_TEST_DRIVE"]!, isDirectory: true) }
+}
+
+final class LogStore {
+    static let shared = LogStore()
+    enum Level { case info, error }
+    var lines: [String] = []
+    func log(_ message: String, level: Level = .info) { lines.append(message) }
+}
+
+struct LibraryEntry {
+    var title: String
+    var windowsPath: String
+    var steamAppID: Int? = nil
+    var desktop: Bool? = nil
+    var config: String? = nil
+    var resolution = "1408x648"
+    var display: String? = nil
+    var fpsMode = 1
+    var fastSync: Bool? = nil
+    var semaphoreFastPath: Bool? = nil
+}
+
+final class PrefStore {
+    static let shared = PrefStore()
+    var flags: [String: Bool] = [:]
+    var screens: [String: String] = [:]
+}
+
+enum LibraryPrefs {
+    static let screenSizes = ["", "1280x720", "fill", "fill-mfx15", "1600x900", "1920x1080"]
+    static func avx(_ path: String) -> Bool { PrefStore.shared.flags["avx|" + path] ?? false }
+    static func setAVX(_ on: Bool, for path: String) { PrefStore.shared.flags["avx|" + path] = on ? true : nil }
+    static func nvidia(_ path: String) -> Bool { PrefStore.shared.flags["nvidia|" + path] ?? false }
+    static func setNvidia(_ on: Bool, for path: String) { PrefStore.shared.flags["nvidia|" + path] = on ? true : nil }
+    static func wineVCRT(_ path: String) -> Bool { PrefStore.shared.flags["vcrt|" + path] ?? false }
+    static func setWineVCRT(_ on: Bool, for path: String) { PrefStore.shared.flags["vcrt|" + path] = on ? true : nil }
+    static func safeSync(_ path: String) -> Bool { PrefStore.shared.flags["safe|" + path] ?? false }
+    static func setSafeSync(_ on: Bool, for path: String) { PrefStore.shared.flags["safe|" + path] = on ? true : nil }
+    static func screen(_ path: String) -> String { PrefStore.shared.screens[path] ?? "" }
+    static func setScreen(_ size: String, for path: String) { PrefStore.shared.screens[path] = size.isEmpty ? nil : size }
+}
+
+struct GameProfile {
+    let windowsPath: String
+    var url: URL? {
+        URL(fileURLWithPath: ProcessInfo.processInfo.environment["MADEIRA_TEST_CONFIGS"]!, isDirectory: true)
+            .appendingPathComponent(String(format: "%016llx.cfg", CoverStore.stableHash(windowsPath.lowercased())))
+    }
+''' + profile_text + profile_parse + '}\n'
+
+main = r'''import Foundation
+
+func check(_ ok: Bool, _ what: String, line: Int = #line) {
+    if !ok { print("FAILED (main.swift line \(line)): \(what)"); exit(1) }
+}
+
+let R = GameRecommendations.self
+let steam = #"C:\Program Files (x86)\Steam\steamapps\common"#
+
+func id(_ path: String, _ app: Int? = nil, files: [String] = []) -> String {
+    let have = Set(files.map { $0.lowercased() })
+    return R.match(windowsPath: path, steamAppID: app, fileExists: { have.contains($0.lowercased()) })?.id ?? "none"
+}
+
+// How a game is recognised.
+let rdr2 = steam + #"\Red Dead Redemption 2"#
+check(id(rdr2, 1174180) == "rdr2-steam", "RDR2 by its App ID")
+check(id(rdr2) == "rdr2-steam", "RDR2 by its Steam folder")
+check(id("D:\\SteamLibrary\\steamapps\\common\\Red Dead Redemption 2\\") == "rdr2-steam", "another Steam library, trailing backslash")
+check(id(#"C:\Games\Red Dead Redemption 2\RDR2.exe"#) == "none", "RDR2 outside Steam has no list")
+let gta = steam + #"\Grand Theft Auto V Enhanced"#
+check(id(gta, 3240220) == "gta5e-steam", "GTA V Enhanced by its App ID")
+check(id(gta) == "gta5e-steam", "GTA V Enhanced by its Steam folder")
+check(id(gta + #"\PlayGTAV.exe"#, files: [gta + #"\GTA5_Enhanced.exe"#]) == "gta5e-steam", "PlayGTAV.exe inside Steam is the Steam copy")
+let other = #"C:\Games\GTA V Enhanced"#
+check(id(other + #"\PlayGTAV.exe"#, files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "PlayGTAV.exe elsewhere")
+check(id(other + #"\GTA5_Enhanced.exe"#, files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "GTA5_Enhanced.exe elsewhere")
+check(id(#"C:\GAMES\gta v enhanced\PLAYGTAV.EXE"#, files: [other + #"\gta5_enhanced.exe"#]) == "gta5e-other", "names in any case")
+check(id("C:/Games/GTA V Enhanced/PlayGTAV.exe", files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "forward slashes")
+check(id(#"C:\Games\GTA V\PlayGTAV.exe"#, files: [#"C:\Games\GTA V\GTA5.exe"#]) == "none", "the legacy edition has no list")
+check(id(other + #"\PlayGTAV.exe"#) == "none", "PlayGTAV.exe without GTA5_Enhanced.exe beside it")
+check(id(#"C:\GhostOfTsushima\GhostOfTsushima.exe"#) == "ghost-of-tsushima", "GoT by its program")
+check(id(#"E:\Some Other Folder\ghostoftsushima.EXE"#) == "ghost-of-tsushima", "GoT anywhere, in any case")
+check(id(steam + #"\Ghost of Tsushima DIRECTOR'S CUT"#, 2215430) == "ghost-of-tsushima", "GoT from Steam")
+check(id(steam + #"\Ghost"#, 1, files: [steam + #"\Ghost\GhostOfTsushima.exe"#]) == "ghost-of-tsushima", "a Steam folder holding GoT's program")
+check(id(#"C:\God of War\GoW.exe"#) == "god-of-war", "GoW by its program")
+check(id(steam + #"\God of War"#, 1593500) == "god-of-war", "GoW from Steam")
+check(id(#"C:\Games\God of War Ragnarok\GoWR.exe"#) == "none", "Ragnarok is another game")
+check(id(#"C:\Games\Foo\foo.exe"#) == "none" && id(steam + #"\Portal 2"#, 620) == "none", "other games")
+check(id("") == "none" && id("C:\\") == "none", "no path")
+print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced inside and outside Steam, GoT and GoW by their programs, others none")
+
+// The lists themselves.
+check(Set(R.all.map(\.id)).count == R.all.count, "ids are unique")
+for rec in R.all {
+    check(rec.fileText.hasSuffix("\n") && !rec.fileText.hasSuffix("\n\n"), "\(rec.id): one trailing newline")
+    check(GameProfile.parse(rec.config).count == rec.config.split(separator: "\n").count - 2, "\(rec.id): every line but the comments parses")
+}
+check(R.gta5EnhancedSteam.switchSummary == "AVX off, NVIDIA on, Wine's C++ runtime off, fast semaphore waits on, FPS limit 40",
+      R.gta5EnhancedSteam.switchSummary)
+check(R.note(R.rdr2Steam).contains("36 config lines") && R.note(nil).contains("no recommended settings"), R.note(R.rdr2Steam))
+
+// First sight, the player's changes, newer lists and Reset to Recommended.
+let key = "madeira.recommended.applied"
+UserDefaults.standard.removeObject(forKey: key)
+func mark(_ path: String) -> String? { (UserDefaults.standard.dictionary(forKey: key) as? [String: String])?[path.lowercased()] }
+func file(_ path: String) -> String { GameProfile(windowsPath: path).text }
+
+var red = LibraryEntry(title: "Red Dead Redemption 2", windowsPath: rdr2, steamAppID: 1174180)
+red.display = "fill"
+LibraryPrefs.setNvidia(true, for: rdr2)
+check(R.prepare(&red), "first sight takes the entry's fields")
+check(file(rdr2) == R.rdr2Steam.fileText, "first sight writes the list")
+check(red.fastSync == true && red.semaphoreFastPath == false && red.display == nil && red.fpsMode == 1, "first sight's entry fields")
+check(!LibraryPrefs.avx(rdr2) && !LibraryPrefs.nvidia(rdr2) && !LibraryPrefs.wineVCRT(rdr2), "first sight's switches")
+check(mark(rdr2)?.hasPrefix("rdr2-steam#1#") == true, "what was written is recorded")
+check(!R.prepare(&red) && file(rdr2) == R.rdr2Steam.fileText, "once")
+GameProfile(windowsPath: rdr2).text = R.rdr2Steam.fileText + "fence-chain = 1\n"
+check(!R.prepare(&red) && file(rdr2).hasSuffix("fence-chain = 1\n"), "a changed config is the player's")
+GameProfile(windowsPath: rdr2).text = ""
+check(!R.prepare(&red) && file(rdr2).isEmpty, "an emptied config stays empty")
+red.fpsMode = 2
+LibraryPrefs.setNvidia(true, for: rdr2)
+check(R.reset(&red)?.id == "rdr2-steam" && file(rdr2) == R.rdr2Steam.fileText, "Reset writes the list again")
+check(!LibraryPrefs.nvidia(rdr2) && red.fpsMode == 2, "Reset writes the list's switches and leaves the rest")
+// A list Madeira wrote that nobody changed follows a newer version: the config file only.
+let older = "# an older list\nvram-mb = 2048\n"
+GameProfile(windowsPath: rdr2).text = older
+var marks = (UserDefaults.standard.dictionary(forKey: key) as? [String: String]) ?? [:]
+marks[rdr2.lowercased()] = "rdr2-steam#0#" + String(CoverStore.stableHash(older), radix: 16)
+UserDefaults.standard.set(marks, forKey: key)
+LibraryPrefs.setAVX(true, for: rdr2)
+check(!R.prepare(&red) && file(rdr2) == R.rdr2Steam.fileText, "an untouched older list is updated")
+check(LibraryPrefs.avx(rdr2) && !R.prepare(&red), "an update leaves the switches, once")
+print("PASS: first sight writes the list and its switches once; changed or emptied configs stay; Reset writes it again; untouched lists follow newer versions")
+
+var gtaEntry = LibraryEntry(title: "GTA V Enhanced", windowsPath: gta, steamAppID: 3240220)
+GameProfile(windowsPath: gta).text = "vram-mb = 4096\n"
+check(!R.prepare(&gtaEntry) && file(gta) == "vram-mb = 4096\n" && mark(gta) == "" && gtaEntry.fpsMode == 1, "a config of its own stays")
+GameProfile(windowsPath: gta).text = ""
+check(!R.prepare(&gtaEntry) && file(gta).isEmpty, "and is not filled in later")
+check(R.reset(&gtaEntry)?.id == "gta5e-steam" && file(gta) == R.gta5EnhancedSteam.fileText, "GTA V Enhanced Reset")
+check(gtaEntry.fpsMode == 4 && gtaEntry.semaphoreFastPath == true && LibraryPrefs.nvidia(gta) && !LibraryPrefs.avx(gta), "its switches")
+let gowExe = #"C:\Games\God of War\GoW.exe"#
+var gow = LibraryEntry(title: "God of War", windowsPath: gowExe)
+gow.config = "dxmt = d3d11.mipClampBC=1"
+check(!R.prepare(&gow) && file(gowExe).isEmpty && mark(gowExe) == "", "lines in upstream's config field are the game's own")
+check(R.reset(&gow)?.id == "god-of-war" && gow.resolution == "1920x1080" && gow.config == nil, "God of War Reset")
+var desk = LibraryEntry(title: "Desktop", windowsPath: #"C:\windows\system32\explorer.exe"#)
+desk.desktop = true
+check(!R.prepare(&desk) && R.recommendation(for: desk) == nil, "the Desktop has none")
+let fooExe = #"C:\Games\Foo\foo.exe"#
+var foo = LibraryEntry(title: "Foo", windowsPath: fooExe)
+GameProfile(windowsPath: fooExe).text = "fence-chain = 6\n"
+check(!R.prepare(&foo) && file(fooExe) == "fence-chain = 6\n" && mark(fooExe) == nil, "a game without a list is left alone")
+check(R.reset(&foo) == nil && file(fooExe).isEmpty, "its Reset empties its config")
+print("PASS: own configs (the file or upstream's field) stay until Reset; Reset writes every switch of the list; no list: Reset empties the config")
+
+// The madeira-bcd home screen: keyed by the program, its own forms of the switches, drive_c looked up.
+let drive = URL(fileURLWithPath: ProcessInfo.processInfo.environment["MADEIRA_TEST_DRIVE"]!, isDirectory: true)
+let folder = drive.appendingPathComponent("Games/GTA V Enhanced", isDirectory: true)
+try! FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+check(FileManager.default.createFile(atPath: folder.appendingPathComponent("gta5_enhanced.EXE").path, contents: Data()), "fixture")
+let play = #"C:\Games\GTA V Enhanced\PlayGTAV.exe"#
+check(R.recommendation(windowsPath: play, steamAppID: nil)?.id == "gta5e-other", "drive_c is looked up in any case")
+check(R.recommendation(windowsPath: #"C:\Games\GTA V\PlayGTAV.exe"#, steamAppID: nil) == nil, "a missing game file")
+R.prepare(windowsPath: play, title: "GTA V Enhanced")
+check(file(play) == R.gta5EnhancedOther.fileText && LibraryPrefs.nvidia(play) && !LibraryPrefs.safeSync(play)
+      && LibraryPrefs.screen(play) == "1280x720", "the home screen's first sight")
+LibraryPrefs.setScreen("", for: play)
+check(R.reset(windowsPath: play, title: "GTA V Enhanced")?.id == "gta5e-other" && LibraryPrefs.screen(play) == "1280x720", "the home screen's Reset")
+var playEntry = LibraryEntry(title: "GTA V Enhanced", windowsPath: play)
+check(!R.prepare(&playEntry), "the library's entry for the same program sees it was written")
+let got = #"C:\GoT\GhostOfTsushima.exe"#
+R.prepare(windowsPath: got, title: "Ghost of Tsushima")
+check(LibraryPrefs.avx(got) && LibraryPrefs.nvidia(got) && LibraryPrefs.screen(got) == "1280x720", "GoT on the home screen")
+check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v1 written (first sight)") }, "log line")
+UserDefaults.standard.removeObject(forKey: key)
+print("PASS: the home screen shares the files and records; Safe thread sync and Screen size take the list's values")
+'''
+
+with tempfile.TemporaryDirectory(prefix='madeira-recommended-') as directory:
+    temporary = Path(directory)
+    compiler = shutil.which('swiftc')
+    if compiler:
+        (temporary / 'Stubs.swift').write_text(stubs)
+        (temporary / 'main.swift').write_text(main)
+        (temporary / 'drive').mkdir()
+        (temporary / 'configs').mkdir()
+        binary = temporary / 'recommended'
+        subprocess.run([compiler, str(app / 'GameRecommendations.swift'), str(app / 'GameRecommendationsApply.swift'),
+                        str(temporary / 'Stubs.swift'), str(temporary / 'main.swift'), '-o', str(binary)], check=True)
+        env = dict(os.environ, MADEIRA_TEST_DRIVE=str(temporary / 'drive'), MADEIRA_TEST_CONFIGS=str(temporary / 'configs'))
+        subprocess.run([str(binary)], check=True, env=env)
+    elif args.require_swift:
+        raise SystemExit('Swift compiler required for the recommended-settings fixture')
+    else:
+        print('SKIP: Swift compiler unavailable locally; macOS CI must run this check with --require-swift')

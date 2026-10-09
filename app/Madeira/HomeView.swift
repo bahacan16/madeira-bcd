@@ -752,6 +752,9 @@ struct HomeView: View {
         // are; FixedBaseImage gives them a relocation table (once, keeping the
         // original).
         if let note = FixedBaseImage.prepare(exe.url) { LogStore.shared.log(note) }
+        // A game seen for the first time starts with Madeira's recommended settings
+        // (GameRecommendationsApply.swift).
+        GameRecommendations.prepare(windowsPath: exe.windowsPath, title: game.title)
         let saved = GameArguments.get(exe.windowsPath)
         let args = saved.isEmpty ? GameArguments.suggestion(for: exe) : saved
         var request: LaunchRequest
@@ -970,6 +973,10 @@ struct GameSettingsSheet: View {
     @State private var photo: PhotosPickerItem?
     @State private var tick = 0
     @State private var copiedLink = false
+    /// Madeira's recommended settings for the chosen exe, nil for none (GameRecommendations.swift).
+    @State private var recommended: GameRecommendation?
+    @State private var confirmReset = false
+    @State private var prepared = false
 
     init(game: LibraryGame, archs: [String: String], onPlay: @escaping () -> Void, onCoverChanged: @escaping () -> Void) {
         self.game = game
@@ -1003,6 +1010,24 @@ struct GameSettingsSheet: View {
         submit = profile.get("async-submit") ?? ""
         gpuSync = profile.get("fence-chain") ?? ""
         frameGen = profile.get("env.MADEIRA_FRAMEGEN") ?? ""
+    }
+
+    /// The switches a recommendation writes, as stored now.
+    private func loadSwitches() {
+        avx = LibraryPrefs.avx(exePath)
+        wineVCRT = LibraryPrefs.wineVCRT(exePath)
+        nvidia = LibraryPrefs.nvidia(exePath)
+        safeSync = LibraryPrefs.safeSync(exePath)
+        screen = LibraryPrefs.screen(exePath)
+        loadProfile()
+    }
+
+    /// A game seen for the first time gets Madeira's recommended settings, which the
+    /// sheet then shows (GameRecommendationsApply.swift).
+    private func prepareRecommendation() {
+        recommended = GameRecommendations.recommendation(windowsPath: exePath, steamAppID: nil)
+        GameRecommendations.prepare(windowsPath: exePath, title: game.title)
+        loadSwitches()
     }
 
     /// A picker over (value, label) pairs that also shows a value typed into the raw file.
@@ -1170,6 +1195,24 @@ struct GameSettingsSheet: View {
                             .font(.headline)
                     }
                 }
+
+                // Always last (GameRecommendationsApply.swift); written at once.
+                Section {
+                    Button {
+                        confirmReset = true
+                    } label: {
+                        Label("Reset to Recommended", systemImage: "arrow.counterclockwise")
+                    }
+                    .confirmationDialog(GameRecommendations.question(recommended), isPresented: $confirmReset,
+                                        titleVisibility: .visible) {
+                        Button("Reset", role: .destructive) {
+                            recommended = GameRecommendations.reset(windowsPath: exePath, title: game.title)
+                            loadSwitches()
+                        }
+                    }
+                } footer: {
+                    Text(GameRecommendations.note(recommended))
+                }
             }
             .navigationTitle(game.title)
             .navigationBarTitleDisplayMode(.inline)
@@ -1181,16 +1224,18 @@ struct GameSettingsSheet: View {
                     Button("Cancel") { dismiss() }
                 }
             }
+            .onAppear {
+                // Once per sheet: coming back from the config editor keeps unsaved choices.
+                guard !prepared else { return }
+                prepared = true
+                prepareRecommendation()
+            }
             .onChange(of: exePath) { _, newPath in
                 // Arguments and the desktop choice belong to an exe, not a title.
                 args = GameArguments.get(newPath)
                 inDesktop = LibraryPrefs.inDesktop(newPath)
-                avx = LibraryPrefs.avx(newPath)
-                wineVCRT = LibraryPrefs.wineVCRT(newPath)
-                nvidia = LibraryPrefs.nvidia(newPath)
-                safeSync = LibraryPrefs.safeSync(newPath)
-                screen = LibraryPrefs.screen(newPath)
-                loadProfile()
+                // The switches, the game's file and its recommendation (loadSwitches).
+                prepareRecommendation()
             }
             .onChange(of: photo) { _, item in
                 guard let item else { return }
