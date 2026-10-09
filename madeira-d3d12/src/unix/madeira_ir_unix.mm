@@ -757,9 +757,37 @@ static int mad_vsps_fill_enabled(void)
     return cached;
 }
 
+/* madeira-bcd: madeira.cfg (or the game's own file) dxbc-register-spaces = 1
+ * lets SM 5.1 declarations in a register space other than 0 through. The
+ * compiler keys its tables by the declaration's range id, never by register or
+ * space, and the runtime resolves every range by (type, space, register)
+ * against the root signature (madeira_d3d12.c, mad_air_resolve), so nothing
+ * lands on space 0's register. Off by default: those shaders are refused as
+ * before. Horizon Zero Dawn declares b0 in spaces 6 and 8 and s0/t16 in space 8.
+ * With it on, the cache keys of the tessellation and geometry paths (which look
+ * up before the range check) carry it, so turning it off refuses again. */
+static int mad_dxbc_spaces(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        cached = madeira_cfg_bool("dxbc-register-spaces", 0) ? 1 : 0;
+        if (cached)
+            fprintf(stderr, "[madeira-ir] DXBC register spaces other than 0 are mapped "
+                            "(madeira.cfg dxbc-register-spaces)\n");
+    }
+    return cached;
+}
+static void mad_sc_hash_spaces(uint64_t *key)
+{
+    static const char tag[] = "dxbc-register-spaces";
+    if (mad_dxbc_spaces()) mad_sc_hash_add(key, tag, sizeof tag);
+}
+
 /* ml1083: one shader's declaration ranges, in the runtime's record format, with
  * the same refusals mad_airconv_convert has always applied (singletons in
- * register space 0 only). Returns a madeira_ir_status. */
+ * register space 0 only; other spaces with dxbc-register-spaces). Returns a
+ * madeira_ir_status. */
 static int mad_air_ranges(sm50_shader_t shader, struct madeira_ir_air_range *out, uint32_t cap,
                           uint32_t *n_out, char *note, size_t note_cap)
 {
@@ -779,8 +807,9 @@ static int mad_air_ranges(sm50_shader_t shader, struct madeira_ir_air_range *out
                      c, ranges[i].LowerBound, ranges[i].RegisterSpace, ranges[i].RangeSize);
             return MADEIRA_IR_UNSUPPORTED_RANGE;
         }
-        if (ranges[i].RegisterSpace != 0) {
-            snprintf(note, note_cap, "%s%u is in register space %u (only space 0 is mapped)",
+        if (ranges[i].RegisterSpace != 0 && !mad_dxbc_spaces()) {
+            snprintf(note, note_cap, "%s%u is in register space %u (only space 0 is mapped; "
+                     "dxbc-register-spaces = 1 maps the others)",
                      c, ranges[i].LowerBound, ranges[i].RegisterSpace);
             return MADEIRA_IR_UNSUPPORTED_RANGE;
         }
@@ -874,6 +903,7 @@ static int mad_airconv_convert_tess(struct madeira_ir_convert_args *a,
         mad_sc_hash_add(&key, &ver, sizeof ver);
         mad_sc_hash_add(&key, stamp, strlen(stamp));
         if (ia_nel) mad_sc_hash_add(&key, ia_el, (size_t)ia_nel * sizeof ia_el[0]);
+        mad_sc_hash_spaces(&key);   /* madeira-bcd: dxbc-register-spaces */
         sc_key = key;
         int hit = mad_sc_load(key, a, out_ranges);
         if (hit) { a->ret_air_slot_mask = slot_mask; a->ret_vs_input_count = ia_nel; return (int)a->ret_status; }
@@ -1050,6 +1080,7 @@ static int mad_airconv_convert_gs(struct madeira_ir_convert_args *a,
         mad_sc_hash_add(&key, &ver, sizeof ver);
         mad_sc_hash_add(&key, stamp, strlen(stamp));
         if (ia_nel) mad_sc_hash_add(&key, ia_el, (size_t)ia_nel * sizeof ia_el[0]);
+        mad_sc_hash_spaces(&key);   /* madeira-bcd: dxbc-register-spaces */
         sc_key = key;
         int hit = mad_sc_load(key, a, out_ranges);
         if (hit) { a->ret_air_slot_mask = slot_mask; a->ret_vs_input_count = ia_nel; return (int)a->ret_status; }
@@ -1166,8 +1197,8 @@ static int mad_airconv_convert(struct madeira_ir_convert_args *a,
     /* Refuse what the compiler would silently get wrong. Its resource-lookup
      * callbacks take the dynamic index and discard it ("ignore index in
      * SM 5.0"), so a multi-element or unbounded range collapses to its first
-     * descriptor -- wrong data, no diagnostic. A register space we do not map
-     * would likewise bind whatever sits at the same register in space 0.
+     * descriptor -- wrong data, no diagnostic. A register space other than 0
+     * is refused too unless dxbc-register-spaces is on (mad_dxbc_spaces).
      * Named refusal, never a silent collapse. */
     for (uint32_t i = 0; i < n; i++) {
         static const char *cls[4] = { "b", "s", "t", "u" };
@@ -1180,9 +1211,10 @@ static int mad_airconv_convert(struct madeira_ir_convert_args *a,
             status = MADEIRA_IR_UNSUPPORTED_RANGE;
             goto done;
         }
-        if (ranges[i].RegisterSpace != 0) {
+        if (ranges[i].RegisterSpace != 0 && !mad_dxbc_spaces()) {
             snprintf(a->ret_note, sizeof a->ret_note,
-                     "%s%u is in register space %u (only space 0 is mapped)",
+                     "%s%u is in register space %u (only space 0 is mapped; "
+                     "dxbc-register-spaces = 1 maps the others)",
                      c, ranges[i].LowerBound, ranges[i].RegisterSpace);
             status = MADEIRA_IR_UNSUPPORTED_RANGE;
             goto done;
@@ -1323,6 +1355,7 @@ static int mad_airconv_convert(struct madeira_ir_convert_args *a,
                 uint32_t pv[4] = { a->ps_sample_mask, a->ps_flags, a->ps_unorm_output_mask, 1u };
                 mad_sc_hash_add(&key, pv, sizeof pv);
             }
+            mad_sc_hash_spaces(&key);   /* madeira-bcd: dxbc-register-spaces */
             sc_key = key;
 
             int hit = mad_sc_load(key, a, out_ranges);

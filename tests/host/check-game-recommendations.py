@@ -53,8 +53,9 @@ for m in re.finditer(r'static let (\w+) = GameRecommendation\(\n\s*id: "([^"]+)"
     name, ident, title, version, body, indent, switches = m.groups()
     lines = [line[len(indent):] if line.startswith(indent) else line for line in body.split('\n')]
     presets[ident] = dict(name=name, title=title, version=int(version), lines=lines, switches=' '.join(switches.split()))
-assert set(presets) == {'rdr2-steam', 'gta5e-steam', 'gta5e-other', 'ghost-of-tsushima', 'god-of-war'}, sorted(presets)
-assert 'static let all = [rdr2Steam, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar]' in lists_src
+assert set(presets) == {'rdr2-steam', 'gta5e-steam', 'gta5e-other', 'ghost-of-tsushima', 'god-of-war',
+                        'horizon-zero-dawn'}, sorted(presets)
+assert 'static let all = [rdr2Steam, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn]' in lists_src
 
 catalog_keys = set(re.findall(r'ConfigOption\(key: "([^"]+)"', catalog))
 for ident, p in presets.items():
@@ -73,7 +74,7 @@ for ident, p in presets.items():
             assert key in catalog_keys, (ident, 'not a key Madeira reads', key)
         # Madeira's own settings only: nothing that loads a replaced Social Club.
         assert 'socialclub' not in line.lower() and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
-print('PASS: five lists, two comment lines each, no key twice, every non-env key in the settings catalog, no Social Club DLL lines')
+print('PASS: six lists, two comment lines each, no key twice, every non-env key in the settings catalog, no Social Club DLL lines')
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
 # plus the lines of build 466's test (version 2) and build 467's (version 3).
@@ -132,14 +133,19 @@ assert 'semaphoreFastPath: true, fpsMode: 4' in gta['switches'] and 'nvidia: tru
 assert 'env.MADEIRA_FASTSYNC_SEM = 1' in presets['gta5e-other']['lines']
 assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']
 assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466 and 467 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines')
+# Horizon Zero Dawn, still being brought up: build 469's test list (register spaces other than 0).
+hzd = presets['horizon-zero-dawn']
+assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'swap-mb = 3072'], hzd['lines']
+assert hzd['version'] == 1 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466 and 467 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 469\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')
-assert 'rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500' in lists_src
+assert 'rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,\n               horizonZeroDawnAppID = 1151640' in lists_src
 assert 'let installFolder = last == steamFolder ? steamFolder : nil' in match
 assert 'installFolder == "red dead redemption 2"' in match and 'installFolder == "grand theft auto v enhanced"' in match
 assert 'case "ghostoftsushima.exe":' in match and 'case "gow.exe":' in match and 'case "rdr2.exe", "playrdr2.exe":' in match
+assert 'case "horizonzerodawn.exe":\n            return horizonZeroDawn' in match and 'if steamAppID == horizonZeroDawnAppID { return horizonZeroDawn }' in match
 assert 'case "playgtav.exe", "gta5_enhanced.exe":' in match and 'return inSteam ? gta5EnhancedSteam : gta5EnhancedOther' in match
 assert 'guard fileExists(folder + "\\\\GTA5_Enhanced.exe") else { return nil }' in match and 'default:\n            return nil' in match
 
@@ -303,9 +309,13 @@ check(id(steam + #"\Ghost"#, 1, files: [steam + #"\Ghost\GhostOfTsushima.exe"#])
 check(id(#"C:\God of War\GoW.exe"#) == "god-of-war", "GoW by its program")
 check(id(steam + #"\God of War"#, 1593500) == "god-of-war", "GoW from Steam")
 check(id(#"C:\Games\God of War Ragnarok\GoWR.exe"#) == "none", "Ragnarok is another game")
+check(id(#"C:\Horizon - Zero Down CE\HorizonZeroDawn.exe"#) == "horizon-zero-dawn", "Horizon Zero Dawn by its program (GOG)")
+check(id(steam + #"\Horizon Zero Dawn\HorizonZeroDawn.exe"#) == "horizon-zero-dawn", "its program inside Steam")
+check(id(steam + #"\Horizon Zero Dawn"#, 1151640) == "horizon-zero-dawn", "Horizon Zero Dawn from Steam")
+check(id(#"C:\Games\Horizon Zero Dawn Remastered\HorizonZeroDawnRemastered.exe"#) == "none", "the remaster is another game")
 check(id(#"C:\Games\Foo\foo.exe"#) == "none" && id(steam + #"\Portal 2"#, 620) == "none", "other games")
 check(id("") == "none" && id("C:\\") == "none", "no path")
-print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced inside and outside Steam, GoT and GoW by their programs, others none")
+print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced inside and outside Steam, GoT, GoW and Horizon Zero Dawn by their programs, others none")
 
 // The lists themselves.
 check(Set(R.all.map(\.id)).count == R.all.count, "ids are unique")

@@ -11700,6 +11700,9 @@ static const char *mad_ir_status_name(uint32_t st) {
     case MADEIRA_IR_EMPTY_ENTRY:      return "no such entry point (reflection returned an empty name)";
     case MADEIRA_IR_UNSUPPORTED:      return "a root parameter this build does not model";
     case MADEIRA_IR_NO_MEMORY:        return "out of memory";
+    case MADEIRA_IR_BAD_CONTAINER:    return "not a DXBC container, or a damaged one";
+    case MADEIRA_IR_UNSUPPORTED_RANGE: return "a resource declaration this build does not map";
+    case MADEIRA_IR_TOO_MANY_RANGES:  return "more resource declarations than this build carries";
     default:                          return "unknown";
     }
 }
@@ -11909,6 +11912,13 @@ static int mad_sc_init(void) {
                      mad_cfg_int_pe("msc-sampler-lod-bias", 1) ? 1 : 0,
                      mad_cfg_int_pe("msc-sample-nan-zero", 1) ? 1 : 0,       /* madeira-bcd: madeira_ir_unix.mm, build 217 */
                      mad_cfg_int_pe("msc-position-inf-nan", 1) ? 1 : 0);
+            /* madeira-bcd: dxbc-register-spaces (madeira_ir_unix.mm) turns refusals
+             * into conversions; what was converted with it on must not answer
+             * with it off. Off leaves the identity as it was. */
+            if (mad_cfg_int_pe("dxbc-register-spaces", 0)) {
+                size_t l = strlen(g_sc_rt);
+                snprintf(g_sc_rt + l, sizeof g_sc_rt - l, ", dxbc-spaces 1");
+            }
             mad_sc_feed(&h, g_sc_stamp, strlen(g_sc_stamp) + 1);
             mad_sc_feed(&h, g_sc_rt, sizeof g_sc_rt);
             n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);

@@ -247,12 +247,27 @@ enum GameRecommendations {
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, semaphoreFastPath: false,
         resolution: "1920x1080", display: "fit")
 
-    static let all = [rdr2Steam, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar]
+    /// Horizon Zero Dawn (Complete Edition, GOG or Steam), still being brought
+    /// up: the list for build 469's test. Its shaders keep their constant
+    /// buffers, samplers and textures in register spaces 6 and 8, which build
+    /// 466 refused (the game then crashed); MFC ships with build 468.
+    static let horizonZeroDawn = GameRecommendation(
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 1,
+        config: """
+        # Madeira's recommended settings for Horizon Zero Dawn.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        dxbc-register-spaces = 1
+        swap-mb = 3072
+        """,
+        avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
+
+    static let all = [rdr2Steam, gta5EnhancedSteam, gta5EnhancedOther, ghostOfTsushima, godOfWar, horizonZeroDawn]
 
     // MARK: Recognising a game
 
     /// Steam App IDs.
-    static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500
+    static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500,
+               horizonZeroDawnAppID = 1151640
 
     /// The recommendation for a game, or nil.
     /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
@@ -272,6 +287,7 @@ enum GameRecommendations {
             if steamAppID == gta5EnhancedAppID || installFolder == "grand theft auto v enhanced" { return gta5EnhancedSteam }
             if steamAppID == ghostAppID { return ghostOfTsushima }
             if steamAppID == godOfWarAppID { return godOfWar }
+            if steamAppID == horizonZeroDawnAppID { return horizonZeroDawn }
             return nil
         }
         // A program, wherever it was installed: only the game's own programs, so a
@@ -290,6 +306,8 @@ enum GameRecommendations {
             return ghostOfTsushima
         case "gow.exe":
             return godOfWar
+        case "horizonzerodawn.exe":
+            return horizonZeroDawn
         default:
             return nil
         }

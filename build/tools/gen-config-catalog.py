@@ -124,6 +124,14 @@ OVERLAY = {
                         "thousands of indirect records a frame (Red Dead Redemption 2), where that setup costs more "
                         "CPU time than the GPU spends. DXIL pipelines only; diagnostics and captures keep the "
                         "per-record path. Read once per session."},
+    "dxbc-register-spaces": {"category": "Direct3D 12", "title": "Shader model 5.1 resources in register spaces other than 0",
+                "kind": "bool", "default": "0",
+                "note": "Default off: a DXBC shader (shader model 5.1) that declares a resource in a register space "
+                        "other than 0 is refused, and its pipeline is not created. 1: such shaders are converted, and "
+                        "each resource is bound from the root-signature entry with the same space and register. "
+                        "Horizon Zero Dawn needs it (its constant buffers sit in spaces 6 and 8). Shaders converted "
+                        "with it on are cached apart from the others. Read once per session.",
+                "sources": ["madeira-d3d12/src/unix/madeira_ir_unix.mm", "madeira-d3d12/src/pe/madeira_d3d12.c"]},
     "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "
