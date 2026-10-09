@@ -1445,6 +1445,7 @@ static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {
         if (l->alloc && !l->closed) InterlockedDecrement(&l->alloc->recording);
         if (l->alloc) ID3D12CommandAllocator_Release((ID3D12CommandAllocator *)l->alloc);
         for (unsigned k = 0; k < l->nrings; k++) NSObject_release(l->rings[k]);
+        if (l->nrings) InterlockedExchangeAdd(&g_ring_chunks, -(LONG)l->nrings);   /* madeira-bcd metal-gap: live chunks */
         free(l->rings); free(l->ring_cpu); free(l->ring_gpu); free(l->cmds); free(l->used); free(l->cdata);
         free(l);
     }
@@ -1510,6 +1511,8 @@ struct mad_queue {
     obj_handle_t open_cb;
     UINT64 last_serial;            /* ml1061: serial of the newest committed batch */
     UINT64 batch_serial[64];       /* serial of batch n at [n & 63] */
+    struct mad_ringchunk *ring_parked;   /* madeira-bcd ring-share: chunks the open batch reads */
+    unsigned nring_parked, ring_parked_cap;
     unsigned open_lists;
     UINT64 batches;
     /* ml1021: SUBMISSION LOCK.
@@ -1592,6 +1595,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         }
         d3d12_log("[madeira-d3d12] destroyed %s\n", q->name);
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
+        free(q->ring_parked);   /* madeira-bcd ring-share: emptied by the flush above */
         free(q);
     }
     return (ULONG)r;
@@ -3437,7 +3441,66 @@ static void mad_ring_retire(struct mad_device *d, struct mad_list *l, UINT64 ser
         if (mad_grow((void **)&d->ring_retired, &d->ring_retired_cap, d->nring_retired + 1, sizeof *d->ring_retired)) {
             struct mad_ringchunk *c = &d->ring_retired[d->nring_retired++];
             c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = serial;
-        } else NSObject_release(l->rings[k]);   /* the command buffer still holds it */
+        } else { NSObject_release(l->rings[k]); InterlockedDecrement(&g_ring_chunks); }   /* the command buffer still holds it */
+    LeaveCriticalSection(&d->ring_lock);
+    l->nrings = 0;
+}
+/* madeira-bcd: ring-share (madeira.cfg ring-share = 1, opt-in). A command list
+ * kept the argument-ring chunks of its last replay until it was reset (and
+ * reused them once the GPU was done), and a list executed again without a reset
+ * went on taking new ones, so the chunks added up over every list the game
+ * keeps. Red Dead Redemption 2 on build 470 (2026-10-09 14:48): they grew from
+ * 32 MB to 1575 MB within two minutes of play (metal-gap "argument ring chunks
+ * 25204"), almost half of Metal's 3.6 GB, while one frame's arguments take a
+ * few MB. With the switch a list gives its chunks back at every reset and
+ * before every replay: those the GPU has finished go to the device pool at
+ * once, the others retire with their batch's serial (mad_ring_retire), and any
+ * list takes them from the pool. */
+static int g_ring_share = -1;
+static int mad_ring_share_on(void) {
+    if (g_ring_share < 0) {
+        g_ring_share = mad_cfg_int_pe("ring-share", 0) ? 1 : 0;   /* madeira.cfg ring-share = 1 */
+        if (g_ring_share)
+            d3d12_log("[madeira-d3d12] ring-share = 1: command lists give their argument-ring chunks back to the "
+                      "device pool after every replay\n");
+    }
+    return g_ring_share;
+}
+/* At the end of a replay: the list's chunks go to the queue, read by its open batch.
+ * Called with the queue's submit_lock held (ExecuteCommandLists). */
+static void mad_ring_park(struct mad_queue *q, struct mad_list *l) {
+    unsigned k;
+    if (!mad_grow((void **)&q->ring_parked, &q->ring_parked_cap, q->nring_parked + l->nrings, sizeof *q->ring_parked))
+        return;   /* the list keeps them, as without ring-share */
+    for (k = 0; k < l->nrings; k++) {
+        struct mad_ringchunk *c = &q->ring_parked[q->nring_parked++];
+        c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = 0;
+    }
+    l->nrings = 0; l->ring_used = 0;
+}
+/* At the batch's commit (mad_queue_flush, submit_lock held): its chunks retire with its serial. */
+static void mad_ring_unpark(struct mad_queue *q, UINT64 serial) {
+    struct mad_device *d = q->device;
+    unsigned k;
+    if (!serial) serial = q->last_serial;
+    EnterCriticalSection(&d->ring_lock);
+    for (k = 0; k < q->nring_parked; k++)
+        if (mad_grow((void **)&d->ring_retired, &d->ring_retired_cap, d->nring_retired + 1, sizeof *d->ring_retired)) {
+            struct mad_ringchunk *c = &d->ring_retired[d->nring_retired++];
+            *c = q->ring_parked[k]; c->serial = serial;
+        } else { NSObject_release(q->ring_parked[k].buf); InterlockedDecrement(&g_ring_chunks); }   /* the command buffer still holds it */
+    LeaveCriticalSection(&d->ring_lock);
+    q->nring_parked = 0;
+}
+/* The GPU has finished with every chunk of the list: all of them to the pool. */
+static void mad_ring_pool_put(struct mad_device *d, struct mad_list *l) {
+    unsigned k;
+    EnterCriticalSection(&d->ring_lock);
+    for (k = 0; k < l->nrings; k++)
+        if (mad_grow((void **)&d->ring_pool, &d->ring_pool_cap, d->nring_pool + 1, sizeof *d->ring_pool)) {
+            struct mad_ringchunk *c = &d->ring_pool[d->nring_pool++];
+            c->buf = l->rings[k]; c->cpu = l->ring_cpu[k]; c->gpu = l->ring_gpu[k]; c->serial = 0;
+        } else { NSObject_release(l->rings[k]); InterlockedDecrement(&g_ring_chunks); }
     LeaveCriticalSection(&d->ring_lock);
     l->nrings = 0;
 }
@@ -6881,25 +6944,57 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
 static int g_indirect_fast = -1;
 static volatile LONG g_ifast_calls, g_ifast_records;
 
-static int exec_indirect_fast_ok(struct mad_exec *e, const struct mad_cmd *c) {
+/* madeira-bcd: why an ExecuteIndirect replay took the per-record path. Build
+ * 470's Red Dead Redemption 2 run (2026-10-09 14:48) spent 37-66 ms a frame in
+ * ExecuteIndirect with indirect-fast = 1 and never logged a fast-path call; the
+ * tallies below name the condition, every 20000 replays (and at 200). */
+enum { IFR_USED, IFR_TESS_IND, IFR_NOT_DRAWN, IFR_ONE_RECORD, IFR_DIAG, IFR_DUMP, IFR_CAPTURE, IFR_COMPUTE,
+       IFR_NO_ENCODER, IFR_GS_EMU, IFR_DXBC_TESS, IFR_BACKEND, IFR_NO_IB, IFR_N };
+static const char *const g_ifr_names[IFR_N] = {
+    "fast path", "tessellation indirect", "first record not drawn", "one record", "diagnostics running",
+    "draw dump", "capture", "compute state", "no render encoder or pipeline", "geometry emulation",
+    "DXBC tessellation", "other converter", "no index buffer" };
+static volatile LONG g_ifr[IFR_N], g_ifr_total;
+
+static int mad_indirect_fast_on(void) {
     if (g_indirect_fast < 0) {
         g_indirect_fast = mad_cfg_int_pe("indirect-fast", 0) ? 1 : 0;   /* madeira.cfg indirect-fast = 1 */
         if (g_indirect_fast)
             d3d12_log("[madeira-d3d12] indirect-fast = 1: ExecuteIndirect records after the first are encoded "
                       "without per-record setup (DXIL and DXBC pipelines)\n");
     }
-    if (!g_indirect_fast || c->u.ind.count < 2) return 0;
-    if (g_census_on || g_capture_on || g_fault_diag || g_skip_ps_state > 0 || g_sd_state != 0) return 0;
-    if ((g_list_seq <= 3 || (g_list_seq >= 12000 && g_list_seq < 12400)) && g_dump_draws < 40000) return 0;   /* draw dumps name each record */
-    if (e->cap_after || e->cap_after_cs || e->ncap_after_buf || e->ncap_after_tex) return 0;
+    return g_indirect_fast;
+}
+
+static void mad_ifr_note(int why) {
+    LONG total;
+    InterlockedIncrement(&g_ifr[why]);
+    total = InterlockedIncrement(&g_ifr_total);
+    if (total == 200 || total % 20000 == 0) {
+        char buf[640]; int pos = 0, r;
+        for (r = 0; r < IFR_N && pos >= 0 && pos < (int)sizeof buf; r++)
+            if (g_ifr[r]) pos += snprintf(buf + pos, sizeof buf - pos, "%s%s %ld", pos ? ", " : "", g_ifr_names[r], (long)g_ifr[r]);
+        d3d12_log("[madeira-d3d12] indirect-fast: %ld ExecuteIndirect replays: %s\n", (long)total, buf);
+    }
+}
+
+/* IFR_USED when records 1..count-1 can share record 0's encoding. */
+static int exec_indirect_fast_why(struct mad_exec *e, const struct mad_cmd *c) {
+    if (c->u.ind.count < 2) return IFR_ONE_RECORD;
+    if (g_census_on || g_fault_diag || g_skip_ps_state > 0 || g_sd_state != 0) return IFR_DIAG;
+    if (g_capture_on) return IFR_CAPTURE;
+    if ((g_list_seq <= 3 || (g_list_seq >= 12000 && g_list_seq < 12400)) && g_dump_draws < 40000) return IFR_DUMP;   /* draw dumps name each record */
+    if (e->cap_after || e->cap_after_cs || e->ncap_after_buf || e->ncap_after_tex) return IFR_CAPTURE;
     if (c->kind == MC_DISPATCH_INDIRECT)
         return e->cenc && e->cpso && e->cpso->cps &&
-               (e->cpso->backend == MADEIRA_IR_BACKEND_MSC || e->cpso->backend == MADEIRA_IR_BACKEND_AIRCONV);
-    if (!e->renc || !e->pso || e->pso->gs_emu) return 0;
+               (e->cpso->backend == MADEIRA_IR_BACKEND_MSC || e->cpso->backend == MADEIRA_IR_BACKEND_AIRCONV)
+               ? IFR_USED : IFR_COMPUTE;
+    if (!e->renc || !e->pso) return IFR_NO_ENCODER;
+    if (e->pso->gs_emu) return IFR_GS_EMU;
     if (e->pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* build 470: its tables come from the shared root state */
-        if (e->pso->tess || e->pso->tess_strip || e->pso->has_tess) return 0;
-    } else if (e->pso->backend != MADEIRA_IR_BACKEND_MSC) return 0;
-    return c->kind == MC_DRAW_INDIRECT || (c->kind == MC_DRAW_INDEXED_INDIRECT && e->ib && e->ib->buffer);
+        if (e->pso->tess || e->pso->tess_strip || e->pso->has_tess) return IFR_DXBC_TESS;
+    } else if (e->pso->backend != MADEIRA_IR_BACKEND_MSC) return IFR_BACKEND;
+    return c->kind == MC_DRAW_INDIRECT || (c->kind == MC_DRAW_INDEXED_INDIRECT && e->ib && e->ib->buffer) ? IFR_USED : IFR_NO_IB;
 }
 
 /* Records 1..count-1 of an ExecuteIndirect whose record 0 was just encoded. */
@@ -7099,7 +7194,11 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                 if (tess) { e.tind_buf = e.q->device->k_ring; e.tind_off = toff + (UINT64)k * 16; }
                 if (c->kind == MC_DISPATCH_INDIRECT) exec_dispatch(&e, &t); else exec_draw(&e, &t);
                 /* madeira-bcd: indirect-fast -- record 0 was encoded, the rest share its state */
-                if (!k && !tess && e.draws == drawn + 1 && exec_indirect_fast_ok(&e, c)) { exec_indirect_rest(&e, c); break; }
+                if (!k && mad_indirect_fast_on()) {
+                    int why = tess ? IFR_TESS_IND : e.draws != drawn + 1 ? IFR_NOT_DRAWN : exec_indirect_fast_why(&e, c);
+                    mad_ifr_note(why);
+                    if (why == IFR_USED) { exec_indirect_rest(&e, c); break; }
+                }
             }
             e.tind_buf = 0; e.tind_off = 0;
             if (g_sd_state > 0 && g_ic_frames) mad_ic_note(&e, c);   /* madeira-bcd: ind-count */
@@ -7186,6 +7285,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             d3d12_log("[madeira-d3d12] list executed: %u commands, %u draws, %u skipped\n", l->ncmds, e.draws, e.skipped);
         }
     }
+    /* madeira-bcd ring-share: the chunks this replay wrote belong to the open batch now;
+     * mad_queue_flush retires them with its serial, and the list keeps none. */
+    if (l->nrings && q->device->gpu_event && mad_ring_share_on()) mad_ring_park(q, l);
 }
 
 /* ml1120: the replay itself; runs on the caller (async-submit = 0) or on the
@@ -7542,6 +7644,7 @@ static void mad_queue_flush(struct mad_queue *q) {
         if (q->open_ticket) { mad_ticket_commit(q->open_ticket, serial); q->open_ticket = 0; }   /* madeira-bcd: sync diagnostics */
         LeaveCriticalSection(&sd->fence_lock);
         q->batch_serial[(q->batches + 1) & 63] = serial;
+        if (q->nring_parked) mad_ring_unpark(q, serial);   /* madeira-bcd ring-share */
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
     q->open_cb = 0; q->open_lists = 0; q->batches++;
@@ -7576,6 +7679,7 @@ static void mad_list_rings_rewind(struct mad_list *l) {
         UINT64 serial = (q->batches - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;
         if (!serial) serial = q->last_serial;
         if (serial && mad_gpu_completed(q->device) < serial) mad_ring_retire(q->device, l, serial);
+        else if (mad_ring_share_on()) mad_ring_pool_put(q->device, l);   /* madeira-bcd: ring-share */
     }
 }
 
@@ -9550,7 +9654,7 @@ static void mad_vis_complete(struct mad_device *d, struct mad_vis_batch *v) {
     for (k = 0; k < v->nchunks; k++) {
         if (mad_grow((void **)&d->ring_pool, &d->ring_pool_cap, d->nring_pool + 1, sizeof *d->ring_pool)) {
             v->chunks[k].serial = 0; d->ring_pool[d->nring_pool++] = v->chunks[k];
-        } else NSObject_release(v->chunks[k].buf);
+        } else { NSObject_release(v->chunks[k].buf); InterlockedDecrement(&g_ring_chunks); }
     }
     LeaveCriticalSection(&d->ring_lock);
     NSObject_release(v->cb);

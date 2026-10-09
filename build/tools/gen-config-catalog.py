@@ -155,6 +155,13 @@ OVERLAY = {
                         "that read their controller only that way (Horizon Zero Dawn); a game that also reads "
                         "XInput could list it twice. Read when the game first asks for a gamepad.",
                 "sources": ["tools/patch-wine-wgi-host-pads.py"]},
+    # madeira-bcd: Red Dead Redemption 2 on build 470, 1.5 GB of argument-ring chunks.
+    "ring-share": {"category": "Direct3D 12", "title": "Share argument buffers between command lists",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a command list gives the argument-buffer chunks its replay wrote back as "
+                        "soon as the GPU is done with them, instead of keeping them until it is recorded again; "
+                        "all lists then share one pool. Red Dead Redemption 2 kept 1.5 GB of them (half of its "
+                        "Metal memory) with the switch off."},
     # madeira-bcd: tools/patch-winemetal-null-fragment.py (winemetal reads it).
     "gs-null-fragment": {"category": "Direct3D 12", "title": "Empty fragment function for pipelines without a pixel shader",
                 "kind": "bool", "default": "1", "sources": ["tools/patch-winemetal-null-fragment.py"],

@@ -96,15 +96,18 @@ enum GameRecommendations {
     /// screen, 13:09), build 470's test: the swap file also takes the 1-4 MB
     /// blocks (the game still reached the 8 GB limit a minute into play), and
     /// build 472's pool-mid: a mapping between the pool's two regions at image
-    /// load cut the pool to 604 MB and the game stopped with ERR_GFX_INIT (14:33).
+    /// load cut the pool to 604 MB and the game stopped with ERR_GFX_INIT (14:33);
+    /// and ring-share: on build 470 (14:48) the argument-buffer chunks grew to
+    /// 1.5 GB of the 3.6 GB Metal held in play.
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 5,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 6,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         d3d12-caps-log = 2
         d3d12-shader-pack = 1
         replay-split = 1
+        ring-share = 1
         pool-low = 1
         pool-mid = 1
         pool-page-fit = 1

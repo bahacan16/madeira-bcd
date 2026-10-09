@@ -4,7 +4,8 @@
 madeira_d3d12.c replays an ExecuteIndirect record by record through the whole
 exec_draw / exec_dispatch. With indirect-fast = 1, record 0 still does, and
 records 1..count-1 are encoded 64 to a call as only what differs. This test
-cuts exec_indirect_fast_ok and exec_indirect_rest out of the file, compiles
+cuts mad_indirect_fast_on, exec_indirect_fast_why and exec_indirect_rest out of the file
+(exec_indirect_fast_ok below is their verdict), compiles
 them on the host against the real winemetal.h with a recording
 encodeCommands, and checks:
   - off by default, and refused for one record, any capture / census / fault /
@@ -42,7 +43,8 @@ def check(what, cond):
 start = src.index("static int g_indirect_fast = -1;")
 end = src.index("\n}\n", src.index("static void exec_indirect_rest(")) + 3
 cut = src[start:end]
-check("fast path functions found", "static int exec_indirect_fast_ok(" in cut and "static void exec_indirect_rest(" in cut)
+check("fast path functions found", "static int mad_indirect_fast_on(" in cut and "static int exec_indirect_fast_why(" in cut
+      and "static void exec_indirect_rest(" in cut)
 check("switch read once with mad_cfg_int_pe, off by default",
       'g_indirect_fast = mad_cfg_int_pe("indirect-fast", 0) ? 1 : 0;' in cut and "if (g_indirect_fast < 0)" in cut)
 
@@ -50,8 +52,11 @@ loop = src[src.index("case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case
 loop = loop[:loop.index("\n            break;\n        }")]
 check("replay loop: fast path only after record 0 drew, never for indirect tessellation, then leaves the loop",
       "unsigned drawn = e.draws;" in loop
-      and "if (!k && !tess && e.draws == drawn + 1 && exec_indirect_fast_ok(&e, c)) { exec_indirect_rest(&e, c); break; }" in loop
-      and loop.index("exec_draw(&e, &t);") < loop.index("exec_indirect_fast_ok(&e, c)"))
+      and "if (!k && mad_indirect_fast_on()) {" in loop
+      and "int why = tess ? IFR_TESS_IND : e.draws != drawn + 1 ? IFR_NOT_DRAWN : exec_indirect_fast_why(&e, c);" in loop
+      and "mad_ifr_note(why);" in loop
+      and "if (why == IFR_USED) { exec_indirect_rest(&e, c); break; }" in loop
+      and loop.index("exec_draw(&e, &t);") < loop.index("exec_indirect_fast_why(&e, c)"))
 draw = src[src.index("static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {"):]
 draw = draw[:draw.index("\n}\n")]
 check("exec_draw binds the record at buffer 4 as the fast path repeats it",
@@ -119,6 +124,10 @@ void MTLComputeCommandEncoder_encodeCommands(obj_handle_t enc, const struct wmtc
     if (n > maxchain) maxchain = n;
 }
 ''' + cut + r'''
+/* the replay loop's verdict for a record 0 that drew */
+static int exec_indirect_fast_ok(struct mad_exec *e, const struct mad_cmd *c) {
+    return mad_indirect_fast_on() && exec_indirect_fast_why(e, c) == IFR_USED;
+}
 static int bad;
 #define EXPECT(c, what) do { if (!(c)) { printf("FAIL %s\n", what); bad = 1; } } while (0)
 static struct mad_resource args = { 0xa0 }, ib = { 0x1b };

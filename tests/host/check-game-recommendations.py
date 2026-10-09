@@ -78,10 +78,11 @@ print('PASS: six lists, two comment lines each, no key twice, every non-env key 
 
 # Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
 # plus the lines of build 466's test (version 2), build 467's (version 3), build 470's (version 4) and
-# build 472's (version 5: pool-mid).
+# build 472's (version 5: pool-mid) and build 475's (version 6: ring-share).
 rdr2 = '''d3d12-caps-log = 2
 d3d12-shader-pack = 1
 replay-split = 1
+ring-share = 1
 pool-low = 1
 pool-mid = 1
 pool-page-fit = 1
@@ -124,7 +125,7 @@ env.WINEDLLOVERRIDES = video64=
 env.MADEIRA_DEVICE_STATS = 1
 env.MADEIRA_METAL_HUD_MAIN = 1'''.split('\n')
 assert presets['rdr2-steam']['lines'][2:] == rdr2, 'the RDR2 list differs from the owner\'s'
-assert presets['rdr2-steam']['version'] == 5, presets['rdr2-steam']['version']
+assert presets['rdr2-steam']['version'] == 6, presets['rdr2-steam']['version']
 assert presets['rdr2-steam']['switches'] == ('avx: false, nvidia: false, wineVCRT: false, fastSync: true, '
                                              'semaphoreFastPath: false, resolution: GameRecommendation.screen720, display: "fit"'), presets['rdr2-steam']['switches']
 assert 'static let screen720 = "screen@720"' in lists_src and 'resolution == Self.screen720 ? "this screen\'s shape at 720 lines" : resolution' in lists_src
@@ -144,7 +145,7 @@ assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'swap-mb = 3072',
                             'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1',
                             'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1'], hzd['lines']
 assert hzd['version'] == 3 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470 and 472 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 475\'s test list')
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472 and 475 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 475\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')

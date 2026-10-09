@@ -1208,6 +1208,11 @@ jobs:
           python3 tests/host/check-wgi-host-pads.py
           python3 tests/host/check-input-foreground.py
 
+      # madeira-bcd: Red Dead Redemption 2 kept 1.5 GB of argument-ring chunks (build 470);
+      # ring-share = 1 returns them per batch. Also the ExecuteIndirect fast-path tallies.
+      - name: Check the shared argument ring
+        run: python3 tests/host/check-ring-share.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
