@@ -119,7 +119,7 @@ for d in $todo; do
 done
 make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
 git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c dlls/d2d1/dc_render_target.c \
-    dlls/windows.gaming.input/provider.c dlls/windows.gaming.input/main.c
+    dlls/windows.gaming.input/provider.c dlls/windows.gaming.input/main.c dlls/windows.gaming.input/manager.c
 for d in $undelayed; do git -C "$R/wine" checkout -- "dlls/$d/Makefile.in"; done
 [ -n "$undelayed" ] && echo "::notice::delay imports linked as plain imports:$undelayed"
 xi_built=0; xi_failed=""

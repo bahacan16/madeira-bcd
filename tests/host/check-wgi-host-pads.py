@@ -9,6 +9,10 @@ The patch adds a provider per connected XInput slot. Checks:
   - main.c polls once with the HID providers and waits through
     madeira_host_pads_wait; without MADEIRA_WGI_HOST_PADS=1 that wait is the
     old INFINITE one and nothing else runs;
+  - manager.c: with the switch a controller's User is a static local user
+    (IUser's IID and vtable order from windows.system.idl) and UserChanged is
+    accepted; without it the stubs answer E_NOTIMPL as before (build 478,
+    Horizon Zero Dawn asked for the User every frame and took no pad input);
   - compiled: the patch's XINPUT_STATE conversion followed by Wine's own
     gamepad.c reading code gives the GamepadReading Windows gives for the same
     XInput state (buttons, d-pad, both sticks with up positive, triggers);
@@ -37,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-wgi-') as directory:
     temporary = Path(directory)
     copy = temporary / 'windows.gaming.input'
     copy.mkdir()
-    for name in ('provider.c', 'main.c'):
+    for name in ('provider.c', 'main.c', 'manager.c'):
         shutil.copy(wgi / name, copy / name)
     first = subprocess.run(['python3', str(script), str(copy)], capture_output=True, text=True, check=True).stdout
     assert 'patched windows.gaming.input' in first, first
@@ -45,6 +49,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-wgi-') as directory:
     assert 'already patched' in second, second
     provider = (copy / 'provider.c').read_text()
     main = (copy / 'main.c').read_text()
+    manager = (copy / 'manager.c').read_text()
     assert provider.startswith((wgi / 'provider.c').read_text().rstrip('\n')), 'the HID providers are untouched'
     print('PASS: the patch applies to the submodule and is idempotent')
 
@@ -69,6 +74,50 @@ with tempfile.TemporaryDirectory(prefix='madeira-wgi-') as directory:
     assert '*value = WineGameControllerType_Gamepad;' in provider
     vibration = function(provider, 'static HRESULT WINAPI host_provider_put_Vibration(')
     assert 'struct madeira_xvibration motors = { value.rumble, value.buzz };' in vibration and 'madeira_xset(' in vibration
+    # manager.c: a controller's User and UserChanged. With the switch the local
+    # user; without it the stub's own FIXME and E_NOTIMPL, as before.
+    for signature, first, stub in (
+            ('static HRESULT WINAPI controller_get_User(',
+             'if (SUCCEEDED(madeira_host_user( value ))) return S_OK;',
+             'FIXME( "iface %p, value %p stub!\\n", iface, value );\n    return E_NOTIMPL;'),
+            ('static HRESULT WINAPI controller_add_UserChanged(',
+             'if (SUCCEEDED(madeira_host_user_changed( token ))) return S_OK;',
+             'FIXME( "iface %p, handler %p, token %p stub!\\n", iface, handler, token );\n    return E_NOTIMPL;'),
+            ('static HRESULT WINAPI controller_remove_UserChanged(',
+             'if (SUCCEEDED(madeira_host_user_changed( &token ))) return S_OK;',
+             'FIXME( "iface %p, token %I64x stub!\\n", iface, token.value );\n    return E_NOTIMPL;')):
+        body = function(manager, signature)
+        assert body.split('{\n', 1)[1].lstrip().startswith(first), signature
+        assert stub in body and body.index(first) < body.index(stub), signature + ': the stub stays behind the switch'
+    assert manager.index('extern HRESULT madeira_host_user(') < manager.index('static HRESULT WINAPI controller_add_UserChanged(')
+    user = function(provider, 'HRESULT madeira_host_user( __x_ABI_CWindows_CSystem_CIUser **value )')
+    assert user.index('if (!madeira_host_pads_enabled()) return E_NOTIMPL;') < user.index('*value = &madeira_user;'), \
+        'no user without the switch'
+    changed = function(provider, 'HRESULT madeira_host_user_changed( EventRegistrationToken *token )')
+    assert changed.index('if (!madeira_host_pads_enabled()) return E_NOTIMPL;') < changed.index('token->value = 0;')
+    # The user object: IUser's IID from windows.system.idl, LocallyAuthenticated, LocalUser.
+    idl = (root / 'wine/include/windows.system.idl').read_text()
+    iid = idl[:idl.index('interface IUser : IInspectable')]
+    iid = iid[iid.rindex('uuid(') + 5:].split(')')[0]
+    a, b, c, d, e = iid.split('-')
+    want = '{ 0x%s, 0x%s, 0x%s, { %s } }' % (a, b, c, ', '.join('0x' + (d + e)[i:i + 2] for i in range(0, 16, 2)))
+    assert 'static const GUID madeira_iid_user = ' + want + ';' in provider, ('IUser IID', want)
+    assert '*value = 1;   /* LocallyAuthenticated */' in function(provider, 'static HRESULT WINAPI madeira_user_get_AuthenticationStatus(')
+    assert '*value = 0;   /* LocalUser */' in function(provider, 'static HRESULT WINAPI madeira_user_get_Type(')
+    assert 'IsEqualGUID( iid, &madeira_iid_user )' in function(provider, 'static HRESULT WINAPI madeira_user_QueryInterface(')
+    vtbl = function(provider, 'static const struct __x_ABI_CWindows_CSystem_CIUserVtbl madeira_user_vtbl =', '\n};\n')
+    order = ['QueryInterface', 'AddRef', 'Release', 'GetIids', 'GetRuntimeClassName', 'GetTrustLevel',
+             'get_NonRoamableId', 'get_AuthenticationStatus', 'get_Type', 'GetPropertyAsync',
+             'GetPropertiesAsync', 'GetPictureAsync']
+    slots = [line.strip().rstrip(',') for line in vtbl.splitlines()[2:] if line.strip().startswith('madeira_user_')]
+    assert slots == ['madeira_user_' + m for m in order], slots
+    get_state = function(provider, 'static HRESULT WINAPI host_provider_get_State(')
+    assert 'madeira_host_reading_note( impl->index, &state, out->timestamp );' in get_state
+    rid = function(provider, 'static HRESULT WINAPI host_provider_get_NonRoamableId(')
+    assert 'L"madeira-xinput-0"' in rid and 'WindowsCreateString(' in rid
+    print('PASS: with the switch every controller has the local user (IUser vtable in windows.system.idl order), '
+          'UserChanged is accepted, readings are logged; without it the stubs answer as before')
+
     print('PASS: opt-in (MADEIRA_WGI_HOST_PADS=1), first poll with the HID providers, a poll every 500 ms, '
           'Gamepad type, rumble to XInputSetState')
 
@@ -183,7 +232,7 @@ int main( void )
 build = (root / 'tools/build-wine-extra-dlls.sh').read_text()
 assert 'targets="$targets dlls/windows.gaming.input/arm64ec-windows/windows.gaming.input.dll"' in build
 assert 'python3 "$R/tools/patch-wine-wgi-host-pads.py" "$R/wine/dlls/windows.gaming.input" && wgi_patched=1' in build
-assert 'dlls/windows.gaming.input/provider.c dlls/windows.gaming.input/main.c' in build, 'the sources are restored'
+assert 'dlls/windows.gaming.input/provider.c dlls/windows.gaming.input/main.c dlls/windows.gaming.input/manager.c' in build, 'the sources are restored'
 copy_step = build[build.index('if [ "$wgi_patched" = 1 ]; then'):]
 copy_step = copy_step[:copy_step.index('built=0; failed=""')]
 assert 'if [ -f "$f" ]; then' in copy_step and 'mv "$SHIP/windows.gaming.input.dll.tmp" "$SHIP/windows.gaming.input.dll"' in copy_step

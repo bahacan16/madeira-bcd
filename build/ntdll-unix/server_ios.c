@@ -997,7 +997,17 @@ static void ios_guest_rip_profile( int gen )
         for (k = 0; k < tc && ntg < ML979_MAXTHREADS; k++) {
             arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
             uint64_t bb = 0;
+            pthread_t pt;
             if (tl[k] == self_port) continue;
+            /* madeira-bcd: look the pthread up BEFORE the suspend, as the ml876
+             * sampler does. pthread_from_mach_thread_np takes libpthread's thread
+             * list lock; a thread suspended while it held that lock (creating or
+             * ending a thread) was never resumed, because this profile blocked on
+             * the lock with the thread still suspended. Every later thread start
+             * and exit, the [xp] probe and the stack dumps then blocked behind it:
+             * RDR2 on build 476 froze at 16:55:52, the moment a profile began.
+             * Nothing between thread_suspend and thread_resume may take a lock. */
+            pt = pthread_from_mach_thread_np( tl[k] );
             if (thread_suspend( tl[k] ) != KERN_SUCCESS) continue;
             /* ml981: a guest thread is one whose frame yields a plausible RIP at
              * x28+0x18 -- the same test the sampling loop uses, so a thread can
@@ -1006,7 +1016,7 @@ static void ios_guest_rip_profile( int gen )
             if (thread_get_state( tl[k], ARM_THREAD_STATE64, (thread_state_t)&st, &cnt ) == KERN_SUCCESS
                 && ios_ts_read( st.__x[28] + 0x18, &bb, 8 )
                 && bb > 0x10000 && bb < 0x8000000000ull
-                && (teb_k = ios_ts_teb( pthread_from_mach_thread_np( tl[k] ) )))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
+                && (teb_k = ios_ts_teb( pt )))   /* ml1116: a Wine thread (has a TEB); native threads passed the x28 test by accident */
             {
                 if (!rp_teb) rp_teb = teb_k;
                 tg[ntg] = tl[k];
@@ -5184,6 +5194,11 @@ void server_init_process_done(void)
                 mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
                 kern_return_t kr = thread_get_state(wine_mach_thread, ARM_THREAD_STATE64,
                                                     (thread_state_t)&state, &state_count);
+                /* madeira-bcd: resume before logging. wine_log_write allocates and
+                 * crosses into Swift (locks); a thread suspended inside malloc or
+                 * the log store would never be resumed. The guest-stack reads below
+                 * are vm_read_overwrite of memory, which needs no suspend. */
+                thread_resume(wine_mach_thread);
                 if (kr == KERN_SUCCESS) {
                     wine_log_write("[Wine WATCHDOG %ds] PC=0x%llx LR=0x%llx SP=0x%llx FP=0x%llx",
                         secs,
@@ -5283,8 +5298,6 @@ void server_init_process_done(void)
                 } else {
                     wine_log_write("[Wine WATCHDOG %ds] thread_get_state failed: %d", secs, kr);
                 }
-
-                thread_resume(wine_mach_thread);
             };
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),

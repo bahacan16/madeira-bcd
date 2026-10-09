@@ -1217,6 +1217,11 @@ jobs:
       - name: Check the refused-shader retry, memo and placeholder
         run: python3 tests/host/check-msc-unbounded-retry.py
 
+      # madeira-bcd: RDR2 froze on build 476 (16:55:52) when the guest RIP
+      # profile took libpthread's thread-list lock with a thread suspended.
+      - name: Check that no sampler takes a lock with a thread suspended
+        run: python3 tests/host/check-suspend-windows.py
+
       # madeira-bcd: Horizon Zero Dawn got no input (build 471): XInput pads as
       # Windows.Gaming.Input gamepads (MADEIRA_WGI_HOST_PADS=1) and the opt-in
       # foreground for a process when no window is foreground

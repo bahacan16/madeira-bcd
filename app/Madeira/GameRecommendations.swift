@@ -103,9 +103,13 @@ enum GameRecommendations {
     /// game) move to the swap file once read, the launcher's and Social Club's
     /// DXMT upload rings take 4 MB blocks instead of 32 MB (they held 200 MB
     /// through play on 467), and the ExecuteIndirect probe is off (on 470 it
-    /// split render passes every 3 s per pipeline for the first two minutes).
+    /// split render passes every 3 s per pipeline for the first two minutes);
+    /// and build 478's: 192 MB of image headroom in the JIT pool instead of
+    /// 128 (on 476 the launcher's, Social Club's and the game's 128 MB code
+    /// buffers left no room for xinput1_4.dll, so neither the controller nor
+    /// the on-screen controls reached the game).
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 7,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 8,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -145,7 +149,7 @@ enum GameRecommendations {
         env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
         env.MADEIRA_EXECREQ_LEAVE = 1
         env.MADEIRA_PIN_GRAPHICS_DLLS = 1
-        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 192
         env.MADEIRA_POOL_LOW_IMAGES = 1
         env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_SC_PA_POOLS = 2
@@ -279,11 +283,13 @@ enum GameRecommendations {
     /// pipeline: the converter refused ~4,900 of its shaders with code 4 (they
     /// read a "t4-unbounded" range), each of them again for every pipeline.
     /// Build 477's switches retry those with sized ranges, remember what stays
-    /// refused, and hand the game a placeholder instead of a failure; Wine's
-    /// "controller_get_User stub" line (12,747 of them, the game asks every
-    /// frame) is silenced.
+    /// refused, and hand the game a placeholder instead of a failure. The game
+    /// took no input from the controller: it asked for the controller's user
+    /// every frame (12,747 times) and Wine had none to give; with build 478
+    /// MADEIRA_WGI_HOST_PADS=1 also answers that with the local user, so the
+    /// line that silenced the question is gone.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 4,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 5,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -297,7 +303,6 @@ enum GameRecommendations {
         env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_INPUT_FOREGROUND = 1
         env.MADEIRA_WGI_HOST_PADS = 1
-        env.WINEDEBUG = fixme-input
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
 
