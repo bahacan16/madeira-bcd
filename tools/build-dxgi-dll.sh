@@ -2,8 +2,10 @@
 # Build DXMT's dxgi.dll (dxmt/src/dxgi) for arm64ec from the submodule source,
 # with IDXGIFactory7 and EnumAdapterByLuid added (tools/patch-dxgi-factory7.py)
 # and CheckInterfaceSupport's UMD version taken from D3DKMT when
-# env.MADEIRA_KMT_ADAPTER = 1 (tools/patch-dxgi-umd-version.py), and ship it
-# NEXT TO upstream's committed binary as app/Madeira/arm64ec-windows/dxgi-src.dll.
+# env.MADEIRA_KMT_ADAPTER = 1 (tools/patch-dxgi-umd-version.py), with
+# video-memory budget-change events when env.MADEIRA_DXGI_BUDGET_EVENTS = 1
+# (tools/patch-dxgi-budget-events.py), and ship it NEXT TO upstream's
+# committed binary as app/Madeira/arm64ec-windows/dxgi-src.dll.
 #
 # Why: the 64-bit dxgi.dll in the bundle is a prebuilt binary upstream
 # committed (9e8291e); CI never compiled it, so a change to dxmt/src/dxgi
@@ -75,9 +77,17 @@ REV="$(git -C "$D" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 cp "$G/dxgi_factory.cpp" "$OUT/src/dxgi_factory.cpp"
 python3 "$R/tools/patch-dxgi-factory7.py" "$OUT/src/dxgi_factory.cpp" || fail "tools/patch-dxgi-factory7.py did not apply"
 python3 "$R/tools/patch-dxgi-x64-entry.py" "$OUT/src/dxgi_factory.cpp" || fail "tools/patch-dxgi-x64-entry.py did not apply"
-# The adapter with the D3DKMT UMD version (run-time switch MADEIRA_KMT_ADAPTER), also on a copy.
+# The adapter with the D3DKMT UMD version (run-time switch MADEIRA_KMT_ADAPTER), also on a copy,
+# and with video-memory budget-change events (run-time switch MADEIRA_DXGI_BUDGET_EVENTS).
 cp "$G/dxgi_adapter.cpp" "$OUT/src/dxgi_adapter.cpp"
 python3 "$R/tools/patch-dxgi-umd-version.py" "$OUT/src/dxgi_adapter.cpp" || fail "tools/patch-dxgi-umd-version.py did not apply"
+# Opt-in for one game, so a missed anchor must not cost every game dxgi-src.dll:
+# the copy is left unpatched and the build goes on.
+BUDGET_EVENTS=" + opt-in budget events"
+python3 "$R/tools/patch-dxgi-budget-events.py" "$OUT/src/dxgi_adapter.cpp" || {
+    BUDGET_EVENTS=""
+    echo "::warning::tools/patch-dxgi-budget-events.py did not apply: dxgi-src.dll is built without budget events (env.MADEIRA_DXGI_BUDGET_EVENTS has no effect)"
+}
 
 # DXMT's meson.build: compiler_args, the project defines, buildtype=release
 # (-O3, b_ndebug=if-release -> NDEBUG), C++20, the include paths of dxgi's
@@ -162,6 +172,9 @@ if ! grep -q "GetUmdDriverVersion()" "$G/dxgi_adapter.cpp"; then
     LC_ALL=C grep -aq "CheckInterfaceSupport: UMD version" "$OUT/dxgi.dll" || fail "the UMD version patch is not in the result"
 fi
 "$NM" --defined-only "$OUT/dxgi.dll" | grep -q "RegisterAdaptersChangedEvent" || fail "RegisterAdaptersChangedEvent is not in the result"
+if [ -n "$BUDGET_EVENTS" ]; then
+    LC_ALL=C grep -aq "\[budget-event\] registered cookie=" "$OUT/dxgi.dll" || fail "the budget events patch is not in the result"
+fi
 python3 "$R/tests/host/check-x64-graphics-entry.py" --factory "$OUT/dxgi.dll" || fail "the x64 factory entries failed validation"
 
 # The recipe check: the unpatched link against upstream's binary. Same
@@ -183,4 +196,4 @@ if [ "${DXGI_NO_SHIP:-0}" = "1" ]; then
     exit 0
 fi
 cp "$OUT/dxgi.dll" "$DEST.tmp" && mv -f "$DEST.tmp" "$DEST" || fail "copying into the bundle failed"
-echo "::notice::dxgi-src.dll built from DXMT $REV with IDXGIFactory7 + EnumAdapterByLuid + the D3DKMT UMD version ($(wc -c < "$DEST" | tr -d ' ') bytes, exports = upstream's) and shipped next to upstream's dxgi.dll, which stays the default (env.MADEIRA_DXGI_SRC = 1 selects it); the recipe $MATCH"
+echo "::notice::dxgi-src.dll built from DXMT $REV with IDXGIFactory7 + EnumAdapterByLuid + the D3DKMT UMD version$BUDGET_EVENTS ($(wc -c < "$DEST" | tr -d ' ') bytes, exports = upstream's) and shipped next to upstream's dxgi.dll, which stays the default (env.MADEIRA_DXGI_SRC = 1 selects it); the recipe $MATCH"

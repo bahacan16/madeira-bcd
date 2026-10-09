@@ -84,9 +84,11 @@ struct GameRecommendation: Equatable {
 enum GameRecommendations {
     // MARK: The lists
 
-    /// Red Dead Redemption 2 from Steam, through Madeira Dock (builds 462-463).
+    /// Red Dead Redemption 2 from Steam, through Madeira Dock: the build 463
+    /// list, plus build 466's memory and ExecuteIndirect switches and the DXGI
+    /// monitor identity and mode list for Borderless / Full Screen.
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 1,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 2,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -101,6 +103,8 @@ enum GameRecommendations {
         swap-mode = 2
         pso-warm = 2
         fence-chain = 6
+        avail-phys = 1
+        indirect-fast = 1
         env.WINE_D3D_CONFIG = renderer=no3d
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_BAND_CENSUS = 1
@@ -112,6 +116,9 @@ enum GameRecommendations {
         env.MADEIRA_DOCK_GAME_SCM = 1
         env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe
         env.MADEIRA_DXGI_SRC = 1
+        env.MADEIRA_DXGI_BUDGET_EVENTS = 1
+        env.DXMT_WSI_MONITOR_IDENTITY = 1
+        env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_EXECREQ_LEAVE = 1
         env.MADEIRA_PIN_GRAPHICS_DLLS = 1
         env.MADEIRA_POOL_HEAD_RESERVE_MB = 128

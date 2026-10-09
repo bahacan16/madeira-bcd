@@ -6849,6 +6849,98 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     }
 }
 
+/* madeira-bcd: indirect-fast (madeira.cfg indirect-fast = 1, opt-in). An
+ * ExecuteIndirect is MaxCommandCount draws or dispatches that share all state
+ * but the argument record's offset (list_ExecuteIndirect takes single-argument
+ * signatures only). The replay ran the whole exec_draw / exec_dispatch for every
+ * record: an argument slot, the bindings, the residency declarations and one
+ * encodeCommands call each. In the owner's Red Dead Redemption 2 run of
+ * 2026-10-09 11:02 that was 20-60 ms a frame for about 9,400 records, with the
+ * GPU about 30 % busy. With the switch the first record still takes the full
+ * path; the encoder keeps that state, and the other records are encoded 64 to a
+ * call as only what differs: the record's offset at buffer 4 (the converter's
+ * draw parameters) and the indirect draw, or the indirect dispatch alone. Only
+ * for Metal Shader Converter (DXIL) pipelines without geometry or tessellation
+ * emulation, and never while a capture, census, draw dump, fault or sync
+ * diagnostic runs: those keep the per-record path. */
+static int g_indirect_fast = -1;
+static volatile LONG g_ifast_calls, g_ifast_records;
+
+static int exec_indirect_fast_ok(struct mad_exec *e, const struct mad_cmd *c) {
+    if (g_indirect_fast < 0) {
+        g_indirect_fast = mad_cfg_int_pe("indirect-fast", 0) ? 1 : 0;   /* madeira.cfg indirect-fast = 1 */
+        if (g_indirect_fast)
+            d3d12_log("[madeira-d3d12] indirect-fast = 1: ExecuteIndirect records after the first are encoded "
+                      "without per-record setup (DXIL pipelines)\n");
+    }
+    if (!g_indirect_fast || c->u.ind.count < 2) return 0;
+    if (g_census_on || g_capture_on || g_fault_diag || g_skip_ps_state > 0 || g_sd_state != 0) return 0;
+    if ((g_list_seq <= 3 || (g_list_seq >= 12000 && g_list_seq < 12400)) && g_dump_draws < 40000) return 0;   /* draw dumps name each record */
+    if (e->cap_after || e->cap_after_cs || e->ncap_after_buf || e->ncap_after_tex) return 0;
+    if (c->kind == MC_DISPATCH_INDIRECT)
+        return e->cenc && e->cpso && e->cpso->cps && e->cpso->backend == MADEIRA_IR_BACKEND_MSC;
+    if (!e->renc || !e->pso || e->pso->backend != MADEIRA_IR_BACKEND_MSC || e->pso->gs_emu) return 0;
+    return c->kind == MC_DRAW_INDIRECT || (c->kind == MC_DRAW_INDEXED_INDIRECT && e->ib && e->ib->buffer);
+}
+
+/* Records 1..count-1 of an ExecuteIndirect whose record 0 was just encoded. */
+static void exec_indirect_rest(struct mad_exec *e, const struct mad_cmd *c) {
+    enum { B = 64 };
+    UINT k, n, i, rest = c->u.ind.count - 1;
+    for (k = 1; k < c->u.ind.count; k += n) {
+        n = c->u.ind.count - k < B ? c->u.ind.count - k : B;
+        if (c->kind == MC_DISPATCH_INDIRECT) {
+            struct wmtcmd_compute_dispatch_indirect d[B];
+            memset(d, 0, n * sizeof d[0]);
+            for (i = 0; i < n; i++) {
+                d[i].type = WMTComputeCommandDispatchIndirect;
+                d[i].indirect_args_buffer = c->u.ind.args->buffer;
+                d[i].indirect_args_offset = c->u.ind.off + (UINT64)(k + i) * c->u.ind.stride;
+                d[i].next.ptr = i + 1 < n ? (void *)&d[i + 1] : NULL;
+            }
+            MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&d[0]);
+        } else {
+            struct wmtcmd_render_setbuffer sb[B];
+            struct wmtcmd_render_draw_indirect di[B];
+            struct wmtcmd_render_draw_indexed_indirect dii[B];
+            int indexed = c->kind == MC_DRAW_INDEXED_INDIRECT;
+            memset(sb, 0, n * sizeof sb[0]);
+            if (indexed) memset(dii, 0, n * sizeof dii[0]); else memset(di, 0, n * sizeof di[0]);
+            for (i = 0; i < n; i++) {
+                UINT64 off = c->u.ind.off + (UINT64)(k + i) * c->u.ind.stride;
+                void *draw = indexed ? (void *)&dii[i] : (void *)&di[i];
+                /* the converter's draw parameters: this record, as exec_draw binds them */
+                sb[i].type = WMTRenderCommandSetVertexBuffer;
+                sb[i].buffer = c->u.ind.args->buffer; sb[i].offset = off; sb[i].index = 4;
+                sb[i].next.ptr = draw;
+                if (indexed) {
+                    dii[i].type = WMTRenderCommandDrawIndexedIndirect;
+                    dii[i].primitive_type = mad_prim(e->topo);
+                    dii[i].index_type = e->ib_type;
+                    dii[i].index_buffer = e->ib->buffer;
+                    dii[i].index_buffer_offset = e->ib_off;
+                    dii[i].indirect_args_buffer = c->u.ind.args->buffer;
+                    dii[i].indirect_args_offset = off;
+                    dii[i].next.ptr = i + 1 < n ? (void *)&sb[i + 1] : NULL;
+                } else {
+                    di[i].type = WMTRenderCommandDrawIndirect;
+                    di[i].primitive_type = mad_prim(e->topo);
+                    di[i].indirect_args_buffer = c->u.ind.args->buffer;
+                    di[i].indirect_args_offset = off;
+                    di[i].next.ptr = i + 1 < n ? (void *)&sb[i + 1] : NULL;
+                }
+            }
+            MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&sb[0]);
+            e->pass_draws += n;
+        }
+        e->draws += n;
+    }
+    InterlockedExchangeAdd(&g_ifast_records, (LONG)rest);
+    if ((InterlockedIncrement(&g_ifast_calls) % 20000) == 1)
+        d3d12_log("[madeira-d3d12] indirect-fast: %ld calls, %ld records encoded without per-record setup\n",
+                  (long)g_ifast_calls, (long)g_ifast_records);
+}
+
 /* madeira-bcd: during a CAP frame, every clear and copy with its target's
  * identity and alias report -- clear-only passes are not captured as images,
  * and a copy into memory shared with a live target is a corruption source. */
@@ -6983,9 +7075,12 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (c->kind != MC_DISPATCH_INDIRECT && e.pso && e.pso->gs_emu == 2)   /* madeira-bcd */
                 tess = exec_tess_indirect_prep(&e, c, &toff);
             for (k = 0; k < c->u.ind.count; k++) {
+                unsigned drawn = e.draws;
                 t.u.ind.off = c->u.ind.off + (UINT64)k * c->u.ind.stride;
                 if (tess) { e.tind_buf = e.q->device->k_ring; e.tind_off = toff + (UINT64)k * 16; }
                 if (c->kind == MC_DISPATCH_INDIRECT) exec_dispatch(&e, &t); else exec_draw(&e, &t);
+                /* madeira-bcd: indirect-fast -- record 0 was encoded, the rest share its state */
+                if (!k && !tess && e.draws == drawn + 1 && exec_indirect_fast_ok(&e, c)) { exec_indirect_rest(&e, c); break; }
             }
             e.tind_buf = 0; e.tind_off = 0;
             if (g_sd_state > 0 && g_ic_frames) mad_ic_note(&e, c);   /* madeira-bcd: ind-count */

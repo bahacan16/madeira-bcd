@@ -23284,6 +23284,57 @@ void virtual_init(void)
 
 
 /***********************************************************************
+ *           ios_avail_phys
+ *
+ * madeira-bcd: madeira.cfg or the game's own file `avail-phys = 1`, opt-in
+ * (owner's Red Dead Redemption 2 run of 2026-10-09 11:02). Wine's
+ * get_performance_info (system.c) reports the whole phone's free + inactive
+ * pages as SystemPerformanceInformation.AvailablePages, which is
+ * GlobalMemoryStatusEx's ullAvailPhys, while this app dies at its own memory
+ * limit (the total virtual_get_system_info reports, ml992). Windows programs
+ * saw gigabytes available until iOS killed the app at 8184 MB, so Chromium's
+ * memory pressure evaluator (SocialClubHelper.exe, steamwebhelper.exe), which
+ * purges caches and collects garbage below 1000 MB (moderate) and 400 MB
+ * (critical) available, never fired. With the switch the value is lowered to
+ * what remains before the limit (os_proc_available_memory) when that is
+ * smaller. Called by the patched get_performance_info
+ * (tools/patch-wine-avail-phys.py); off, host_free comes back unchanged.
+ */
+unsigned long long ios_avail_phys( unsigned long long host_free )
+{
+    extern size_t os_proc_available_memory( void );
+    static int on = -1, band = -1, said;
+    static unsigned long long memsize;
+    unsigned long long left;
+    int now;
+
+    if (on < 0)
+    {
+        size_t len = sizeof(memsize);
+        if (sysctlbyname( "hw.memsize", &memsize, &len, NULL, 0 )) memsize = 0;
+        on = madeira_cfg_bool( "avail-phys", 0 );   /* madeira.cfg avail-phys = 1 */
+        if (on) dprintf( 2, "[avail-phys] on: available physical memory is what remains before this "
+                         "app's memory limit (madeira.cfg avail-phys = 1)\n" );
+    }
+    if (!on) return host_free;
+    left = (unsigned long long)os_proc_available_memory();
+    /* rdr61: a "no limit" sentinel larger than the machine is not a measurement */
+    if (!left || (memsize && left > memsize)) return host_free;
+    now = left < (400ull << 20) ? 2 : left < (1000ull << 20) ? 1 : 0;
+    if (now != band && said < 64)
+    {
+        said++;
+        dprintf( 2, "[avail-phys] %llu MB left before the limit (host free %llu MB): %s\n",
+                 left >> 20, host_free >> 20,
+                 now == 2 ? "below 400 MB, Chromium's critical level" :
+                 now == 1 ? "below 1000 MB, Chromium's moderate level" : "1000 MB or more" );
+    }
+    band = now;
+    return left < host_free ? left : host_free;
+}
+
+
+/***********************************************************************
  *           get_system_affinity_mask
  */
 ULONG_PTR get_system_affinity_mask(void)

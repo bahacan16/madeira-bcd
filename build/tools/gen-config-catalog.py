@@ -105,6 +105,14 @@ OVERLAY = {
                         "command buffer, each kind of command (draws, dispatches, copies, clears, barriers, render "
                         "targets, queries, state) and the end of each list. For finding why a game's frame is slow "
                         "when the GPU is not busy."},
+    "indirect-fast": {"category": "Direct3D 12", "title": "Encode ExecuteIndirect records without per-record setup",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: after the first record of an ExecuteIndirect, the other records (which share "
+                        "all state but their offset) are encoded 64 at a time with only their offset and the "
+                        "indirect draw or dispatch, instead of the whole per-draw setup each. For games that issue "
+                        "thousands of indirect records a frame (Red Dead Redemption 2), where that setup costs more "
+                        "CPU time than the GPU spends. DXIL pipelines only; diagnostics and captures keep the "
+                        "per-record path. Read once per session."},
     "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "
@@ -281,6 +289,22 @@ OVERLAY = {
                         "upstream's DXMT dxgi plus IDXGIFactory7 and EnumAdapterByLuid (GTA V Enhanced stops with "
                         "ERR_GFX_D3D_NOD3D12 without Factory7). Off (default): upstream's committed dxgi.dll. Set it in "
                         "the game's own file, not for every game; read at session start."},
+    "avail-phys": {"category": "Memory & JIT pool", "title": "Report the memory left before the app's limit as available",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: Windows programs' available physical memory (GlobalMemoryStatusEx) is what "
+                        "remains before Madeira's memory limit instead of the phone's free memory, so Chromium "
+                        "(Social Club, Steam) frees caches below 1000 MB and 400 MB left, and a game can see memory "
+                        "running out. Set it in the game's own file; read at session start."},
+    # madeira-bcd: budget-change events in dxgi-src.dll (tools/patch-dxgi-budget-events.py).
+    "env.MADEIRA_DXGI_BUDGET_EVENTS": {"category": "Direct3D 9/10/11 (DXMT)",
+                "title": "Tell the game when its video memory budget changes",
+                "kind": "bool", "default": "0", "sources": ["tools/patch-dxgi-budget-events.py"],
+                "note": "Needs env.MADEIRA_DXGI_SRC = 1. The video memory budget DXGI reports shrinks as Madeira "
+                        "nears its memory limit (vram-trim-mb below it). 1: a game's budget-change event is "
+                        "registered for real, signalled at once and again whenever the budget moves by 32 MB, so a "
+                        "game that waits for it (Red Dead Redemption 2) reads the smaller budget and frees textures. "
+                        "Off (default): the registration is refused, as before. Set it in the game's own file; read "
+                        "at session start."},
     # madeira-bcd: the opt-in source build of DXMT's 64-bit d3d11.dll (tools/build-d3d11-dll.sh).
     "env.MADEIRA_D3D11_SRC": {"category": "Direct3D 9/10/11 (DXMT)", "title": "D3D11 built from DXMT source (context state swap)",
                 "kind": "bool", "default": "0",

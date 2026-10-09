@@ -410,6 +410,15 @@ jobs:
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
+      # madeira.cfg avail-phys = 1 (opt-in): GlobalMemoryStatusEx's available
+      # physical memory is what remains before this app's memory limit, so
+      # Chromium (Social Club, Steam) sees memory pressure before iOS kills the
+      # app. Patches wine/dlls/ntdll/unix/system.c; off, nothing changes.
+      - name: Patch wine with the opt-in available memory
+        run: |
+          python3 tests/host/check-avail-phys.py
+          python3 tools/patch-wine-avail-phys.py wine/dlls/ntdll/unix/system.c
+
       # Self-modifying-code fault storms (RockstarService, builds 435-437):
       # the ARM64EC SMC path decides plain and backpatched stores without
       # FEX's backpatch lock, and the PE ntdll's uncapped "[rtcs] pre" line is
@@ -582,6 +591,14 @@ jobs:
           path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
           key: llvm-mingw-20260421-ucrt-macos-universal
 
+      # env.MADEIRA_DXGI_BUDGET_EVENTS = 1 (opt-in): the budget-change events
+      # tools/patch-dxgi-budget-events.py adds to dxgi-src.dll, checked (and
+      # compiled for arm64ec) before the build below applies it.
+      - name: Check opt-in DXGI budget events
+        env:
+          MINGW: ${{ github.workspace }}/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin
+        run: python3 tests/host/check-dxgi-budget-events.py
+
       # madeira-bcd: DXMT's 64-bit dxgi.dll compiled from the dxmt submodule
       # with IDXGIFactory7 + EnumAdapterByLuid (tools/patch-dxgi-factory7.py, on
       # a copy). The committed arm64ec dxgi.dll stops at IDXGIFactory6 and GTA V
@@ -594,7 +611,9 @@ jobs:
       # upstream's dxgi.dll goes out alone, as before. Since 2026-10-02 it also
       # applies tools/patch-dxgi-umd-version.py to a copy of dxgi_adapter.cpp:
       # CheckInterfaceSupport's UMD version comes from D3DKMT when
-      # env.MADEIRA_KMT_ADAPTER = 1 (else ~0, upstream).
+      # env.MADEIRA_KMT_ADAPTER = 1 (else ~0, upstream). Since 2026-10-09 also
+      # tools/patch-dxgi-budget-events.py: video-memory budget-change events
+      # when env.MADEIRA_DXGI_BUDGET_EVENTS = 1 (a failed patch only warns).
       - name: Build dxgi-src.dll (DXMT dxgi from source, IDXGIFactory7)
         continue-on-error: true
         run: bash tools/build-dxgi-dll.sh
@@ -1147,6 +1166,11 @@ jobs:
             obj/*.o "$GITHUB_WORKSPACE"/toolchains/llvm-ios-build/lib/*.a
           cp libdxmt_combined.a "$GITHUB_WORKSPACE/app/Madeira/"
           echo "::notice::libdxmt_combined.a $(wc -c < libdxmt_combined.a | tr -d ' ') bytes"
+
+      # madeira.cfg indirect-fast = 1 (opt-in): ExecuteIndirect records after
+      # the first are encoded without per-record setup.
+      - name: Check the opt-in ExecuteIndirect fast path
+        run: python3 tests/host/check-indirect-fast.py
 
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.

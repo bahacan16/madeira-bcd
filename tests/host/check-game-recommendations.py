@@ -75,7 +75,8 @@ for ident, p in presets.items():
         assert 'socialclub' not in line.lower() and 'MADEIRA_DLL_LOCAL' not in line, (ident, line)
 print('PASS: five lists, two comment lines each, no key twice, every non-env key in the settings catalog, no Social Club DLL lines')
 
-# Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line.
+# Red Dead Redemption 2 from Steam: the owner's list of 2026-10-09 (build 463), line for line,
+# plus the lines of build 466's test (version 2).
 rdr2 = '''d3d12-caps-log = 2
 d3d12-shader-pack = 1
 replay-split = 1
@@ -87,6 +88,8 @@ swap-mb = 8192
 swap-mode = 2
 pso-warm = 2
 fence-chain = 6
+avail-phys = 1
+indirect-fast = 1
 env.WINE_D3D_CONFIG = renderer=no3d
 env.FEX_VECTORTSOENABLED = 0
 env.MADEIRA_BAND_CENSUS = 1
@@ -98,6 +101,9 @@ env.MADEIRA_D3D11_SRC = 1
 env.MADEIRA_DOCK_GAME_SCM = 1
 env.MADEIRA_DOCK_KEEP_ALIVE = Launcher.exe;RDR2.exe
 env.MADEIRA_DXGI_SRC = 1
+env.MADEIRA_DXGI_BUDGET_EVENTS = 1
+env.DXMT_WSI_MONITOR_IDENTITY = 1
+env.DXMT_WSI_MODE_TABLE = 1
 env.MADEIRA_EXECREQ_LEAVE = 1
 env.MADEIRA_PIN_GRAPHICS_DLLS = 1
 env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
@@ -113,6 +119,7 @@ env.WINEDLLOVERRIDES = video64=
 env.MADEIRA_DEVICE_STATS = 1
 env.MADEIRA_METAL_HUD_MAIN = 1'''.split('\n')
 assert presets['rdr2-steam']['lines'][2:] == rdr2, 'the RDR2 list differs from the owner\'s'
+assert presets['rdr2-steam']['version'] == 2, presets['rdr2-steam']['version']
 assert presets['rdr2-steam']['switches'] == ('avx: false, nvidia: false, wineVCRT: false, fastSync: true, '
                                              'semaphoreFastPath: false, display: "fit"'), presets['rdr2-steam']['switches']
 gta = presets['gta5e-steam']
@@ -122,7 +129,7 @@ assert 'semaphoreFastPath: true, fpsMode: 4' in gta['switches'] and 'nvidia: tru
 assert 'env.MADEIRA_FASTSYNC_SEM = 1' in presets['gta5e-other']['lines']
 assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']
 assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
-print('PASS: RDR2 (Steam) is the owner\'s 463 list line for line with its switches; GTA V Enhanced, GoT and GoW keep their tested lines')
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466 test lines, line for line with its switches; GTA V Enhanced, GoT and GoW keep their tested lines')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')
@@ -306,7 +313,7 @@ check(R.gta5EnhancedSteam.switchSummary == "AVX off, NVIDIA on, Wine's C++ runti
 check(R.gta5EnhancedSteam.summary(home: true) == "AVX off, NVIDIA on, Wine's C++ runtime off", R.gta5EnhancedSteam.summary(home: true))
 check(R.note(R.ghostOfTsushima, home: true).contains("1280x720") && !R.note(R.ghostOfTsushima, home: true).contains("semaphore"),
       R.note(R.ghostOfTsushima, home: true))
-check(R.note(R.rdr2Steam).contains("36 config lines") && R.note(nil).contains("no recommended settings"), R.note(R.rdr2Steam))
+check(R.note(R.rdr2Steam).contains("41 config lines") && R.note(nil).contains("no recommended settings"), R.note(R.rdr2Steam))
 
 // First sight, the player's changes, newer lists and Reset to Recommended.
 let key = "madeira.recommended.applied"
@@ -321,7 +328,7 @@ check(R.prepare(&red), "first sight takes the entry's fields")
 check(file(rdr2) == R.rdr2Steam.fileText, "first sight writes the list")
 check(red.fastSync == true && red.semaphoreFastPath == false && red.display == nil && red.fpsMode == 1, "first sight's entry fields")
 check(!LibraryPrefs.avx(rdr2) && !LibraryPrefs.nvidia(rdr2) && !LibraryPrefs.wineVCRT(rdr2), "first sight's switches")
-check(mark(rdr2)?.hasPrefix("rdr2-steam#1#") == true, "what was written is recorded")
+check(mark(rdr2)?.hasPrefix("rdr2-steam#2#") == true, "what was written is recorded")
 check(!R.prepare(&red) && file(rdr2) == R.rdr2Steam.fileText, "once")
 GameProfile(windowsPath: rdr2).text = R.rdr2Steam.fileText + "fence-chain = 1\n"
 check(!R.prepare(&red) && file(rdr2).hasSuffix("fence-chain = 1\n"), "a changed config is the player's")
@@ -419,7 +426,7 @@ LibraryModel.shared.entries = [LibraryEntry(title: "God of War", windowsPath: go
 check(R.reset(windowsPath: gowHome, title: "God of War")?.id == "god-of-war" && file(gowHome) == R.godOfWar.fileText
       && LibraryModel.shared.entries[0].resolution == "1920x1080" && LibraryModel.shared.entries[0].config == nil,
       "a home screen Reset reaches the library entry for the same program")
-check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v1 written (first sight)") }, "log line")
+check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v2 written (first sight)") }, "log line")
 UserDefaults.standard.removeObject(forKey: key)
 print("PASS: the home screen shares the files and records; Safe thread sync and Screen size take the list's values")
 '''
