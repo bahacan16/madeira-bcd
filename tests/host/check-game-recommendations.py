@@ -157,20 +157,29 @@ assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
 # orphan-lock reaper releases only locks a live thread has stamped. Version 6 (build 481): shader
 # libraries only for pipelines in use, rectangle clears, the game's memory in the swap file
 # (broad, from 1 MB), and no pso-warm (its queue held 24,570 pipelines when iOS closed the game).
-# Version 7 (build 482): the skin-check and view-census diagnostics for its compute-skinned
+# Version 7 (build 483): the skin-check and view-census diagnostics for its compute-skinned
 # characters (missing faces, missing hair, spikes every few frames on 481, gpu-sync or not).
+# Version 8 (build 484): every candidate fix at once, one line each, to be halved if it helps:
+# no wave operations, raw views readable as typed, ShaderAtomic on R32 typed UAVs, and FEX's
+# x86 ordering for vector, memcpy and split-lock accesses and for images with volatile metadata.
 hzd = presets['horizon-zero-dawn']
 assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'msc-unbounded-retry = 1', 'msc-fail-memo = 1',
                             'pso-placeholder = 1', 'pso-lazy-libs = 1', 'clear-rects = 1',
                             'skin-check = 1', 'view-census = 1',
+                            'd3d12-wave-ops = 0', 'd3d12-raw-typed-views = 1', 'typed-uav-atomic = 1',
+                            'ignore-volatile-metadata = 1',
                             'swap-mb = 6144', 'swap-mode = 2', 'swap-min-mb = 1',
+                            'env.FEX_VECTORTSOENABLED = 1', 'env.FEX_MEMCPYSETTSOENABLED = 1',
+                            'env.FEX_STRICTINPROCESSSPLITLOCKS = 1',
                             'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1',
                             'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1',
                             'env.MADEIRA_LOCK_ORPHAN = stamped', 'env.WINEDEBUG = fixme-input'], hzd['lines']
-assert hzd['version'] == 7 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
-assert not any(line.startswith(('pso-lazy-libs', 'clear-rects', 'skin-check', 'view-census')) for p in presets.values() if p is not hzd
-               for line in p['lines']), 'the build 481 and 482 switches are Horizon Zero Dawn\'s only'
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 480 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 482\'s test list')
+assert hzd['version'] == 8 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
+assert not any(line.startswith(('pso-lazy-libs', 'clear-rects', 'skin-check', 'view-census', 'd3d12-wave-ops',
+                                 'd3d12-raw-typed-views', 'typed-uav-atomic', 'ignore-volatile-metadata',
+                                 'env.FEX_VECTORTSOENABLED = 1', 'env.FEX_MEMCPYSETTSOENABLED', 'env.FEX_STRICTINPROCESSSPLITLOCKS'))
+               for p in presets.values() if p is not hzd for line in p['lines']), 'the build 481-484 switches are Horizon Zero Dawn\'s only'
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 480 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 484\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')

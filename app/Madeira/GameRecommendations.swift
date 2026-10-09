@@ -308,12 +308,20 @@ enum GameRecommendations {
     /// On build 481 (21:52, 21:55) the game played without closing, but its
     /// characters, which it skins in compute shaders, came out with missing
     /// faces, missing hair or collapsed to spikes every few frames, with
-    /// gpu-sync = 1 as without it. Build 482's list adds two diagnostics:
+    /// gpu-sync = 1 as without it. Build 483's list adds two diagnostics:
     /// skin-check logs those draws, the dispatches that wrote their vertices and
     /// copies of the vertices themselves; view-census names buffer views that
-    /// fall back or are cut short.
+    /// fall back or are cut short. d3d12-typed-uav-load = 1 changed nothing
+    /// (481, 23:19). Build 484's list is one test of every candidate the
+    /// research left at once, each its own line: the game reads OPTIONS1, so
+    /// d3d12-wave-ops = 0 gives it shaders without wave intrinsics; raw and
+    /// structured buffer views also carry a texture view (typed reads of them
+    /// read zeros otherwise); R32 typed UAVs get ShaderAtomic; FEX orders vector
+    /// and memcpy accesses as x86 does and ignores the volatile metadata of
+    /// concrt140.dll and mfc140.dll. If the characters come out whole, the lines
+    /// are halved to find the one that matters; skin-check stays on either way.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 7,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 8,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -325,9 +333,16 @@ enum GameRecommendations {
         clear-rects = 1
         skin-check = 1
         view-census = 1
+        d3d12-wave-ops = 0
+        d3d12-raw-typed-views = 1
+        typed-uav-atomic = 1
+        ignore-volatile-metadata = 1
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1
+        env.FEX_VECTORTSOENABLED = 1
+        env.FEX_MEMCPYSETTSOENABLED = 1
+        env.FEX_STRICTINPROCESSSPLITLOCKS = 1
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_INPUT_FOREGROUND = 1

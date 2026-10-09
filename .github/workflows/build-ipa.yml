@@ -1246,6 +1246,12 @@ jobs:
       - name: Check the skin-check and view-census diagnostics
         run: python3 tests/host/check-skin-check.py
 
+      # madeira-bcd: A/B switches for the same corruption, all off by default:
+      # d3d12-wave-ops = 0, d3d12-binding-tier = 3, d3d12-raw-typed-views = 1,
+      # and ignore-volatile-metadata = 1 (FEX's x86 ordering for whole images).
+      - name: Check the opt-in switches for the Sony ports' corrupted meshes
+        run: python3 tests/host/check-nixxes-optins.py
+
       # madeira-bcd: RDR2 froze on build 476 (16:55:52) when the guest RIP
       # profile took libpthread's thread-list lock with a thread suspended.
       - name: Check that no sampler takes a lock with a thread suspended

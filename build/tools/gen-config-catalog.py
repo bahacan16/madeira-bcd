@@ -216,6 +216,30 @@ OVERLAY = {
                 "note": "Default off. 1: typed buffer views that cannot become a Metal texture buffer (the shader then "
                         "sees no data), views cut short at the end of their resource, and views or constant buffer "
                         "views past their resource are counted and named in the log. Changes nothing else."},
+    # madeira-bcd: A/B switches for the Sony ports' corrupted meshes (Horizon Zero Dawn, Ghost of Tsushima).
+    "d3d12-wave-ops": {"category": "Direct3D 12", "title": "Report wave operations",
+                "kind": "bool", "default": "1",
+                "note": "On by default. 0: OPTIONS1 reports WaveOps FALSE, so a game with a fallback picks shaders "
+                        "without wave intrinsics (an A/B for the shader converter's wave code; Horizon Zero Dawn reads "
+                        "it). Read once per game start."},
+    "d3d12-binding-tier": {"category": "Direct3D 12", "title": "Reported resource binding tier",
+                "kind": "int", "default": "2",
+                "note": "Default 2. 3: OPTIONS reports resource binding tier 3, as Apple's D3DMetal and vkd3d-proton do; "
+                        "a game can take another binding path for it. Anything else keeps tier 2. Read once per game "
+                        "start."},
+    "d3d12-raw-typed-views": {"category": "Direct3D 12", "title": "Raw buffer views readable as typed",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: raw and structured buffer views also carry a texture-buffer view (R32, or "
+                        "RG32/RGBA32 for a structured SRV whose stride allows it), as native drivers and vkd3d-proton "
+                        "do, so a shader that reads one as Buffer<T> gets the data instead of zeros (vertices at the "
+                        "origin). Costs one Metal texture object per such view."},
+    "ignore-volatile-metadata": {"category": "Memory & JIT pool", "title": "FEX: x86 ordering for the whole game",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: an x64 image's PE volatile metadata (MSVC /volatileMetadata) is cleared when "
+                        "it is mapped, so FEX orders every instruction of it by its TSO settings instead of only the "
+                        "ones the metadata lists (Ghost of Tsushima's exe carries it; Horizon Zero Dawn's concrt140.dll "
+                        "too). Slower; for testing memory-ordering bugs. Each cleared image is logged as [fex-vmeta]. "
+                        "Read at session start."},
     "msc-fail-memo": {"category": "Direct3D 12", "title": "Remember refused shaders for the session",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: a shader the converter refused is not converted again for the next pipeline "

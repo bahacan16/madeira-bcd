@@ -5479,6 +5479,25 @@ static void mad_skin_print(const struct mad_skcap *c) {
         d3d12_log("[skin-cap] %s: %u vertices, position 0: %u, NaN/Inf: %u, over 1e5: %u, max |x| %.5g, hash %08x, "
                   "v0 (%g %g %g %g) v1 (%g %g %g %g)\n", c->label, n, zero, bad, huge, mx, hash,
                   f0[0], f0[1], f0[2], f0[3], f1[0], f1[1], f1[2], f1[3]);
+    } else if (c->kind == 22 || c->kind == 23) {   /* indices; 23: the first u16 is not the draw's; stride bit 4: nor the last */
+        UINT isz = (c->stride & 15) == 4 ? 4 : 2, skip = c->kind == 23 ? 1 : 0, n = c->len / isz, t, lo = ~0u, hi = 0, degen = 0, first[6] = { 0 };
+        if ((c->stride & 16) && n > skip) n--;
+        for (i = skip; i < n; i++) {
+            UINT32 x; UINT16 h;
+            if (isz == 4) memcpy(&x, p + (size_t)i * 4, 4); else { memcpy(&h, p + (size_t)i * 2, 2); x = h; }
+            if (x < lo) lo = x;
+            if (x > hi) hi = x;
+            if (i - skip < 6) first[i - skip] = x;
+        }
+        n = n > skip ? n - skip : 0;
+        for (t = 0; t + 3 <= n; t += 3) {
+            UINT32 a, b, cc; UINT16 h;
+            if (isz == 4) { memcpy(&a, p + (size_t)(skip + t) * 4, 4); memcpy(&b, p + (size_t)(skip + t + 1) * 4, 4); memcpy(&cc, p + (size_t)(skip + t + 2) * 4, 4); }
+            else { memcpy(&h, p + (size_t)(skip + t) * 2, 2); a = h; memcpy(&h, p + (size_t)(skip + t + 1) * 2, 2); b = h; memcpy(&h, p + (size_t)(skip + t + 2) * 2, 2); cc = h; }
+            if (a == b || b == cc || a == cc) degen++;
+        }
+        d3d12_log("[skin-cap] %s: %u indices captured, min %u max %u, %u of %u triangles degenerate, hash %08x: %u %u %u %u %u %u\n",
+                  c->label, n, n ? lo : 0, hi, degen, n / 3, hash, first[0], first[1], first[2], first[3], first[4], first[5]);
     } else {   /* 21: the start of a shader input */
         UINT n = c->len / 4, zero = 0, bad = 0; float f[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
         for (i = 0; i < n; i++) {
@@ -5773,6 +5792,19 @@ static void mad_skin_draw(struct mad_exec *e, const struct mad_cmd *c) {
         snprintf(lab, sizeof lab, "f%ld L%u D%u s%u r#%u+%llu st%u", (long)g_skin_frame, s->list, s->ndraw, sl, r->serial,
                  (unsigned long long)off, st);
         mad_skin_capture(e, lab, r, off, (UINT)len, 20, st);
+    }
+    if (g_skin_cap_on && c->kind == MC_DRAW_INDEXED && e->ib && e->ib->buffer && c->u.drawi.icount &&
+        InterlockedIncrement(&g_skin_caps_frame) <= 96) {   /* the draw's indices: kind 22, or 23 when one u16 precedes them */
+        UINT isz = e->ib_type == WMTIndexTypeUInt32 ? 4 : 2, tail;
+        UINT64 off = e->ib_off + (UINT64)c->u.drawi.start * isz, len = (UINT64)c->u.drawi.icount * isz, lead = off & 3;
+        char lab[120];
+        off -= lead; len += lead;
+        tail = (UINT)((4 - (len & 3)) & 3);   /* a u16 after the draw's last index, read to keep the copy 4-byte sized */
+        len += tail;
+        if (len > 98304) { len = 98304; tail = 0; }
+        snprintf(lab, sizeof lab, "f%ld L%u D%u ib r#%u+%llu u%u x%u base %d", (long)g_skin_frame, s->list, s->ndraw, e->ib->serial,
+                 (unsigned long long)(off + lead), isz * 8, c->u.drawi.icount, c->u.drawi.base);
+        mad_skin_capture(e, lab, e->ib, off, (UINT)len, lead ? 23 : 22, isz | (tail ? 16u : 0u));
     }
     if (s->draw_gpu == 2 && p->backend != MADEIRA_IR_BACKEND_AIRCONV) {   /* the DXBC path logs its ranges as it builds them */
         s->ntok = 0; s->tok[0] = 0; s->nin = 0;
@@ -9117,6 +9149,32 @@ static BOOL mad_tile_based_answer(void) {
     return v ? TRUE : FALSE;
 }
 
+/* madeira-bcd: OPTIONS1.WaveOps; madeira.cfg d3d12-wave-ops = 0 reports FALSE,
+ * so an engine with a fallback picks shaders without wave intrinsics (an A/B
+ * for the converter's wave code). Horizon Zero Dawn reads OPTIONS1; when
+ * vkd3d-proton first reported wave ops, its skinned meshes broke until
+ * dxil-spirv's control-flow fix (vkd3d-proton 74a654e, 0749f46). */
+static BOOL mad_wave_ops_answer(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("d3d12-wave-ops", 1) ? 1 : 0;   /* 0: WaveOps FALSE */
+        if (!v) d3d12_log("[d3d12-caps] wave-ops=0 (d3d12-wave-ops): OPTIONS1 reports WaveOps FALSE\n");
+    }
+    return v ? TRUE : FALSE;
+}
+
+/* madeira-bcd: OPTIONS.ResourceBindingTier; madeira.cfg d3d12-binding-tier = 3
+ * reports tier 3, as Apple's D3DMetal and vkd3d-proton do (an A/B: an engine
+ * can take another binding path for it). Anything else keeps tier 2. */
+static D3D12_RESOURCE_BINDING_TIER mad_binding_tier_answer(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = mad_cfg_int_pe("d3d12-binding-tier", 2) == 3 ? 3 : 2;   /* 3: tier 3 */
+        if (v == 3) d3d12_log("[d3d12-caps] binding-tier=3 (d3d12-binding-tier): OPTIONS reports ResourceBindingTier 3\n");
+    }
+    return v == 3 ? D3D12_RESOURCE_BINDING_TIER_3 : D3D12_RESOURCE_BINDING_TIER_2;
+}
+
 static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         D3D12_FEATURE feature, void *data, UINT size) {
     (void)This;
@@ -9126,7 +9184,7 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         D3D12_FEATURE_DATA_D3D12_OPTIONS *o = data;
         if (size < sizeof *o) return E_INVALIDARG;
         memset(o, 0, sizeof *o);
-        o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_2;
+        o->ResourceBindingTier = mad_binding_tier_answer();   /* madeira-bcd: tier 2 unless d3d12-binding-tier = 3 */
         o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;   /* heaps here are descriptions; any mix is fine */
         o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
         /* ml1970: FORMAT_SUPPORT below already reports UAV_TYPED_LOAD for every
@@ -9224,7 +9282,7 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 *o = data;
         if (size < sizeof *o) return E_INVALIDARG;
         memset(o, 0, sizeof *o);
-        o->WaveOps = TRUE;
+        o->WaveOps = mad_wave_ops_answer();   /* madeira-bcd: TRUE unless d3d12-wave-ops = 0 */
         o->WaveLaneCountMin = 32;
         o->WaveLaneCountMax = 32;
         o->TotalLaneCount = 4096;
@@ -10100,6 +10158,48 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     return 1;
 }
 
+/* madeira-bcd raw-typed-views (madeira.cfg d3d12-raw-typed-views = 1, opt-in):
+ * a raw or structured buffer view also carries a texture-buffer view, as a
+ * typed view already carries the plain address. A shader that reads such a
+ * descriptor as Buffer<T> (undefined in D3D12, but native drivers return the
+ * data, and vkd3d-proton writes both kinds for every buffer view: 97e0d8e,
+ * 7201b27) otherwise reads texture id 0 here: zeros, which put vertices at the
+ * origin (ml905). The sibling's format follows native drivers: R32_UINT for
+ * raw views and every UAV, RGBA32/RG32_UINT for a structured SRV whose stride
+ * is a multiple of 16/8. Address and size stay the view's own, so raw and
+ * structured reads see what they saw before. Off: nothing changes. */
+static int g_raw_typed = -1;
+static volatile LONG g_raw_typed_made, g_raw_typed_failed;
+static int mad_raw_typed_on(void) {
+    if (g_raw_typed < 0) {
+        g_raw_typed = mad_cfg_int_pe("d3d12-raw-typed-views", 0) ? 1 : 0;
+        if (g_raw_typed)
+            d3d12_log("[raw-typed] madeira-bcd: raw and structured buffer views also carry a texture-buffer view "
+                      "(madeira.cfg d3d12-raw-typed-views)\n");
+    }
+    return g_raw_typed > 0;
+}
+static int mad_raw_typed_sibling(struct mad_device *d, struct mad_resource *r, UINT64 first, UINT64 num,
+                                 UINT64 stride, int uav, struct mad_descriptor *e) {
+    DXGI_FORMAT fmt = DXGI_FORMAT_R32_UINT; UINT64 f = 4; LONG k; int why = 0;
+    if (!stride || (stride & 3) || !num) return 0;
+    if (!uav && !(stride & 15)) { fmt = DXGI_FORMAT_R32G32B32A32_UINT; f = 16; }
+    else if (!uav && !(stride & 7)) { fmt = DXGI_FORMAT_R32G32_UINT; f = 8; }
+    if (!mad_typed_buffer_view(d, r, fmt, first * stride / f, num * stride / f, uav, e, &why)) {
+        k = InterlockedIncrement(&g_raw_typed_failed);
+        if (k <= 8 || !(k & (k - 1)))
+            d3d12_log("[raw-typed] no texture-buffer view for a %s view (stride %llu, first %llu, num %llu, buffer %llu bytes): "
+                      "reason %d; plain descriptor as before (%ld so far)\n", uav ? "UAV" : "SRV", (unsigned long long)stride,
+                      (unsigned long long)first, (unsigned long long)num, (unsigned long long)r->size, why, (long)k);
+        return 0;
+    }
+    k = InterlockedIncrement(&g_raw_typed_made);
+    if (k <= 4 || !(k & (k - 1)))
+        d3d12_log("[raw-typed] %s view stride %llu -> format %u texture-buffer view (%ld so far, %ld refused)\n",
+                  uav ? "UAV" : "SRV", (unsigned long long)stride, (unsigned)fmt, (long)k, (long)g_raw_typed_failed);
+    return 1;
+}
+
 /* ml913: the texture resource id a descriptor should carry for a view of the
  * given D3D dimension and sub-range. The base texture when it already matches;
  * otherwise a (cached) Metal texture view of the right type. */
@@ -10282,7 +10382,10 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
             }
         }
         if (g_view_census && (first + num) * stride > r->size && mad_vc_on()) mad_vc_past(r, 1, first, num, stride);   /* madeira-bcd view-census */
-        mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
+        if (!counter && desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER &&
+            (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) && mad_raw_typed_on() &&
+            mad_raw_typed_sibling((struct mad_device *)This, r, first, num, stride, 1, e)) ;   /* madeira-bcd raw-typed-views */
+        else mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
         {   /* remember this view's counter (or forget a stale one) */
             struct mad_resource *cr = (struct mad_resource *)counter;
             UINT64 cva = 0;
@@ -12491,6 +12594,9 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
             }
         }
         if (g_view_census && (first + num) * stride > r->size && mad_vc_on()) mad_vc_past(r, 0, first, num, stride);   /* madeira-bcd view-census */
+        if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER &&
+            (desc->Buffer.StructureByteStride || (desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) && mad_raw_typed_on() &&
+            mad_raw_typed_sibling((struct mad_device *)This, r, first, num, stride, 0, e)) return;   /* madeira-bcd raw-typed-views */
         mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
         return;
     }

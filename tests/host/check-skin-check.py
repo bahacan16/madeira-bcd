@@ -164,7 +164,7 @@ harness = r'''
 #include <stdint.h>
 #include <stdarg.h>
 #include <math.h>
-typedef uint32_t UINT32; typedef unsigned UINT; typedef long LONG; typedef uint64_t UINT64; typedef uint8_t UINT8;
+typedef uint32_t UINT32; typedef unsigned UINT; typedef long LONG; typedef uint64_t UINT64; typedef uint8_t UINT8; typedef uint16_t UINT16;
 typedef int DXGI_FORMAT; typedef void *obj_handle_t;
 typedef struct { int x; } SRWLOCK, CRITICAL_SECTION;
 #define SRWLOCK_INIT { 0 }

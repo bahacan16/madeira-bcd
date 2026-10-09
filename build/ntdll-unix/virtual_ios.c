@@ -22302,6 +22302,57 @@ static BOOL ios_subfloor_window_held( ULONG_PTR low, ULONG_PTR real )
     return FALSE;
 }
 
+/* madeira-bcd: madeira.cfg ignore-volatile-metadata = 1 (opt-in). FEX runs an
+ * image that carries PE volatile metadata (MSVC's /volatileMetadata, on by
+ * default for x64 since VS 2019) without TSO ordering for every instruction the
+ * metadata does not list, as Windows' x64 emulator does (FEX ImageTracker::
+ * HandleImageMap -> AddForceTSOInformation). Code that orders plain loads and
+ * stores through x86's own memory model then runs relaxed: GhostOfTsushima.exe
+ * carries 5424 entries (build 336), Horizon Zero Dawn's concrt140.dll 1795
+ * (build 481); HorizonZeroDawn.exe and the Rockstar games carry none. With the
+ * switch on, an x64 image's VolatileMetadataPointer is cleared here, after
+ * relocation and before the PE side or FEX reads it, so FEX applies its own TSO
+ * settings to the whole image. Off: nothing changes. */
+static void ios_ignore_volatile_metadata( char *base, SIZE_T total_size, IMAGE_NT_HEADERS *nt,
+                                          ULONG_PTR pref_base, const UNICODE_STRING *nt_name )
+{
+    static int enabled = -1;
+    static unsigned said;
+    IMAGE_NT_HEADERS64 *nt64 = (IMAGE_NT_HEADERS64 *)nt;
+    IMAGE_DATA_DIRECTORY *dir;
+    IMAGE_LOAD_CONFIG_DIRECTORY64 *lc;
+    ULONGLONG va, rva = ~0ull;
+    unsigned accesses = 0, ranges = 0;
+    const SIZE_T need = offsetof( IMAGE_LOAD_CONFIG_DIRECTORY64, VolatileMetadataPointer ) + sizeof(ULONGLONG);
+
+    if (enabled < 0) enabled = madeira_cfg_bool( "ignore-volatile-metadata", 0 );
+    if (!enabled) return;
+    if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt64->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG) return;
+    dir = &nt64->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    if (!dir->VirtualAddress || !dir->Size || dir->VirtualAddress >= total_size ||
+        total_size - dir->VirtualAddress < need) return;
+    lc = (IMAGE_LOAD_CONFIG_DIRECTORY64 *)(base + dir->VirtualAddress);
+    if (lc->Size < need || !(va = lc->VolatileMetadataPointer)) return;
+    /* A VA: relocated with the image, or still at the preferred base (ml949). */
+    if (va >= nt64->OptionalHeader.ImageBase && va - nt64->OptionalHeader.ImageBase < total_size)
+        rva = va - nt64->OptionalHeader.ImageBase;
+    else if (va >= pref_base && va - pref_base < total_size)
+        rva = va - pref_base;
+    if (rva != ~0ull && rva + 6 * sizeof(DWORD) <= total_size)
+    {   /* IMAGE_VOLATILE_METADATA: Size, Version, access table + size, range table + size */
+        const DWORD *md = (const DWORD *)(base + rva);
+        accesses = md[3] / 4;
+        ranges = md[5] / 8;
+    }
+    lc->VolatileMetadataPointer = 0;
+    if (said++ < 32)
+        dprintf( 2, "[fex-vmeta] madeira-bcd: %s at %p: volatile metadata (%u accesses, %u ranges) cleared; FEX orders "
+                    "the whole image by its TSO settings (ignore-volatile-metadata)\n",
+                 debugstr_us(nt_name), base, accesses, ranges );
+}
+
 
 /***********************************************************************
  *           map_image_into_view
@@ -22700,6 +22751,8 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
     }
     /* madeira-bcd: [sc-rph], before the protections and the JIT-pool copy. */
     ios_sc_render_handler_patch( ptr, total_size, nt, sec, nt_name );
+    /* madeira-bcd: [fex-vmeta], likewise (opt-in, ignore-volatile-metadata). */
+    ios_ignore_volatile_metadata( ptr, total_size, nt, (ULONG_PTR)image_info->base, nt_name );
 
     /* madeira-bcd [x64-image]: decided before any protection is set, so both
      * the section pass and the eager copy loop below see the mark (see
