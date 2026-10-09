@@ -51,9 +51,13 @@ struct GameRecommendation: Equatable {
     var semaphoreFastPath: Bool? = nil
     /// LibraryEntry.fpsMode: 1 = 60, 3 = 30, 4 = 40, 0 = display maximum, 2 = uncapped.
     var fpsMode: Int? = nil
-    /// "WxH". nil keeps the device's own default, which is what the lists
-    /// recorded as 1408x648 were on a 19.5:9 iPhone.
+    /// "WxH", or `GameRecommendation.screen720`. nil keeps the device's own
+    /// default, which is what the lists recorded as 1408x648 were on a 19.5:9 iPhone.
     var resolution: String? = nil
+    /// `resolution`: this screen's shape at 720 lines (ResolutionChoices.screen720,
+    /// 1568x720 on a 19.5:9 iPhone), for games that offer full screen only at 720
+    /// lines or more. A screen whose default already has them keeps its default.
+    static let screen720 = "screen@720"
     /// Aspect & scaling (DisplayMode raw value); "fit" is the default.
     var display: String? = nil
 
@@ -76,7 +80,7 @@ struct GameRecommendation: Equatable {
             let label = [1: "60", 3: "30", 4: "40", 0: "display maximum", 2: "uncapped"][fpsMode] ?? "\(fpsMode)"
             parts.append("FPS limit \(label)")
         }
-        if let resolution { parts.append(resolution) }
+        if let resolution { parts.append(resolution == Self.screen720 ? "this screen's shape at 720 lines" : resolution) }
         return parts.joined(separator: ", ")
     }
 }
@@ -85,10 +89,12 @@ enum GameRecommendations {
     // MARK: The lists
 
     /// Red Dead Redemption 2 from Steam, through Madeira Dock: the build 463
-    /// list, plus build 466's memory and ExecuteIndirect switches and the DXGI
-    /// monitor identity and mode list for Borderless / Full Screen.
+    /// list, plus build 466's memory and ExecuteIndirect switches, the DXGI
+    /// monitor identity and mode list for Borderless / Full Screen (which no
+    /// longer crash, 2026-10-09 11:34), and build 467's full-screen window and
+    /// 720-line screen, the least RDR2 offers in full screen.
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 2,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 3,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -105,6 +111,7 @@ enum GameRecommendations {
         fence-chain = 6
         avail-phys = 1
         indirect-fast = 1
+        fullscreen-window = 1
         env.WINE_D3D_CONFIG = renderer=no3d
         env.FEX_VECTORTSOENABLED = 0
         env.MADEIRA_BAND_CENSUS = 1
@@ -135,7 +142,7 @@ enum GameRecommendations {
         env.MADEIRA_METAL_HUD_MAIN = 1
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, semaphoreFastPath: false,
-        display: "fit")
+        resolution: GameRecommendation.screen720, display: "fit")
 
     /// GTA V Enhanced from Steam, through Madeira Dock (build 456: 18 minutes
     /// idle and 19 minutes of fast driving without a crash, 33-40 FPS at 40).

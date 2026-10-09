@@ -15998,21 +15998,68 @@ static HRESULT STDMETHODCALLTYPE swap_GetBuffer(IDXGISwapChain4 *T, UINT i, REFI
     if (i >= s->nbuf) return DXGI_ERROR_INVALID_CALL;
     return res_QI((ID3D12Resource *)s->buffers[i], riid, out);
 }
+/* madeira-bcd: fullscreen-window (madeira.cfg fullscreen-window = 1, opt-in).
+ * Windows' DXGI moves a swapchain's window to its output's top-left corner and
+ * over the whole output when it enters full screen; this runtime only records
+ * the state. Red Dead Redemption 2 then sizes its window to the chosen mode
+ * without moving it (SWP_NOMOVE, owner's run of 2026-10-09 11:34): the window
+ * kept the x = 64 it had while windowed, and the green Wine desktop showed
+ * beside it. With the switch, entering full screen moves the window over the
+ * whole monitor first, posted to the window's thread as the game's own moves are
+ * (SWP_ASYNCWINDOWPOS), so the game's resize that follows starts at the corner.
+ * user32 is looked up only then, so this DLL's imports stay as they were. */
+static int g_fs_window = -1;
+static volatile LONG g_fs_window_n;
+static int mad_swap_fullscreen_window(struct mad_swapchain *s) {
+    typedef BOOL (WINAPI *is_window_fn)(HWND);
+    typedef HMONITOR (WINAPI *monitor_fn)(HWND, DWORD);
+    typedef BOOL (WINAPI *info_fn)(HMONITOR, MONITORINFO *);
+    typedef BOOL (WINAPI *pos_fn)(HWND, HWND, int, int, int, int, UINT);
+    HMODULE u;
+    is_window_fn is_window; monitor_fn monitor; info_fn info; pos_fn pos;
+    HMONITOR mon; MONITORINFO mi; BOOL ok; LONG n;
+    if (g_fs_window < 0) {
+        g_fs_window = mad_cfg_int_pe("fullscreen-window", 0) ? 1 : 0;   /* madeira.cfg fullscreen-window = 1 */
+        if (g_fs_window)
+            d3d12_log("[madeira-d3d12] fullscreen-window = 1: entering full screen moves the window over the whole "
+                      "monitor, as Windows does\n");
+    }
+    if (!g_fs_window || !s->hwnd) return 0;
+    if (!(u = GetModuleHandleW(L"user32.dll"))) return 0;   /* a process with a window has it loaded */
+    is_window = (is_window_fn)(void *)GetProcAddress(u, "IsWindow");
+    monitor = (monitor_fn)(void *)GetProcAddress(u, "MonitorFromWindow");
+    info = (info_fn)(void *)GetProcAddress(u, "GetMonitorInfoW");
+    pos = (pos_fn)(void *)GetProcAddress(u, "SetWindowPos");
+    if (!is_window || !monitor || !info || !pos || !is_window(s->hwnd)) return 0;
+    if (!(mon = monitor(s->hwnd, MONITOR_DEFAULTTOPRIMARY))) return 0;
+    memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
+    if (!info(mon, &mi)) return 0;
+    ok = pos(s->hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+             mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    if ((n = InterlockedIncrement(&g_fs_window_n)) <= 16 || (n % 100) == 0)
+        mad_swd_log("[swap-diag] fullscreen-window #%ld: window %p moved over the monitor {%ld,%ld,%ld,%ld}%s\n", (long)n,
+                    (void *)s->hwnd, (long)mi.rcMonitor.left, (long)mi.rcMonitor.top, (long)mi.rcMonitor.right,
+                    (long)mi.rcMonitor.bottom, ok ? "" : " -- SetWindowPos failed");
+    return ok ? 1 : 0;
+}
 static HRESULT STDMETHODCALLTYPE swap_SetFullscreenState(IDXGISwapChain4 *T, BOOL fs, IDXGIOutput *target) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     UINT64 t0 = mad_tick();   /* madeira-bcd: [swap-diag] */
     LONG seq;
-    int say = mad_swd_take(&g_swd_fs_n, &seq), was = !s->fs.Windowed;
+    int say = mad_swd_take(&g_swd_fs_n, &seq), was = !s->fs.Windowed, moved = 0;
     if (say)
         mad_swd_log("[swap-diag] #%ld SetFullscreenState(%d, output %p) enter: swapchain %p hwnd %p %ux%u, fullscreen was %d, "
                     "tid %04lx\n", (long)seq, fs, (void *)target, (void *)s, (void *)s->hwnd, s->desc.Width, s->desc.Height,
                     was, (unsigned long)GetCurrentThreadId());
     /* The window is what the desktop says it is; fullscreen is recorded so the
-     * application reads back what it set, and changes nothing else. */
+     * application reads back what it set, and changes nothing else (but see
+     * fullscreen-window above). */
     s->fs.Windowed = !fs;
+    if (fs && !was) moved = mad_swap_fullscreen_window(s);
     if (say)
-        mad_swd_log("[swap-diag] #%ld SetFullscreenState -> S_OK in %.2f ms: fullscreen %d -> %d, recorded only (no window "
-                    "style, size, display mode or layer change)\n", (long)seq, mad_swd_ms(t0), was, !s->fs.Windowed);
+        mad_swd_log("[swap-diag] #%ld SetFullscreenState -> S_OK in %.2f ms: fullscreen %d -> %d, %s\n", (long)seq,
+                    mad_swd_ms(t0), was, !s->fs.Windowed, moved ? "window moved over the monitor (fullscreen-window), "
+                    "no style, display mode or layer change" : "recorded only (no window style, size, display mode or layer change)");
     return S_OK;
 }
 /* madeira-bcd: [swap-diag] a game may ask every frame, so: the first 16 calls,

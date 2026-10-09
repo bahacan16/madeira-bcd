@@ -182,7 +182,11 @@ extension GameRecommendations {
         if let on = rec.fastSync { entry.fastSync = on }
         if let on = rec.semaphoreFastPath { entry.semaphoreFastPath = on }
         if let mode = rec.fpsMode { entry.fpsMode = mode }
-        if let size = rec.resolution { entry.resolution = size }
+        if let size = rec.resolution {
+            // This screen's shape at 720 lines; a screen whose default has them keeps its own.
+            if size != GameRecommendation.screen720 { entry.resolution = size }
+            else if let lines720 = ResolutionChoices.screen720Value { entry.resolution = lines720 }
+        }
         if let mode = rec.display { entry.display = mode == DisplayMode.fit.rawValue ? nil : mode }
     }
 

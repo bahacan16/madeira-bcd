@@ -222,6 +222,23 @@ enum ResolutionChoices {
     static func defaultSize(for s: Screen = screen) -> (w: Int, h: Int) { shape(s, pixels: budgets[defaultBudget].pixels) }
     static var defaultValue: String { let d = defaultSize(); return "\(d.w)x\(d.h)" }
 
+    /// madeira-bcd: the screen's shape at `lines` lines, the width a multiple of 8.
+    static func lines(_ s: Screen, _ lines: Int) -> (w: Int, h: Int) {
+        (Int((Double(lines) * aspect(s) / 8).rounded()) * 8, lines)
+    }
+
+    /// madeira-bcd: this screen's shape at 720 lines (1568x720 on a 19.5:9 iPhone),
+    /// offered when the default has fewer lines. Red Dead Redemption 2 lists only
+    /// modes of at least 720 lines for full screen, so on a phone, whose default
+    /// is 1408x648, it offered 960x720 and 1024x768 and the picture did not fill
+    /// the screen (owner's run of 2026-10-09 11:34). A game's recommended settings
+    /// name it as GameRecommendation.screen720.
+    static func screen720(for s: Screen = screen) -> (w: Int, h: Int)? {
+        let d = defaultSize(for: s), l = lines(s, 720), native = Int(s.pixels.width) * Int(s.pixels.height)
+        return d.h < 720 && l.w * l.h < native ? l : nil
+    }
+    static var screen720Value: String? { screen720().map { "\($0.w)x\($0.h)" } }
+
     static func groups(for s: Screen = screen) -> [Group] {
         let native = (w: Int(s.pixels.width), h: Int(s.pixels.height))
         var own: [Choice] = []
@@ -230,6 +247,9 @@ enum ResolutionChoices {
             // More pixels than the screen has only cost more (never the light or default size).
             if i > defaultBudget && w * h >= native.w * native.h { break }
             own.append(Choice(w: w, h: h, label: "\(w)×\(h) · \(b.name)"))
+            if i == defaultBudget, let l = screen720(for: s) {
+                own.append(Choice(w: l.w, h: l.h, label: "\(l.w)×\(l.h) · 720 lines"))
+            }
         }
         if native.w <= 3840, native.h <= 2160, !own.contains(where: { $0.w == native.w && $0.h == native.h }) {
             own.append(Choice(w: native.w, h: native.h, label: "\(native.w)×\(native.h) · native"))

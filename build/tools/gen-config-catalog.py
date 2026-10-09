@@ -105,6 +105,12 @@ OVERLAY = {
                         "command buffer, each kind of command (draws, dispatches, copies, clears, barriers, render "
                         "targets, queries, state) and the end of each list. For finding why a game's frame is slow "
                         "when the GPU is not busy."},
+    "fullscreen-window": {"category": "Direct3D 12", "title": "Full screen moves the game's window over the whole screen",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: when a Direct3D 12 game switches to full screen, its window is moved to the "
+                        "screen's top-left corner and over the whole screen first, as Windows does; the game then "
+                        "sizes it to the chosen mode. Without it a game that only resizes its window (Red Dead "
+                        "Redemption 2) keeps it where it was, beside the Wine desktop. Read once per session."},
     "indirect-fast": {"category": "Direct3D 12", "title": "Encode ExecuteIndirect records without per-record setup",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: after the first record of an ExecuteIndirect, the other records (which share "

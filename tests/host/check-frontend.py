@@ -400,8 +400,11 @@ expect(ig.map(\.title) == ["This screen's shape", "16:9 widescreen · bars above
 expect(sizes(ig[1]) == ["960x540", "1280x720", "1600x900", "1920x1080", "2560x1440"] && sizes(ig[2]) == ["640x480", "800x600", "1024x768", "1280x960"],
        "iPad 11: the 16:9 and 4:3 sizes")
 expect(!RC.fills(1408, 648, screen: ipad) && RC.fills(1408, 648, screen: phone16), "1408x648 is a phone's shape, not an iPad's")
-expect(RC.defaultSize(for: phone16) == (1408, 648) && sizes(RC.groups(for: phone16)[0]) == ["1168x536", "1408x648", "2120x976", "2868x1320"],
-       "iPhone 16 Pro Max: its own shape; the default stays 1408x648, its ≈720p")
+expect(RC.defaultSize(for: phone16) == (1408, 648) && sizes(RC.groups(for: phone16)[0]) == ["1168x536", "1408x648", "1568x720", "2120x976", "2868x1320"],
+       "iPhone 16 Pro Max: its own shape; the default stays 1408x648, its ≈720p; 720 lines for games that need them")
+expect(RC.groups(for: phone16)[0].choices[2].label == "1568×720 · 720 lines" && RC.screen720(for: phone16)! == (1568, 720)
+       && RC.screen720(for: ipad) == nil && RC.screen720(for: screenOf(667, 375, 1334, 750)) == nil,
+       "720 lines only where the default has fewer (a phone), in the screen's shape")
 let g13 = RC.groups(for: ipad13)
 expect(g13[2].title == "4:3 classic · fills this screen" && RC.defaultSize(for: ipad13).h > 0, "iPad 13: 4:3 fills the screen")
 let seG = RC.groups(for: screenOf(667, 375, 1334, 750))
