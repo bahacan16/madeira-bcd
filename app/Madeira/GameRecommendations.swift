@@ -259,9 +259,12 @@ enum GameRecommendations {
     /// 466 refused (the game then crashed); MFC ships with build 468. Build 469
     /// drew the first frame and hung (a pipeline without a pixel shader, fixed
     /// in 471); DXGI now lists the virtual monitor's own modes, as user32 does,
-    /// so the game can pick this screen's resolution.
+    /// so the game can pick this screen's resolution. Build 471 reached the
+    /// language menu at 56 FPS with no input at all: no window was foreground,
+    /// so its raw keyboard and mouse input went nowhere, and it reads its pad
+    /// only through Windows.Gaming.Input; build 475's two switches cover both.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 2,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 3,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -269,6 +272,8 @@ enum GameRecommendations {
         swap-mb = 3072
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
+        env.MADEIRA_INPUT_FOREGROUND = 1
+        env.MADEIRA_WGI_HOST_PADS = 1
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
 

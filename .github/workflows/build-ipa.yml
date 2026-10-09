@@ -1199,6 +1199,15 @@ jobs:
           python3 tests/host/check-null-fragment.py
           python3 tests/host/check-rsig-miss.py
 
+      # madeira-bcd: Horizon Zero Dawn got no input (build 471): XInput pads as
+      # Windows.Gaming.Input gamepads (MADEIRA_WGI_HOST_PADS=1) and the opt-in
+      # foreground for a process when no window is foreground
+      # (MADEIRA_INPUT_FOREGROUND=1).
+      - name: Check XInput pads in Windows.Gaming.Input and the input foreground
+        run: |
+          python3 tests/host/check-wgi-host-pads.py
+          python3 tests/host/check-input-foreground.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked

@@ -106,6 +106,8 @@ static BOOL winios_drv_set_cursor_pos( INT x, INT y )
     return TRUE;
 }
 
+static void ios_foreground_if_none( const char *why );   /* madeira-bcd, MADEIRA_INPUT_FOREGROUND, below */
+
 /* C bridge for Winios.m to inject mouse input without pulling in Wine
  * headers into Obj-C (where INPUT/HWND/etc. would conflict with UIKit
  * types). Call this from pProcessEvents drain or directly from a
@@ -129,6 +131,7 @@ void winios_drv_post_mouse(int x, int y, unsigned int flags, unsigned int mouse_
      * Call win32u's send_hardware_message directly (same library) instead
      * of the NtUserCallHwndParam inline — we get the raw NTSTATUS and skip
      * a dispatch layer that can fail for its own reasons. */
+    ios_foreground_if_none( "an injected mouse event" );
     NTSTATUS st = send_hardware_message( NULL, 0, &input, 0 );
     {
         static unsigned cnt;
@@ -212,6 +215,7 @@ void winios_drv_post_key(unsigned short vk, unsigned int flags)
     input.ki.time        = 0;
     input.ki.dwExtraInfo = 0;
 
+    ios_foreground_if_none( "an injected key" );
     st = send_hardware_message( NULL, 0, &input, 0 );
     {
         /* ml647: COUNT EVENTS, and never let a cap masquerade as absence. The
@@ -670,6 +674,7 @@ static void ios_apply_fullscreen_foreground(void)
 static BOOL winios_drv_process_events( DWORD mask )
 {
     if (ios_show_foreground) ios_apply_fullscreen_foreground();
+    ios_foreground_if_none( "a message poll" );
     return winios_pProcessEvents ? winios_pProcessEvents( mask ) : FALSE;
 }
 
@@ -2711,6 +2716,53 @@ static HWND ios_main_window( DWORD pid )
     }
     free( list );
     return best;
+}
+
+/* madeira-bcd: NOBODY IN FRONT (opt-in, MADEIRA_INPUT_FOREGROUND=1). Horizon
+ * Zero Dawn on build 471 (2026-10-09 15:01) showed its window "DX12" through
+ * style changes and SetWindowPos with SWP_NOACTIVATE only, and it reads no
+ * XInput (it uses Windows.Gaming.Input), so neither the show rule above nor
+ * ios_foreground_check made it foreground: GetForegroundWindow() stayed NULL
+ * ([swap-win] ... fg=0x0). The wineserver queues WM_INPUT only for the
+ * foreground process (queue_ios.c get_foreground_thread) and sends keys to the
+ * foreground thread's focus, so its language menu got none of the Enter
+ * presses (drv_post_key status 0) and none of the taps. With the switch, while
+ * no window at all is foreground, a wine thread polling its messages or posting
+ * injected input makes its process's main window (ios_main_window: the largest
+ * visible top-level window of 320x200 or more) foreground. Never while some
+ * window is foreground, so it cannot take the foreground from another process.
+ * At most every 250 ms. Logs [fg-none] (16 lines). */
+static void ios_foreground_if_none( const char *why )
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static long long next_ns;
+    static int enabled = -1;
+    static unsigned int said;
+    DWORD pid = GetCurrentProcessId();
+    HWND main_hwnd;
+    struct timespec ts;
+    long long now;
+    BOOL ok;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_INPUT_FOREGROUND" );  /* 1: while no window is foreground, a process polling messages or posting input makes its main window foreground */
+        enabled = e && e[0] == '1' && !e[1];
+    }
+    if (!enabled || NtUserGetForegroundWindow()) return;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    if (pthread_mutex_trylock( &lock )) return;
+    if (now < next_ns) { pthread_mutex_unlock( &lock ); return; }
+    next_ns = now + 250000000LL;
+    pthread_mutex_unlock( &lock );
+
+    if (!(main_hwnd = ios_main_window( pid ))) return;
+    ok = set_foreground_window( main_hwnd, FALSE, TRUE );
+    if (__atomic_fetch_add( &said, 1, __ATOMIC_RELAXED ) < 16)
+        dprintf( 2, "[fg-none] no window was foreground: made the main window %p of pid %04x foreground "
+                 "on %s, ok=%d (MADEIRA_INPUT_FOREGROUND=1)\n", main_hwnd, (unsigned)pid, why, ok );
 }
 
 static void ios_foreground_check(void)

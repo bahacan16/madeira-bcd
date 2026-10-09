@@ -379,6 +379,33 @@ top-level window foreground and active, checking at most once a second; a
 window of the same process already in front is left alone. `[fg]` logs the first
 activations. `env.MADEIRA_FOREGROUND_FIX = 0` turns this off.
 
+A game that reads no XInput is not covered by that rule, and Windows sends raw
+keyboard and mouse input only to the process in front. Horizon Zero Dawn
+(madeira-bcd build 471) showed its window with `SWP_NOACTIVATE` only, reads its
+pad through Windows.Gaming.Input, and nothing was in front at all
+(`GetForegroundWindow()` NULL), so it ignored every key and tap. With
+`env.MADEIRA_INPUT_FOREGROUND = 1` (opt-in), while no window at all is in
+front, a process that polls its messages or receives an injected key or mouse
+event makes its largest visible top-level window (at least 320x200) foreground,
+at most every 250 ms; never while another window is in front. `[fg-none]` logs
+the first activations.
+
+## Windows.Gaming.Input
+
+Wine's windows.gaming.input lists HID devices only, and counts one as a Gamepad
+only when it is an XInput-compatible (winexinput) device, so on iOS a game
+that reads its controller only through `Windows.Gaming.Input.Gamepad` sees
+none: in XInput mode there is no HID device, in HID mode player 1 is a
+DualSense, a raw game controller. With `env.MADEIRA_WGI_HOST_PADS = 1`
+(opt-in), the madeira-bcd build of windows.gaming.input.dll
+(`tools/patch-wine-wgi-host-pads.py`, built by `tools/build-wine-extra-dlls.sh`)
+also lists each connected XInput slot (through `XInputGetState`, i.e. the pads
+described above) as a Gamepad, an Xbox 360 pad to the game; rumble goes back
+through `XInputSetState`. The slots are polled twice a second for arrivals and
+removals; the first poll runs before the game gets its first gamepad list.
+A game reading both APIs could list a pad twice, so it is per game.
+`[wgi-host]` lines log the switch and each slot change.
+
 ## Integration prerequisite
 
 The XInput path needs [the Wine change](https://github.com/willfaust/wine/pull/1),

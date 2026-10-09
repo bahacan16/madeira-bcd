@@ -139,6 +139,22 @@ OVERLAY = {
                         "launcher or message box, the arrow is drawn where the finger last touched (where the click "
                         "lands) and goes away with the box. Tap the button itself to press it. 0: no cursor, as "
                         "before. Desktop (Dock) sessions keep their own cursor."},
+    # madeira-bcd: Horizon Zero Dawn on build 471 got no input at all.
+    "env.MADEIRA_INPUT_FOREGROUND": {"category": "Windows, display & input",
+                "title": "Bring the game to the front when no window is",
+                "kind": "bool", "default": "0",
+                "note": "Default off. iOS has no window manager: a game that shows its window without activating "
+                        "it and reads no XInput stays in the background, and Windows sends raw keyboard and mouse "
+                        "input only to the program in front (Horizon Zero Dawn ignored every key and tap). 1: while "
+                        "no window at all is in front, the game's main window is brought to the front when it polls "
+                        "its messages or a key or tap arrives. Never while another window is in front."},
+    "env.MADEIRA_WGI_HOST_PADS": {"category": "Controllers", "title": "Controllers in Windows.Gaming.Input",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: each connected XInput controller (a paired pad or the touch controller) "
+                        "is also a Windows.Gaming.Input gamepad, an Xbox pad to the game, with rumble. For games "
+                        "that read their controller only that way (Horizon Zero Dawn); a game that also reads "
+                        "XInput could list it twice. Read when the game first asks for a gamepad.",
+                "sources": ["tools/patch-wine-wgi-host-pads.py"]},
     # madeira-bcd: tools/patch-winemetal-null-fragment.py (winemetal reads it).
     "gs-null-fragment": {"category": "Direct3D 12", "title": "Empty fragment function for pipelines without a pixel shader",
                 "kind": "bool", "default": "1", "sources": ["tools/patch-winemetal-null-fragment.py"],

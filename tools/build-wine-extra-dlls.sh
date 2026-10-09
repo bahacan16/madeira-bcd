@@ -54,7 +54,16 @@ if [ "${MADEIRA_XINPUT_RUMBLE_BUILD:-1}" != 0 ]; then
         targets="$targets dlls/$d/arm64ec-windows/$d.dll"; XI="$XI $d"
     done
 fi
-[ -n "$todo$XI" ] || { echo "nothing to build"; exit 0; }
+# madeira-bcd: the second exception. windows.gaming.input is rebuilt with
+# tools/patch-wine-wgi-host-pads.py, so a game reading only
+# Windows.Gaming.Input.Gamepad sees the XInput pads (opt-in at run time:
+# MADEIRA_WGI_HOST_PADS=1; without it the DLL behaves as the shipped one). A
+# failed build keeps the shipped copy. MADEIRA_WGI_HOST_PADS_BUILD=0 skips it.
+WGI=""
+if [ "${MADEIRA_WGI_HOST_PADS_BUILD:-1}" != 0 ] && [ -d "$R/wine/dlls/windows.gaming.input" ]; then
+    targets="$targets dlls/windows.gaming.input/arm64ec-windows/windows.gaming.input.dll"; WGI=windows.gaming.input
+fi
+[ -n "$todo$XI$WGI" ] || { echo "nothing to build"; exit 0; }
 
 # The cached tree may have disabled winegstreamer because macOS has no
 # GStreamer headers. Only its real PE frontend is needed here; the iOS unix
@@ -81,6 +90,12 @@ if [ -n "$XI" ]; then
     # Old objects from an unpatched build must not satisfy make.
     for d in $XI; do rm -f "$B/dlls/$d/arm64ec-windows/$d.dll" "$B/dlls/$d"/arm64ec-windows/*.o; done
 fi
+wgi_patched=0
+if [ -n "$WGI" ]; then
+    python3 "$R/tools/patch-wine-wgi-host-pads.py" "$R/wine/dlls/windows.gaming.input" && wgi_patched=1
+    rm -f "$B/dlls/windows.gaming.input/arm64ec-windows/windows.gaming.input.dll" \
+          "$B/dlls/windows.gaming.input"/arm64ec-windows/*.o
+fi
 # Delay imports become plain imports. lld's ARM64EC delay-load stub is x64 code
 # inside .text (`lea rax, __imp_aux_X; jmp __tailMerge`), and the pool copy
 # Madeira runs ARM64EC code from relocates the delay IAT to the stub's POOL
@@ -103,7 +118,8 @@ for d in $todo; do
     undelayed="$undelayed $d"
 done
 make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
-git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c dlls/d2d1/dc_render_target.c
+git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c dlls/d2d1/dc_render_target.c \
+    dlls/windows.gaming.input/provider.c dlls/windows.gaming.input/main.c
 for d in $undelayed; do git -C "$R/wine" checkout -- "dlls/$d/Makefile.in"; done
 [ -n "$undelayed" ] && echo "::notice::delay imports linked as plain imports:$undelayed"
 xi_built=0; xi_failed=""
@@ -127,6 +143,27 @@ PY
     echo "::notice::xinput with host rumble (ml2106): replaced $xi_built shipped DLLs${xi_failed:+ (failed, shipped copy kept:$xi_failed)}"
 elif [ -n "$XI" ]; then
     echo "::warning::xinput rumble patch did not apply; shipped xinput DLLs kept"
+fi
+if [ "$wgi_patched" = 1 ]; then
+    f="$B/dlls/windows.gaming.input/arm64ec-windows/windows.gaming.input.dll"
+    if [ -f "$f" ]; then
+        cp "$f" "$SHIP/windows.gaming.input.dll.tmp"
+        "$MINGW/llvm-strip" "$SHIP/windows.gaming.input.dll.tmp"
+        python3 - "$SHIP/windows.gaming.input.dll.tmp" <<'PY'
+import struct, sys
+p = sys.argv[1]; d = open(p, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+target = struct.unpack_from('<I', d, pe + 24 + 56)[0] + 0x10000
+if len(d) < target:
+    open(p, 'ab').write(b'\0' * (target - len(d)))
+PY
+        mv "$SHIP/windows.gaming.input.dll.tmp" "$SHIP/windows.gaming.input.dll"
+        echo "::notice::windows.gaming.input with XInput pads as gamepads (MADEIRA_WGI_HOST_PADS=1): replaced the shipped DLL"
+    else
+        echo "::warning::windows.gaming.input with XInput pads did not build; shipped DLL kept"
+    fi
+elif [ -n "$WGI" ]; then
+    echo "::warning::windows.gaming.input host-pad patch did not apply; shipped DLL kept"
 fi
 built=0; failed=""
 for d in $todo; do
