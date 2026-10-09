@@ -91,10 +91,12 @@ enum GameRecommendations {
     /// Red Dead Redemption 2 from Steam, through Madeira Dock: the build 463
     /// list, plus build 466's memory and ExecuteIndirect switches, the DXGI
     /// monitor identity and mode list for Borderless / Full Screen (which no
-    /// longer crash, 2026-10-09 11:34), and build 467's full-screen window and
-    /// 720-line screen, the least RDR2 offers in full screen.
+    /// longer crash, 2026-10-09 11:34), build 467's full-screen window and
+    /// 720-line screen, the least RDR2 offers in full screen (which fits the
+    /// screen, 13:09), and build 470's test: the swap file also takes the 1-4 MB
+    /// blocks (the game still reached the 8 GB limit a minute into play).
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 3,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 4,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -107,6 +109,7 @@ enum GameRecommendations {
         vram-mb = 2304
         swap-mb = 8192
         swap-mode = 2
+        swap-min-mb = 1
         pso-warm = 2
         fence-chain = 6
         avail-phys = 1

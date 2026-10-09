@@ -425,6 +425,13 @@ static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
 static volatile LONG64 g_reserved_live_bytes; static volatile LONG g_reserved_live_n;   /* madeira-bcd: d3d12-tiled-resources */
+/* madeira-bcd metal-gap: what the ml1150 line's Metal total is made of, beyond
+ * the ml1057 estimate. Red Dead Redemption 2 (build 467, 13:09) grew Metal's
+ * currentAllocatedSize from 2366 to 2931 MB in its last minute while the
+ * estimate stayed at ~1.55 GB. Standalone textures as Metal sizes them
+ * (heapTextureSizeAndAlign, so page rounding shows), the argument ring chunks
+ * (64 KB each, pooled and never freed), and the frees still waiting for the GPU. */
+static volatile LONG64 g_sa_tex_bytes, g_sa_tex_logical, g_mheap_bytes; static volatile LONG g_sa_tex_n, g_ring_chunks;
 static int mad_upload_swap_on(void);
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
@@ -788,6 +795,7 @@ struct mad_resource {
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
+    UINT64 metal_bytes;      /* madeira-bcd metal-gap: a standalone texture, as Metal sizes it (0 = not counted) */
 };
 /* srv_res / uav_res membership, O(1) through the resource's slot (the linear
  * scan it replaces ran over ~15,000 textures on every view creation). */
@@ -3418,6 +3426,7 @@ static int mad_ring_chunk_get(struct mad_device *d, struct mad_ringchunk *out) {
     bi.options = WMTResourceStorageModeShared;
     out->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
     if (!out->buf || !bi.memory.ptr) return 0;
+    InterlockedIncrement(&g_ring_chunks);   /* madeira-bcd metal-gap */
     out->cpu = bi.memory.ptr; out->gpu = bi.gpu_address; out->serial = 0;
     return 1;
 }
@@ -6862,7 +6871,13 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
  * draw parameters) and the indirect draw, or the indirect dispatch alone. Only
  * for Metal Shader Converter (DXIL) pipelines without geometry or tessellation
  * emulation, and never while a capture, census, draw dump, fault or sync
- * diagnostic runs: those keep the per-record path. */
+ * diagnostic runs: those keep the per-record path.
+ * Build 470: DXBC (sm5) pipelines too. Red Dead Redemption 2's shaders are DXBC,
+ * so the switch never ran for it (467, 13:09: no "indirect-fast:" count, indirect
+ * still 31-39 ms a frame). exec_draw / exec_dispatch build a DXBC stage's
+ * tables from the root state alone, which the records share, and bind the same
+ * buffer 4; nothing else of theirs depends on the record. Pipelines with a
+ * tessellation or geometry variant keep the per-record path. */
 static int g_indirect_fast = -1;
 static volatile LONG g_ifast_calls, g_ifast_records;
 
@@ -6871,15 +6886,19 @@ static int exec_indirect_fast_ok(struct mad_exec *e, const struct mad_cmd *c) {
         g_indirect_fast = mad_cfg_int_pe("indirect-fast", 0) ? 1 : 0;   /* madeira.cfg indirect-fast = 1 */
         if (g_indirect_fast)
             d3d12_log("[madeira-d3d12] indirect-fast = 1: ExecuteIndirect records after the first are encoded "
-                      "without per-record setup (DXIL pipelines)\n");
+                      "without per-record setup (DXIL and DXBC pipelines)\n");
     }
     if (!g_indirect_fast || c->u.ind.count < 2) return 0;
     if (g_census_on || g_capture_on || g_fault_diag || g_skip_ps_state > 0 || g_sd_state != 0) return 0;
     if ((g_list_seq <= 3 || (g_list_seq >= 12000 && g_list_seq < 12400)) && g_dump_draws < 40000) return 0;   /* draw dumps name each record */
     if (e->cap_after || e->cap_after_cs || e->ncap_after_buf || e->ncap_after_tex) return 0;
     if (c->kind == MC_DISPATCH_INDIRECT)
-        return e->cenc && e->cpso && e->cpso->cps && e->cpso->backend == MADEIRA_IR_BACKEND_MSC;
-    if (!e->renc || !e->pso || e->pso->backend != MADEIRA_IR_BACKEND_MSC || e->pso->gs_emu) return 0;
+        return e->cenc && e->cpso && e->cpso->cps &&
+               (e->cpso->backend == MADEIRA_IR_BACKEND_MSC || e->cpso->backend == MADEIRA_IR_BACKEND_AIRCONV);
+    if (!e->renc || !e->pso || e->pso->gs_emu) return 0;
+    if (e->pso->backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* build 470: its tables come from the shared root state */
+        if (e->pso->tess || e->pso->tess_strip || e->pso->has_tess) return 0;
+    } else if (e->pso->backend != MADEIRA_IR_BACKEND_MSC) return 0;
     return c->kind == MC_DRAW_INDIRECT || (c->kind == MC_DRAW_INDEXED_INDIRECT && e->ib && e->ib->buffer);
 }
 
@@ -7143,9 +7162,21 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         if (!qpf.QuadPart) QueryPerformanceFrequency(&qpf);
         if (now - prev > 5 * qpf.QuadPart && InterlockedCompareExchange64(&last_census, now, prev) == prev) {
             mad_acct_report();
-            if (e.q && e.q->device)
-                d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB\n",
-                          (unsigned long long)(MTLDevice_currentAllocatedSize(e.q->device->mtl_device) >> 20));
+            if (e.q && e.q->device) {
+                struct mad_device *md = e.q->device;
+                LONG64 metal = (LONG64)MTLDevice_currentAllocatedSize(md->mtl_device);
+                LONG64 sa = g_sa_tex_bytes, rings = (LONG64)g_ring_chunks * MAD_ARG_RING_BYTES;
+                LONG64 theaps = g_hp_dev ? (LONG64)g_hp_dev->hp_total_bytes : 0, mheaps = g_mheap_bytes;
+                LONG64 bufs = g_cat_bytes[MAD_CAT_BUF_PRIVATE] + g_cat_bytes[MAD_CAT_BUF_SHARED];
+                d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB\n", (unsigned long long)(metal >> 20));
+                /* madeira-bcd metal-gap: see g_sa_tex_bytes */
+                d3d12_log("[madeira-d3d12] metal-gap: Metal %lld MB = standalone textures %ld (%lld MB as Metal sizes them, "
+                          "%lld MB estimated) + texture heaps %lld MB + application heaps %lld MB + buffers %lld MB + "
+                          "argument ring chunks %ld (%lld MB) + the rest %lld MB; frees waiting for the GPU: %u\n",
+                          (long long)(metal >> 20), g_sa_tex_n, (long long)(sa >> 20), (long long)(g_sa_tex_logical >> 20),
+                          (long long)(theaps >> 20), (long long)(mheaps >> 20), (long long)(bufs >> 20), g_ring_chunks,
+                          (long long)(rings >> 20), (long long)((metal - sa - theaps - mheaps - bufs - rings) >> 20), md->nmhret);
+            }
         }
     }
     {
@@ -9779,6 +9810,11 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         }
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
         { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
+        if (r->metal_bytes) {   /* madeira-bcd metal-gap */
+            InterlockedExchangeAdd64(&g_sa_tex_bytes, -(LONG64)r->metal_bytes);
+            InterlockedExchangeAdd64(&g_sa_tex_logical, -(LONG64)r->acct_bytes);
+            InterlockedDecrement(&g_sa_tex_n);
+        }
         if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
         if (r->reserved_bytes) { InterlockedExchangeAdd64(&g_reserved_live_bytes, -(LONG64)r->reserved_bytes); InterlockedDecrement(&g_reserved_live_n); }   /* madeira-bcd */
         if (r->buffer && !r->placed_heap) mad_unresident(r->owner, r->buffer);
@@ -10143,6 +10179,16 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
             mad_acct(r, ti.sample_count > 1 ? MAD_CAT_TEX_MSAA : is_depth ? MAD_CAT_TEX_DS
                         : (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ? MAD_CAT_TEX_RT
                         : (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ? MAD_CAT_TEX_UAV : MAD_CAT_TEX_PLAIN, bytes, +1);
+            if (!r->hp_used) {   /* madeira-bcd metal-gap: a standalone texture, as Metal sizes it */
+                UINT64 msz = 0, mal = 0;
+                MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &msz, &mal);
+                if (msz) {
+                    r->metal_bytes = msz;
+                    InterlockedExchangeAdd64(&g_sa_tex_bytes, (LONG64)msz);
+                    InterlockedExchangeAdd64(&g_sa_tex_logical, (LONG64)bytes);
+                    InterlockedIncrement(&g_sa_tex_n);
+                }
+            }
         }
         hr = res_QI((ID3D12Resource *)r, riid, out);
         if (FAILED(hr)) mad_refuse_log(desc, heap_type, "interface not answered");
@@ -10263,6 +10309,7 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
                       (unsigned long long)h->desc.SizeInBytes >> 10);   /* ml895 */
         if (h->mtl) {   /* ml1145: every placed resource held a reference, so none is left; ml1148: but the GPU may still hold them */
             struct mad_device *hd = h->device; int queued = 0;
+            InterlockedExchangeAdd64(&g_mheap_bytes, -(LONG64)h->desc.SizeInBytes);   /* madeira-bcd metal-gap: queued frees are counted apart */
             EnterCriticalSection(&hd->heap_lock);
             if (mad_grow((void **)&hd->mhret, &hd->mhret_cap, hd->nmhret + 1, sizeof *hd->mhret)) {
                 hd->mhret[hd->nmhret].heap = h->mtl; hd->mhret[hd->nmhret].serial = (UINT64)hd->gpu_serial; hd->mhret[hd->nmhret].mem = NULL; hd->nmhret++; queued = 1;
@@ -10314,7 +10361,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
         if (backing < 0) { backing = (int)mad_cfg_int_pe("heap-backing", 1); d3d12_log("[madeira-d3d12] ml1145 heap-backing = %d (DEFAULT heaps %s)\n", backing, backing ? "are Metal placement heaps; placed resources alias" : "are descriptions only"); }
         if (backing && desc->Properties.Type == D3D12_HEAP_TYPE_DEFAULT && desc->SizeInBytes) {
             h->mtl = MTLDevice_newPlacementHeap(hd->mtl_device, desc->SizeInBytes, WMTResourceStorageModePrivate);
-            if (h->mtl) mad_resident(hd, h->mtl);
+            if (h->mtl) { mad_resident(hd, h->mtl); InterlockedExchangeAdd64(&g_mheap_bytes, (LONG64)desc->SizeInBytes); }   /* madeira-bcd metal-gap */
             if (said_b++ < 32) d3d12_log("[madeira-d3d12] ml1145 heap %llu KB flags %#x %s\n", (unsigned long long)(desc->SizeInBytes >> 10),
                                          (unsigned)desc->Flags, h->mtl ? "backed by a Metal placement heap" : "COULD NOT be backed; its resources stand alone");
         }

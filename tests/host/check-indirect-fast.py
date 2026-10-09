@@ -9,8 +9,9 @@ them on the host against the real winemetal.h with a recording
 encodeCommands, and checks:
   - off by default, and refused for one record, any capture / census / fault /
     skip-ps / sync diagnostic, the draw-dump windows, a pending capture,
-    the DXBC backend, geometry emulation, an indexed draw without an index
-    buffer, and a closed encoder;
+    geometry emulation, a DXBC pipeline with a tessellation or geometry
+    variant, an indexed draw without an index buffer, and a closed encoder;
+    DXIL and (build 470) DXBC draws and dispatches qualify;
   - draws: per record, buffer 4 (the converter's draw parameters) bound to the
     args buffer at off + k * stride, then the indirect draw at the same offset
     (indexed: the encoder's topology, index type, buffer and offset), in
@@ -78,7 +79,7 @@ enum mad_ck { MC_DRAW = 1, MC_DRAW_INDIRECT, MC_DRAW_INDEXED_INDIRECT, MC_DISPAT
 #define MADEIRA_IR_BACKEND_MSC 0
 #define MADEIRA_IR_BACKEND_AIRCONV 1
 struct mad_resource { obj_handle_t buffer; };
-struct mad_pso { int backend; int gs_emu; obj_handle_t cps; };
+struct mad_pso { int backend; int gs_emu; obj_handle_t cps; void *tess, *tess_strip; int has_tess; };
 struct mad_cmd { enum mad_ck kind; union { struct { struct mad_resource *args; UINT64 off; UINT count; UINT stride; } ind; } u; };
 struct mad_exec {
     obj_handle_t renc, cenc; struct mad_pso *pso, *cpso; struct mad_resource *ib; UINT64 ib_off;
@@ -150,14 +151,19 @@ int main(void) {
     g_dump_draws = 40000; EXPECT(exec_indirect_fast_ok(&e, &c), "dump budget spent: allowed"); g_dump_draws = 0; g_list_seq = 100;
     e.cap_after = 1; EXPECT(!exec_indirect_fast_ok(&e, &c), "pending draw capture refused"); e.cap_after = 0;
     e.ncap_after_buf = 1; EXPECT(!exec_indirect_fast_ok(&e, &c), "pending buffer capture refused"); e.ncap_after_buf = 0;
-    e.pso = &air; EXPECT(!exec_indirect_fast_ok(&e, &c), "DXBC backend refused");
+    e.pso = &air; EXPECT(exec_indirect_fast_ok(&e, &c), "build 470: a DXBC draw qualifies");
+    air.tess = &air; EXPECT(!exec_indirect_fast_ok(&e, &c), "DXBC with a tessellation/geometry variant refused"); air.tess = 0;
+    air.tess_strip = &air; EXPECT(!exec_indirect_fast_ok(&e, &c), "DXBC with a strip geometry variant refused"); air.tess_strip = 0;
+    air.has_tess = 1; EXPECT(!exec_indirect_fast_ok(&e, &c), "DXBC with hull/domain stages refused"); air.has_tess = 0;
+    air.backend = 7; EXPECT(!exec_indirect_fast_ok(&e, &c), "an unknown backend refused"); air.backend = MADEIRA_IR_BACKEND_AIRCONV;
     e.pso = &gs; EXPECT(!exec_indirect_fast_ok(&e, &c), "geometry emulation refused"); e.pso = &msc;
     e.ib = NULL; EXPECT(!exec_indirect_fast_ok(&e, &c), "indexed without index buffer refused"); e.ib = &ib;
     e.renc = 0; EXPECT(!exec_indirect_fast_ok(&e, &c), "no render encoder refused"); e.renc = 0xe1;
     c.kind = MC_DRAW_INDIRECT; e.ib = NULL; EXPECT(exec_indirect_fast_ok(&e, &c), "non-indexed needs no index buffer");
     fresh(&e, &c, MC_DISPATCH_INDIRECT, 10);
     EXPECT(exec_indirect_fast_ok(&e, &c), "MSC indirect dispatch qualifies");
-    e.cpso = &air; EXPECT(!exec_indirect_fast_ok(&e, &c), "DXBC compute refused"); e.cpso = &msc;
+    e.cpso = &air; EXPECT(exec_indirect_fast_ok(&e, &c), "build 470: DXBC compute qualifies");
+    air.backend = 7; EXPECT(!exec_indirect_fast_ok(&e, &c), "unknown compute backend refused"); air.backend = MADEIRA_IR_BACKEND_AIRCONV; e.cpso = &msc;
     e.cenc = 0; EXPECT(!exec_indirect_fast_ok(&e, &c), "no compute encoder refused");
 
     for (j = 0; j < 3; j++) {

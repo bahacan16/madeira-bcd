@@ -122,8 +122,9 @@ OVERLAY = {
                         "all state but their offset) are encoded 64 at a time with only their offset and the "
                         "indirect draw or dispatch, instead of the whole per-draw setup each. For games that issue "
                         "thousands of indirect records a frame (Red Dead Redemption 2), where that setup costs more "
-                        "CPU time than the GPU spends. DXIL pipelines only; diagnostics and captures keep the "
-                        "per-record path. Read once per session."},
+                        "CPU time than the GPU spends. DXIL and DXBC pipelines (DXBC from build 470); pipelines "
+                        "with tessellation or geometry stages, diagnostics and captures keep the per-record path. "
+                        "Read once per session."},
     "dxbc-register-spaces": {"category": "Direct3D 12", "title": "Shader model 5.1 resources in register spaces other than 0",
                 "kind": "bool", "default": "0",
                 "note": "Default off: a DXBC shader (shader model 5.1) that declares a resource in a register space "
