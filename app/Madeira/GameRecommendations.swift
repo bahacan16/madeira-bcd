@@ -104,13 +104,17 @@ enum GameRecommendations {
     /// DXMT upload rings take 4 MB blocks instead of 32 MB (they held 200 MB
     /// through play on 467), and the ExecuteIndirect probe is off (on 470 it
     /// split render passes every 3 s per pipeline for the first two minutes);
-    /// and build 479's: on 476 the game loaded xinput1_4.dll only at its first
+    /// and build 480's: on 476 the game loaded xinput1_4.dll only at its first
     /// controller read, when the launcher's, Social Club's and the game's
     /// 128 MB code buffers had left the JIT pool no room for it, so neither the
-    /// controller nor the on-screen controls reached the game. Now the DLL is
-    /// loaded with the D3D12 device, and the pool keeps 192 MB for DLLs, not 128.
+    /// controller nor the on-screen controls reached the game; the DLL is now
+    /// loaded with the D3D12 device. Build 479 also kept 192 MB of the pool for
+    /// DLLs: the game's code buffer then got 16 MB and was refilled again and
+    /// again (2-3 FPS, 19:35), so the pool is back to 128 MB. The orphan-lock
+    /// reaper releases only locks a live thread has stamped (it released live
+    /// locks: three "is not owned" errors on 476).
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 8,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 9,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -149,9 +153,10 @@ enum GameRecommendations {
         env.DXMT_WSI_MODE_TABLE = 1
         env.DXMT_SMALL_RINGS = Launcher.exe;SocialClubHelper.exe
         env.MADEIRA_EXECREQ_LEAVE = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
         env.MADEIRA_PIN_GRAPHICS_DLLS = 1
         env.MADEIRA_PRELOAD_DLLS = xinput1_4.dll
-        env.MADEIRA_POOL_HEAD_RESERVE_MB = 192
+        env.MADEIRA_POOL_HEAD_RESERVE_MB = 128
         env.MADEIRA_POOL_LOW_IMAGES = 1
         env.MADEIRA_POOL_RECYCLE_IMAGES = 1
         env.MADEIRA_SC_PA_POOLS = 2
@@ -287,9 +292,12 @@ enum GameRecommendations {
     /// Build 477's switches retry those with sized ranges, remember what stays
     /// refused, and hand the game a placeholder instead of a failure; Wine's
     /// "controller_get_User stub" line (12,747 of them, the game asks every
-    /// frame) is silenced.
+    /// frame) is silenced. On build 479 (19:44) the retried shaders converted,
+    /// but the game stopped with "Error" at start: the orphan-lock reaper had
+    /// released two locks whose owners were alive (one on 475 too). Build 480's
+    /// line lets it release only locks a live thread has stamped.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 4,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 5,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -303,6 +311,7 @@ enum GameRecommendations {
         env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_INPUT_FOREGROUND = 1
         env.MADEIRA_WGI_HOST_PADS = 1
+        env.MADEIRA_LOCK_ORPHAN = stamped
         env.WINEDEBUG = fixme-input
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")

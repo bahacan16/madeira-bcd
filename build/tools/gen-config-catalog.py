@@ -428,6 +428,15 @@ OVERLAY = {
                         "upstream's aborts in (Rockstar Games Launcher exited with code 3). Off (default): upstream's "
                         "committed d3d11.dll. Set it in the game's own file, not for every game; read at session start."},
     # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
+    "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
+                "kind": "choice", "default": "", "sources": ["tools/patch-wine-lock-orphan.py"],
+                "choices": [("", "As before"), ("stamped", "Only stamped locks"), ("0", "Off")],
+                "note": "The monitor releases an SRW lock it believes a dead thread left held. Unset (default): as "
+                        "before, which counts one strike per parked waiter, so a busy lock with 3 waiters is released "
+                        "at once even while its owner lives (Horizon Zero Dawn stopped with \"Error\" right after such "
+                        "a release, build 479). stamped: one strike per monitor cycle, three in a row, and only locks a "
+                        "live thread has stamped (FEX's code-buffer locks) can be released. 0: no releases. The "
+                        "dead-thread reaper is unchanged. Restart the session after changing it."},
     "env.DXMT_SMALL_RINGS": {"category": "Direct3D 9/10/11 (DXMT)", "title": "Small DXMT staging rings for these programs",
                 "kind": "text", "default": "", "sources": ["tools/patch-d3d11-src-small-rings.py"],
                 "note": "Needs env.MADEIRA_D3D11_SRC = 1. Program file names separated by ';' (e.g. "

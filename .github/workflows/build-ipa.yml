@@ -416,6 +416,15 @@ jobs:
       - name: Patch wine with fault-safe waiter diagnostics
         run: python3 tools/patch-wine-waiter-read.py wine/dlls/ntdll/unix/sync.c
 
+      # madeira-bcd: env MADEIRA_LOCK_ORPHAN = stamped (opt-in): the orphan-lock
+      # reaper counts strikes per cycle, not per parked waiter, and releases only
+      # locks a live thread has stamped. As it was, it released live locks
+      # (Horizon Zero Dawn's "Error" stop, build 479). Unset, nothing changes.
+      - name: Patch wine with the opt-in safe orphan-lock reaper
+        run: |
+          python3 tests/host/check-lock-orphan.py
+          python3 tools/patch-wine-lock-orphan.py wine/dlls/ntdll/unix/sync.c
+
       # madeira.cfg avail-phys = 1 (opt-in): GlobalMemoryStatusEx's available
       # physical memory is what remains before this app's memory limit, so
       # Chromium (Social Club, Steam) sees memory pressure before iOS kills the
