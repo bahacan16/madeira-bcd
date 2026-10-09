@@ -939,9 +939,13 @@ __attribute__((constructor(101), used)) static void madeira_early_va_claim(void)
      * mapping already sat at ~0x157d00000 before this constructor ran, leaving
      * 253MB above the window; the pool fell back to a 432MB hole below it and FEX
      * rolled its code cache over 52 times (a ~1 s freeze each). Record the first
-     * mapped region above the window so the log can say what it is. */
-    if (!madeira_early_pool_size) {
-        vm_address_t ra = win + winsz;
+     * mapped region above the window so the log can say what it is.
+     * madeira-bcd: also when a placeholder was obtained -- it ends where the first
+     * mapping above it starts (normally the main thread's stack, VM tag 30; on
+     * RDR2's build 470 run a 71MB mapping at 0x159d00000 cut it to 272MB and the
+     * pool to 604MB). */
+    {
+        vm_address_t ra = win + winsz + (vm_address_t)madeira_early_pool_size;
         vm_size_t rs = 0;
         natural_t depth = 0;
         vm_region_submap_info_data_64_t info;

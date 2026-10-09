@@ -93,10 +93,12 @@ enum GameRecommendations {
     /// monitor identity and mode list for Borderless / Full Screen (which no
     /// longer crash, 2026-10-09 11:34), build 467's full-screen window and
     /// 720-line screen, the least RDR2 offers in full screen (which fits the
-    /// screen, 13:09), and build 470's test: the swap file also takes the 1-4 MB
-    /// blocks (the game still reached the 8 GB limit a minute into play).
+    /// screen, 13:09), build 470's test: the swap file also takes the 1-4 MB
+    /// blocks (the game still reached the 8 GB limit a minute into play), and
+    /// build 472's pool-mid: a mapping between the pool's two regions at image
+    /// load cut the pool to 604 MB and the game stopped with ERR_GFX_INIT (14:33).
     static let rdr2Steam = GameRecommendation(
-        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 4,
+        id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 5,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -104,6 +106,7 @@ enum GameRecommendations {
         d3d12-shader-pack = 1
         replay-split = 1
         pool-low = 1
+        pool-mid = 1
         pool-page-fit = 1
         pool-split = 1
         vram-mb = 2304

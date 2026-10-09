@@ -31,6 +31,8 @@ helpers = ''.join(function(sig) for sig in (
     'static size_t ios_pool_hole_head_place(',
     'static size_t ios_pool_hole_tail_start(',
     'static size_t ios_pool_hole_between(',
+    'static size_t ios_pool_holes_head_place(',
+    'static int ios_pool_skip_pieces(',
     'static size_t ios_pool_code_cap(',
     'static int ios_pool_low_take(',
     'static int ios_pool_best_fit(',
@@ -45,7 +47,9 @@ assert 'ios_pool_parse_head_reserve( getenv( "MADEIRA_POOL_HEAD_RESERVE_MB" ) )'
 assert 'const char *lower = getenv( "MADEIRA_POOL_BIG_SLOT_BELOW" );' in source
 assert 'int below = lower && !strcmp( lower, "1" );' in source
 assert 'if (!fits && below)' in source, 'an unavailable lower slot must try the existing upper placement'
-assert '#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off)' in source
+assert ('#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off || \\\n'
+        '                             (size_t)(o) - ios_jit_hole2_off < ios_jit_hole2_end - ios_jit_hole2_off)') in source, \
+    'the warmer skips the native holes (pool-mid adds a second), never the slot'
 assert source.count('if (IOS_POOL_IN_HOLE(o)) continue;') == 4, 'the warmer skips only the native hole'
 
 harness = r'''
@@ -68,6 +72,7 @@ static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
 static int ios_pool_free_count, ios_pool_ledger_count, ios_pool_last_alloc_reused;
 static size_t jit_pool_offset, ios_jit_hole_off_eff, ios_jit_hole_end_eff;
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;   /* pool-mid: no second hole here */
 static size_t ios_pool_big_off, ios_pool_big_size;
 static int ios_pool_big_taken;
 static time_t ios_pool_big_freed_at;

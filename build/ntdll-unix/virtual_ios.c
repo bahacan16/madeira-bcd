@@ -219,6 +219,19 @@ static size_t jit_pool_offset = 0;
  * the unsplit one. */
 static size_t ios_jit_hole_off, ios_jit_hole_end;
 
+/* madeira-bcd POOL-MID (StikJITHelper.swift, `pool-mid`, on with pool-split; env
+ * WINE_IOS_JIT_HOLE2="<off>:<end>", hex pool offsets). RDR2 on build 470
+ * (2026-10-09 14:33): a 71 MB mapping sat in the band before the app's image-load
+ * constructor ran, so the split pool came out as A 285 MB + B 319 MB (604 MB of
+ * 896) around a 291 MB hole holding that mapping, 213 MB of FREE space and the
+ * main thread's stack; the image copies ran the pool dry and d3dcompiler_47.dll
+ * did not load (ERR_GFX_INIT). The app now takes such a free run between A and
+ * B as a third debugger region M, aliased in the same span, and names a second
+ * hole: hole 1 is then the part below M (the early mapping), hole 2 the part
+ * above it (the stack). Hole 1 lies below hole 2. Without the env var both bounds
+ * stay 0 and every helper below is the one-hole one. */
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;
+
 /* madeira-bcd BIG-IMAGE SLOT (env MADEIRA_POOL_BIG_SLOT_MB = N, split pool only;
  * off by default). Ten processes each copy their own system DLLs into the pool
  * (GTA V Enhanced build 373, 2026-10-04 08:41: 326 images, 469 MB -- shell32
@@ -327,8 +340,64 @@ static size_t ios_pool_code_cap( size_t total, size_t head, size_t tail,
     return cap;
 }
 
-/* 1 for a pool offset inside the hole (always 0 without a split). */
-#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off)
+/* madeira-bcd pool-mid: the one-hole helpers above applied to both holes (hole 1
+ * below hole 2; with no second hole h2_off == h2_end == 0 and these are the
+ * one-hole helpers). A head allocation jumps hole 1, then hole 2; a tail carve,
+ * counted down from the top, jumps hole 2 first, then hole 1. */
+static size_t ios_pool_holes_head_place( size_t cur, size_t size, size_t h1_off, size_t h1_end,
+                                         size_t h2_off, size_t h2_end )
+{
+    return ios_pool_hole_head_place( ios_pool_hole_head_place( cur, size, h1_off, h1_end ), size, h2_off, h2_end );
+}
+
+static size_t ios_pool_holes_tail_start( size_t total, size_t cur, size_t size, size_t h1_off, size_t h1_end,
+                                         size_t h2_off, size_t h2_end )
+{
+    return ios_pool_hole_tail_start( total, ios_pool_hole_tail_start( total, cur, size, h2_off, h2_end ),
+                                     size, h1_off, h1_end );
+}
+
+static size_t ios_pool_holes_between( size_t total, size_t head, size_t tail, size_t h1_off, size_t h1_end,
+                                      size_t h2_off, size_t h2_end )
+{
+    return ios_pool_hole_between( total, head, tail, h1_off, h1_end ) +
+           ios_pool_hole_between( total, head, tail, h2_off, h2_end );
+}
+
+/* The pool memory in [lo, hi) outside both holes, in at most three pieces
+ * (ascending, 16 KB granular; smaller pieces dropped): what a head jump or a tail
+ * carve skipped over, which stays usable. Returns the number of pieces. */
+static int ios_pool_skip_pieces( size_t lo, size_t hi, size_t h1_off, size_t h1_end,
+                                 size_t h2_off, size_t h2_end, size_t piece_off[3], size_t piece_size[3] )
+{
+    size_t hole_lo[2] = { h1_off, h2_off }, hole_hi[2] = { h1_end, h2_end };
+    size_t cur = lo;
+    int n = 0, i;
+
+    for (i = 0; i < 2 && cur < hi; i++)
+    {
+        if (hole_hi[i] <= hole_lo[i] || hole_hi[i] <= cur) continue;   /* no hole, or below the cursor */
+        if (hole_lo[i] >= hi) break;
+        if (hole_lo[i] > cur && hole_lo[i] - cur >= 0x4000)
+        {
+            piece_off[n] = cur;
+            piece_size[n] = (hole_lo[i] - cur) & ~(size_t)0x3fff;
+            n++;
+        }
+        cur = hole_hi[i];
+    }
+    if (cur < hi && hi - cur >= 0x4000)
+    {
+        piece_off[n] = cur;
+        piece_size[n] = (hi - cur) & ~(size_t)0x3fff;
+        n++;
+    }
+    return n;
+}
+
+/* 1 for a pool offset inside a hole (always 0 without a split). */
+#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off || \
+                             (size_t)(o) - ios_jit_hole2_off < ios_jit_hole2_end - ios_jit_hole2_off)
 
 /* madeira-bcd POOL-LOW (StikJITHelper.swift, `pool-low = 1` in madeira.cfg or in a
  * game's own file; env WINE_IOS_JIT_TAIL_REGION="<rx>:<size>", hex). Off by default.
@@ -2872,7 +2941,8 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
                 : now - ios_pool_big_freed_at < IOS_POOL_REUSE_GRACE_SEC ? "in its reuse grace" : "out of reach");
     if (pool_limit && off == (size_t)-1)
     {
-        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+        size_t cand = ios_pool_holes_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                                 ios_jit_hole2_off, ios_jit_hole2_end );
         bump_short = cand + alloc_size > pool_limit;
     }
     if (off == (size_t)-1 && (alloc_size >= 32u * 1024 * 1024 || bump_short))
@@ -2969,7 +3039,8 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
 
     /* each `continue` below has dropped or replaced entry i: pick again */
     {
-        size_t bump_cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+        size_t bump_cand = ios_pool_holes_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                                      ios_jit_hole2_off, ios_jit_hole2_end );
         bump_ok = bump_cand + alloc_size <= pool_limit && IOS_POOL_IN_REACH(bump_cand);
     }
     while (off == (size_t)-1 &&
@@ -3087,33 +3158,40 @@ static size_t ios_pool_alloc_range_ex( size_t alloc_size, size_t pool_limit,
 
     if (off == (size_t)-1)
     {
-        /* madeira-bcd split pool: never into the hole (ios_jit_hole_off). Without
-         * a split `cand` is the cursor itself and this is the old bump. */
-        size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size,
-                                                ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+        /* madeira-bcd split pool: never into a hole (ios_jit_hole_off, pool-mid's
+         * ios_jit_hole2_off). Without a split `cand` is the cursor itself and this
+         * is the old bump. */
+        size_t cand = ios_pool_holes_head_place( jit_pool_offset, alloc_size,
+                                                 ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                                 ios_jit_hole2_off, ios_jit_hole2_end );
         if (cand + alloc_size <= pool_limit
             && IOS_POOL_IN_REACH(cand))
         {
             if (cand != jit_pool_offset)
             {
-                /* The run below the hole stays usable: hand it to the freelist as
-                 * a never-used range (no grace, nothing to advise), so the next
+                /* The runs below the hole(s) stay usable: hand them to the freelist
+                 * as never-used ranges (no grace, nothing to advise), so the next
                  * image that fits there goes there. */
-                size_t below = ios_jit_hole_off_eff > jit_pool_offset ? ios_jit_hole_off_eff - jit_pool_offset : 0;
+                size_t poff[3], psz[3], below = 0;
+                int np = ios_pool_skip_pieces( jit_pool_offset, cand, ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                               ios_jit_hole2_off, ios_jit_hole2_end, poff, psz ), k;
                 static int jump_n;
-                if (below >= 0x4000 && ios_pool_free_count < IOS_POOL_FREE_MAX)
+                for (k = 0; k < np; k++)
                 {
-                    ios_pool_freelist[ios_pool_free_count].off = jit_pool_offset;
-                    ios_pool_freelist[ios_pool_free_count].size = below & ~(size_t)0x3fff;
+                    below += psz[k];
+                    if (ios_pool_free_count >= IOS_POOL_FREE_MAX) continue;
+                    ios_pool_freelist[ios_pool_free_count].off = poff[k];
+                    ios_pool_freelist[ios_pool_free_count].size = psz[k];
                     ios_pool_freelist[ios_pool_free_count].freed_at = 0;
                     ios_pool_freelist[ios_pool_free_count].advised = 1;
                     ios_pool_free_count++;
                 }
                 if (jump_n++ < 8)
-                    dprintf(2, "[jit-pool] split pool: head 0x%lx+0x%lx would reach the hole [0x%lx,0x%lx) "
+                    dprintf(2, "[jit-pool] split pool: head 0x%lx+0x%lx would reach the hole [0x%lx,0x%lx)%s "
                             "-- placed above it at 0x%lx; the 0x%lx below it stays on the freelist\n",
                             (unsigned long)jit_pool_offset, (unsigned long)alloc_size,
                             (unsigned long)ios_jit_hole_off_eff, (unsigned long)ios_jit_hole_end_eff,
+                            ios_jit_hole2_end > ios_jit_hole2_off ? " or hole 2" : "",
                             (unsigned long)cand, (unsigned long)below);
             }
             off = cand;
@@ -3355,8 +3433,8 @@ static void ios_pool_failure_census( size_t want )
         if (entry->size > aged_largest) aged_largest = entry->size;
         if (entry->size >= want) aged_fit++;
     }
-    hole = ios_pool_hole_between( ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved,
-                                  ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+    hole = ios_pool_holes_between( ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved,
+                                   ios_jit_hole_off_eff, ios_jit_hole_end_eff, ios_jit_hole2_off, ios_jit_hole2_end );
     if (jit_pool_offset <= ios_jit_pool_size_global && ios_jit_tail_reserved <= ios_jit_pool_size_global - jit_pool_offset &&
         hole <= ios_jit_pool_size_global - jit_pool_offset - ios_jit_tail_reserved)
         main_virgin = ios_jit_pool_size_global - jit_pool_offset - ios_jit_tail_reserved - hole;
@@ -16717,6 +16795,36 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                                      hole, (unsigned long)jit_pool_size );
                     }
                 }
+                /* madeira-bcd pool-mid: a second hole above the first, with the
+                 * third region M between them (see ios_jit_hole2_off). Taken only
+                 * with a valid first hole and at least 16 KB of M; anything else is
+                 * ignored, which leaves the one-hole pool. */
+                {
+                    const char *hole2 = getenv( "WINE_IOS_JIT_HOLE2" );
+                    if (hole2 && *hole2)
+                    {
+                        char *sep = NULL;
+                        unsigned long long h0 = strtoull( hole2, &sep, 16 ), h1 = 0;
+                        if (sep && *sep == ':') h1 = strtoull( sep + 1, NULL, 16 );
+                        if (ios_jit_hole_end > ios_jit_hole_off && h0 >= ios_jit_hole_end + 0x4000 &&
+                            h1 > h0 && h1 < jit_pool_size && !(h0 & 0x3fff) && !(h1 & 0x3fff))
+                        {
+                            ios_jit_hole2_off = (size_t)h0;
+                            ios_jit_hole2_end = (size_t)h1;
+                            dprintf( 2, "[jit-pool] pool-mid: third region RX [%p,%p) (%lu MB) between the holes; "
+                                     "hole 2 [0x%llx,0x%llx) (%llu MB, the main thread's stack) is never handed out "
+                                     "either; usable %lu MB of the 0x%lx span\n",
+                                     (char *)jit_rx_base + ios_jit_hole_end, (char *)jit_rx_base + h0,
+                                     (unsigned long)((h0 - ios_jit_hole_end) >> 20), h0, h1, (h1 - h0) >> 20,
+                                     (unsigned long)((jit_pool_size - (ios_jit_hole_end - ios_jit_hole_off) - (h1 - h0)) >> 20),
+                                     (unsigned long)jit_pool_size );
+                        }
+                        else
+                            dprintf( 2, "[jit-pool] pool-mid: WINE_IOS_JIT_HOLE2=%s ignored (hole 1 [0x%lx,0x%lx), "
+                                     "pool size 0x%lx)\n", hole2, (unsigned long)ios_jit_hole_off,
+                                     (unsigned long)ios_jit_hole_end, (unsigned long)jit_pool_size );
+                    }
+                }
                 /* The default big-image slot is above the hole. A game may
                  * request the lower side; if it cannot leave 256MB for startup
                  * images, retain the old upper placement instead. */
@@ -16725,7 +16833,10 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
                     const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );
                     /* 1 puts the existing image slot below the native hole; 0/default keeps it above. */
                     const char *lower = getenv( "MADEIRA_POOL_BIG_SLOT_BELOW" );
-                    if (big && *big && strtoul( big, NULL, 10 ))
+                    if (big && *big && strtoul( big, NULL, 10 ) && ios_jit_hole2_end > ios_jit_hole2_off)
+                        dprintf( 2, "[pool-big] madeira-bcd MADEIRA_POOL_BIG_SLOT_MB=%s ignored: the pool has a second "
+                                 "hole (pool-mid), the slot is laid out against one\n", big );
+                    else if (big && *big && strtoul( big, NULL, 10 ))
                     {
                         unsigned long mb = strtoul( big, NULL, 10 );
                         size_t want = mb <= (SIZE_MAX >> 20) ? (size_t)mb << 20 : 0;
@@ -28859,9 +28970,13 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
             enum { TAIL_SMALL = 0x1000000 };
             size_t head_now = jit_pool_offset, tail_now = ios_jit_tail_reserved;
             /* Neither the native hole nor either placement of the image slot
-             * is available to the tail. Default headroom remains 48MB. */
+             * is available to the tail. Default headroom remains 48MB. Pool-mid's
+             * second hole is not room either: counted with the headroom. */
             size_t cap = ios_pool_code_cap( ios_jit_pool_size_global, head_now, tail_now,
-                                            ios_jit_hole_off_eff, ios_jit_hole_end_eff, ios_pool_head_reserve );
+                                            ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                            ios_pool_head_reserve +
+                                            ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,
+                                                                   ios_jit_hole2_off, ios_jit_hole2_end ) );
             /* A retired generation of this size already sitting on the carve
              * free-list costs the pool nothing new: never refuse that. */
             if (alloc_size > cap)
@@ -28996,22 +29111,32 @@ retry_code_carve_reuse:
          * ios_jit_tail_reserved is the shared file-scope counter so the
          * head allocators can refuse to grow into tail-carved buffers. */
         size_t reserve_offset, tail_added, tail_skipped = 0;
+        size_t skip_off[3], skip_size[3];
+        int skip_n = 0;
         if (ios_jit_hole_end > ios_jit_hole_off)
         {
-            /* madeira-bcd split pool: a carve that would overlap the hole goes
+            /* madeira-bcd split pool: a carve that would overlap a hole goes
              * directly below it; the span it skips above the hole becomes a free
-             * carve once this one is granted. */
+             * carve once this one is granted (pool-mid: up to two such spans,
+             * the hole 2 one and the one between the holes). */
             size_t cur, start;
             do
             {
                 cur = ios_jit_tail_reserved;
-            start = ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,
-                                                  ios_jit_hole_off_eff, ios_jit_hole_end_eff );
+            start = ios_pool_holes_tail_start( ios_jit_pool_size_global, cur, alloc_size,
+                                                   ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                                   ios_jit_hole2_off, ios_jit_hole2_end );
             } while (!__sync_bool_compare_and_swap( &ios_jit_tail_reserved, cur, start + alloc_size ));
             reserve_offset = start;
             tail_added = start + alloc_size - cur;
-            if (start != cur && ios_jit_pool_size_global - cur > ios_jit_hole_end_eff)
-                tail_skipped = ios_jit_pool_size_global - cur - ios_jit_hole_end_eff;
+            if (start != cur && start <= ios_jit_pool_size_global && cur <= start)
+            {
+                int k;
+                skip_n = ios_pool_skip_pieces( ios_jit_pool_size_global - start, ios_jit_pool_size_global - cur,
+                                               ios_jit_hole_off_eff, ios_jit_hole_end_eff,
+                                               ios_jit_hole2_off, ios_jit_hole2_end, skip_off, skip_size );
+                for (k = 0; k < skip_n; k++) tail_skipped += skip_size[k];
+            }
         }
         else
         {
@@ -29149,15 +29274,20 @@ retry_code_carve_reuse:
                 ios_tail_carves[ios_tail_carve_n].freed_at = 0;
                 ios_tail_carve_n++;
             }
-            /* madeira-bcd split pool: this carve went below the hole; the span it
-             * skipped above the hole is a never-used carve a smaller ask can take. */
-            if (tail_skipped >= 0x100000 && ios_tail_carve_n < IOS_TAIL_CARVE_MAX)
+            /* madeira-bcd split pool: this carve went below a hole; the span it
+             * skipped above the hole is a never-used carve a smaller ask can take
+             * (pool-mid: one per hole it jumped). */
             {
-                ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;
-                ios_tail_carves[ios_tail_carve_n].size = tail_skipped & ~(size_t)0x3fff;
-                ios_tail_carves[ios_tail_carve_n].free = 1;
-                ios_tail_carves[ios_tail_carve_n].freed_at = 0;   /* never executed, outside region C */
-                ios_tail_carve_n++;
+                int k;
+                for (k = 0; k < skip_n; k++)
+                {
+                    if (skip_size[k] < 0x100000 || ios_tail_carve_n >= IOS_TAIL_CARVE_MAX) continue;
+                    ios_tail_carves[ios_tail_carve_n].off = skip_off[k];
+                    ios_tail_carves[ios_tail_carve_n].size = skip_size[k];
+                    ios_tail_carves[ios_tail_carve_n].free = 1;
+                    ios_tail_carves[ios_tail_carve_n].freed_at = 0;   /* never executed, outside region C */
+                    ios_tail_carve_n++;
+                }
             }
             pthread_mutex_unlock( &ios_tail_carve_lock );
             if (tail_added != alloc_size)

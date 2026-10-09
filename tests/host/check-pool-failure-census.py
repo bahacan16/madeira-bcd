@@ -18,7 +18,9 @@ def body(signature):
 
 census = body('static void ios_pool_failure_census( size_t want )')
 assert 'jit_pool_size,' not in census and 'jit_pool_size -' not in census
-hole = body('static size_t ios_pool_hole_between(')
+hole = body('static size_t ios_pool_hole_between(') + '\n' + body('static size_t ios_pool_holes_between(')
+assert 'ios_pool_holes_between( ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved,' in census, \
+    'the census leaves pool-mid\'s second hole out of the virgin room too'
 assert source.count('ios_pool_failure_census( alloc_size );') == 1
 site = source[source.index('ios_pool_failure_census( alloc_size );') - 80:][:160]
 assert 'if (offset == (size_t)-1)' in site
@@ -43,6 +45,7 @@ static struct ios_pool_free ios_pool_freelist[8];
 static unsigned ios_pool_free_count;
 static size_t ios_jit_pool_size_global, jit_pool_offset, ios_jit_tail_reserved;
 static size_t ios_jit_hole_off_eff, ios_jit_hole_end_eff;
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;   /* pool-mid: no second hole here */
 static size_t ios_jit_low_reserved, ios_jit_low_size_global;
 static pthread_mutex_t ios_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static char output[16384];

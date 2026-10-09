@@ -62,6 +62,7 @@ static size_t ios_jit_low_size_global, ios_jit_pool_size_global;
 static volatile size_t ios_jit_low_reserved;
 static size_t jit_pool_offset, ios_jit_tail_reserved, ios_pool_head_reserve;
 static size_t ios_jit_hole_off_eff, ios_jit_hole_end_eff;
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;
 static int ios_jit_low_full_logged, wow, lose_race;
 static unsigned ios_tail_carve_n;
 static pthread_mutex_t ios_tail_carve_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -92,6 +93,7 @@ static void reset(void *memory)
     ios_jit_pool_size_global = 864 * MB;
     jit_pool_offset = 600 * MB;
     ios_jit_tail_reserved = ios_jit_hole_off_eff = ios_jit_hole_end_eff = 0;
+    ios_jit_hole2_off = ios_jit_hole2_end = 0;
     ios_pool_head_reserve = 128 * MB;
     ios_jit_low_full_logged = wow = lose_race = 0;
     ios_tail_carve_n = 1;

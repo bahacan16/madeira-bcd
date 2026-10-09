@@ -289,6 +289,15 @@ OVERLAY = {
                         "(where the pool cannot split), the pool takes two runs above the window instead if together "
                         "they are larger (GTA V: 368 + 320 MB instead of 464 MB). Falls back to the single run if the "
                         "placement misses. On by default; 0 turns it off. Read at launch, the game's own file wins."},
+    "pool-mid": {"category": "Memory & JIT pool", "title": "Split JIT pool: use the free run between the regions",
+                "kind": "bool", "default": "0",
+                "note": "With pool-split on: when another mapping sits between the pool's two regions and leaves a "
+                        "free run of 64 MB or more there, that run becomes a third debugger region in the same pool "
+                        "(RDR2 build 470: 604 MB pool, a 71 MB mapping and 213 MB free between the regions; the "
+                        "DLL copies ran out and the game failed with ERR_GFX_INIT). Only from what the two regions "
+                        "left of the pool size; costs that region's size in memory. Off by default (RDR2's list turns "
+                        "it on); read at launch, the game's own file wins.",
+                "sources": ["app/Madeira/StikJITHelper.swift", "build/ntdll-unix/virtual_ios.c"]},
     "pool-low": {"category": "Memory & JIT pool", "title": "JIT code buffers below the executable window",
                 "kind": "bool", "default": "0",
                 "note": "1: a free run below the 0x140000000 executable window (less pool-low-margin) "

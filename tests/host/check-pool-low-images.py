@@ -23,6 +23,8 @@ def function(signature):
 
 helpers = ''.join(function(signature) for signature in (
     'static size_t ios_pool_hole_head_place(',
+    'static size_t ios_pool_holes_head_place(',
+    'static int ios_pool_skip_pieces(',
     'static int ios_pool_low_take(',
     'static int ios_pool_best_fit(',
     'static int ios_pool_keep_big(',
@@ -74,6 +76,7 @@ static struct ios_pool_free ios_pool_freelist[IOS_POOL_FREE_MAX];
 static struct ios_pool_alloc ios_pool_ledger[IOS_POOL_LEDGER_MAX];
 static int ios_pool_free_count, ios_pool_ledger_count, ios_pool_last_alloc_reused;
 static size_t jit_pool_offset, ios_jit_hole_off_eff, ios_jit_hole_end_eff;
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;   /* pool-mid: no second hole here */
 static size_t ios_pool_big_off, ios_pool_big_size, ios_jit_pool_size_global;
 static int ios_pool_big_taken, wow, poisoned;
 static time_t ios_pool_big_freed_at;

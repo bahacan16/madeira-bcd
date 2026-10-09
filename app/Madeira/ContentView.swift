@@ -3442,6 +3442,13 @@ struct ContentView: View {
                 } else {
                     unsetenv("WINE_IOS_JIT_HOLE")
                 }
+                // madeira-bcd pool-mid (pool-mid = 1): the second hole, when a free run
+                // between the split regions became a third region (StikJITHelper.poolHole2).
+                if let hole2 = StikJITHelper.poolHole2 {
+                    setenv("WINE_IOS_JIT_HOLE2", String(format: "%lx:%lx", hole2.off, hole2.end), 1)
+                } else {
+                    unsetenv("WINE_IOS_JIT_HOLE2")
+                }
                 // madeira-bcd pool-low (pool-low = 1): region C below the executable window,
                 // RW alias at the pool's distance; ntdll carves FEX's code buffers from it
                 // first (StikJITHelper.poolLow).

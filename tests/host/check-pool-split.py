@@ -47,22 +47,32 @@ helpers = ''.join(function(native, sig) for sig in (
     'static size_t ios_pool_hole_head_place(',
     'static size_t ios_pool_hole_tail_start(',
     'static size_t ios_pool_hole_between(',
+    'static size_t ios_pool_holes_head_place(',
+    'static size_t ios_pool_holes_tail_start(',
+    'static size_t ios_pool_holes_between(',
+    'static int ios_pool_skip_pieces(',
     'static void ios_pool_tail_unreserve(',
 ))
 macro = native[native.index('#define IOS_POOL_IN_HOLE(o)'):]
-macro = macro[:macro.index('\n') + 1]
+macro = macro[:macro.index('\n', macro.index('\\\n') + 2) + 1]   # pool-mid: two lines, both holes
 runs_typedef = native[native.index('typedef int (*ios_pool_region_fn)'):]
 runs_typedef = runs_typedef[:runs_typedef.index(';') + 1] + '\n'
 runs = function(native, 'static int ios_pool_execable_runs(')
 
 # --- call sites ---------------------------------------------------------------
-bump = native[native.index('/* madeira-bcd split pool: never into the hole (ios_jit_hole_off).'):][:2600]
-assert 'ios_pool_hole_head_place( jit_pool_offset, alloc_size,\n                                                ios_jit_hole_off_eff, ios_jit_hole_end_eff );' in bump
-assert native.count('ios_pool_hole_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff );') == 2
-assert 'ios_jit_hole_off_eff - jit_pool_offset' in bump, 'the leftover freelist range excludes a lower image slot'
+bump = native[native.index('/* madeira-bcd split pool: never into a hole (ios_jit_hole_off, pool-mid'):][:3200]
+assert ('ios_pool_holes_head_place( jit_pool_offset, alloc_size,\n'
+        '                                                 ios_jit_hole_off_eff, ios_jit_hole_end_eff,\n'
+        '                                                 ios_jit_hole2_off, ios_jit_hole2_end );') in bump
+assert native.count('ios_pool_holes_head_place( jit_pool_offset, alloc_size, ios_jit_hole_off_eff, ios_jit_hole_end_eff,') == 2
+assert 'ios_pool_hole_head_place( jit_pool_offset' not in native, 'every placement takes both holes'
+assert ('ios_pool_skip_pieces( jit_pool_offset, cand, ios_jit_hole_off_eff, ios_jit_hole_end_eff,\n'
+        '                                               ios_jit_hole2_off, ios_jit_hole2_end, poff, psz )') in bump, \
+    'the leftover freelist ranges exclude a lower image slot and both holes'
 assert 'ios_jit_hole_end );' not in native.replace('ios_jit_hole_end_eff );', ''), 'no placement uses the bare hole end'
-assert '#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off)' in native, \
-    'the warmer still warms the slot'
+assert ('#define IOS_POOL_IN_HOLE(o) ((size_t)(o) - ios_jit_hole_off < ios_jit_hole_end - ios_jit_hole_off || \\\n'
+        '                             (size_t)(o) - ios_jit_hole2_off < ios_jit_hole2_end - ios_jit_hole2_off)') in native, \
+    'the warmer still warms the slot and skips both native holes'
 slot_alloc = native[native.index('/* madeira-bcd: the big-image slot (ios_pool_big_off), once it is free and'):][:1500]
 assert 'pool_limit && ios_pool_big_size && !ios_pool_big_taken && alloc_size >= IOS_POOL_BIG_MIN' in slot_alloc
 assert 'now - ios_pool_big_freed_at >= IOS_POOL_REUSE_GRACE_SEC' in slot_alloc
@@ -80,25 +90,41 @@ assert 'ios_pool_big_off = slot;' in big_init and 'ios_jit_hole_end_eff = skip_e
 assert 'ios_jit_hole_off_eff = skip_off;' in big_init
 assert native.index('ios_jit_hole_end_eff = (size_t)h1;') < native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );')
 assert 'jit_pool_offset = cand + alloc_size;' in bump
-assert 'ios_pool_freelist[ios_pool_free_count].off = jit_pool_offset;' in bump
+assert 'ios_pool_freelist[ios_pool_free_count].off = poff[k];' in bump
 
 warmer = function(native, 'static void *ios_pool_warmer_thread(')
 assert warmer.count('if (IOS_POOL_IN_HOLE(o)) continue;') == 4, 'all four warmer loops skip the hole'
 
 tail = native[native.index('size_t reserve_offset, tail_added, tail_skipped = 0;'):][:12000]
-assert 'ios_pool_hole_tail_start( ios_jit_pool_size_global, cur, alloc_size,' in tail
+assert 'ios_pool_holes_tail_start( ios_jit_pool_size_global, cur, alloc_size,' in tail
 assert tail.count('ios_pool_tail_unreserve( &ios_jit_tail_reserved, reserve_offset + alloc_size, tail_added,') == 2
 assert '__sync_fetch_and_sub(&ios_jit_tail_reserved' not in tail, 'every rollback goes through ios_pool_tail_unreserve'
-assert 'ios_tail_carves[ios_tail_carve_n].off = ios_jit_hole_end_eff;' in tail
-assert 'ios_jit_hole_off_eff, ios_jit_hole_end_eff );' in tail, 'the tail jumps either slot placement with the hole'
-assert 'ios_jit_pool_size_global - cur - ios_jit_hole_end_eff' in tail
+assert 'ios_tail_carves[ios_tail_carve_n].off = skip_off[k];' in tail
+assert ('ios_jit_hole_off_eff, ios_jit_hole_end_eff,\n'
+        '                                                   ios_jit_hole2_off, ios_jit_hole2_end );') in tail, \
+    'the tail jumps either slot placement with the hole, and the second hole'
+assert ('ios_pool_skip_pieces( ios_jit_pool_size_global - start, ios_jit_pool_size_global - cur,') in tail
+assert 'if (skip_size[k] < 0x100000 || ios_tail_carve_n >= IOS_TAIL_CARVE_MAX) continue;' in tail
 
-cap = native[native.index('enum { TAIL_SMALL = 0x1000000 };'):][:1800]
+cap = native[native.index('enum { TAIL_SMALL = 0x1000000 };'):][:2200]
 assert 'ios_pool_code_cap( ios_jit_pool_size_global, head_now, tail_now,' in cap
-assert 'ios_jit_hole_off_eff, ios_jit_hole_end_eff, ios_pool_head_reserve );' in cap
+assert ('ios_jit_hole_off_eff, ios_jit_hole_end_eff,\n'
+        '                                            ios_pool_head_reserve +\n'
+        '                                            ios_pool_hole_between( ios_jit_pool_size_global, head_now, tail_now,\n'
+        '                                                                   ios_jit_hole2_off, ios_jit_hole2_end ) );') in cap, \
+    'the second hole is not room for code either'
 assert 'if (alloc_size > cap && !low_fits)' in cap, 'region C still bypasses the tail cap'
 
 init = native[native.index('const char *hole = getenv( "WINE_IOS_JIT_HOLE" );'):][:1400]
+init2 = native[native.index('const char *hole2 = getenv( "WINE_IOS_JIT_HOLE2" );'):][:1200]
+assert ('if (ios_jit_hole_end > ios_jit_hole_off && h0 >= ios_jit_hole_end + 0x4000 &&\n'
+        '                            h1 > h0 && h1 < jit_pool_size && !(h0 & 0x3fff) && !(h1 & 0x3fff))') in init2, \
+    'a second hole only above a valid first one, with a third region between them'
+assert 'ios_jit_hole2_off = (size_t)h0;' in init2 and 'ios_jit_hole2_end = (size_t)h1;' in init2
+assert native.index('ios_jit_hole_end = (size_t)h1;') < native.index('const char *hole2 = getenv( "WINE_IOS_JIT_HOLE2" );') \
+    < native.index('const char *big = getenv( "MADEIRA_POOL_BIG_SLOT_MB" );'), 'hole 1, then hole 2, then the slot'
+assert ('if (big && *big && strtoul( big, NULL, 10 ) && ios_jit_hole2_end > ios_jit_hole2_off)') in native, \
+    'the big-image slot is laid out against one hole: refused with two'
 assert 'h1 < jit_pool_size' in init and '!(h0 & 0x3fff) && !(h1 & 0x3fff)' in init
 assert 'ios_jit_hole_off = (size_t)h0;' in init and 'ios_jit_hole_end = (size_t)h1;' in init
 assert native.index('ios_jit_pool_size_global = jit_pool_size;') < native.index('const char *hole = getenv( "WINE_IOS_JIT_HOLE" );')
@@ -111,13 +137,58 @@ print('PASS: bump, warmer, tail carve, BIG cap, pool init and the POISONED branc
 
 assert 'MadeiraConfig.gameValue("pool-split") ?? MadeiraConfig.get("pool-split")' in swift
 assert 'if poolSize >= requestedPoolSize {' in swift, 'no split when the pool got its full size'
-assert 'poolHole = holeEnd > poolSize ? (off: poolSize, end: holeEnd) : nil' in swift
+assert 'poolHole = bOff > aSize ? (off: aSize, end: bOff) : nil' in swift
+assert swift.count('splitHoles(aSize: poolSize, bOff: holeEnd, rxBase: rxAddrV)') == 2
 assert 'VM_FLAGS_OVERWRITE' in swift and 'rw + (rxB - rxA)' in swift, 'one RW alias, one RX->RW distance'
 assert 'gapHitsWindow' in swift, 'the hole may never hold the executable window'
 hole_env = content[content.index('if let hole = StikJITHelper.poolHole {'):][:300]
 assert 'setenv("WINE_IOS_JIT_HOLE", String(format: "%lx:%lx", hole.off, hole.end), 1)' in hole_env
 assert 'unsetenv("WINE_IOS_JIT_HOLE")' in hole_env
 print('PASS: the app splits only on request and exports WINE_IOS_JIT_HOLE only for a split pool')
+
+# pool-mid (RDR2 build 470, 14:33: a 71 MB mapping at image load cut the pool to 285 + 319 MB
+# around 213 MB of free space; d3dcompiler_47.dll found no room, ERR_GFX_INIT)
+def swift_func(signature):
+    start = swift.index(signature)
+    return swift[start:swift.index('\n    }\n', start) + 7]
+
+
+take = swift_func('private static func takeSecondRegion(')
+mid_take = take[take.index('poolMid = nil'):take.index('// PROT_NONE placeholders over the free gaps between the regions.')]
+assert 'MadeiraConfig.gameValue("pool-mid") ?? MadeiraConfig.get("pool-mid")' in mid_take
+assert '["1", "on", "true", "yes"].contains(midText)' in mid_take, 'pool-mid is opt-in (GTA never gets it)'
+assert 'let midBudget = want - Int(size)' in mid_take and 'midBudget >= 64 << 20' in mid_take, \
+    'M only from what A and B left of the requested size'
+assert 'freeRuns(aEnd, b, minSize: 64 << 20).max(by: { $0.size < $1.size })' in mid_take, 'M only between the regions'
+assert 'freeRuns(0x100000000, run.base, minSize: msize)' in mid_take and 'mplugs.append(' in mid_take, \
+    'every lower run that could take M is plugged (first-fit)'
+assert 'if m >= run.base && m + msize <= run.base + run.size {' in mid_take, 'a stray M is released'
+assert take.index('poolMid = nil') > take.index('let b = vm_address_t(bitPattern: p)'), 'M only after B is placed'
+assert 'VM_FLAGS_OVERWRITE' not in mid_take
+assert swift.index('poolMid = nil   // pool-mid') < swift.index('var pairSecond: (base: vm_address_t, size: vm_address_t)? = nil'), \
+    'reset before pool-pair, which takes B (and M) early'
+assert swift.count('poolMid = nil') == 4
+holes = swift_func('private static func splitHoles(')
+assert 'poolHole = below ?? above' in holes and 'poolHole2 = below == nil ? nil : above' in holes
+assert swift.count('"pool-RW-alias-mid"') == 2, 'M gets its own no-footprint request'
+assert 'if let mid = poolMid { lowRegions.append((rx: mid.base, size: mid.size)) }' in swift, 'C, A, M, B with region C'
+assert ("rwSplit = mapLowAlias([(rx: rxAddrV, size: vm_address_t(poolSize)), (rx: mid.base, size: mid.size),\n"
+        "                                           (rx: second.base, size: second.size)], tag: \"[pool-mid]\")") in swift
+released = swift[swift.index('if rwSplit == nil {\n                        let dkr'):][:400]
+assert 'vm_deallocate(mach_task_self_, mid.base, vm_size_t(mid.size))' in released and 'poolMid = nil' in released, \
+    'a failed three-region alias gives M back and maps A and B as before'
+gone = swift[swift.index('the pool stays \\(poolSize >> 20)MB in one region", level: .error)'):][:300]
+assert 'vm_deallocate(mach_task_self_, mid.base, vm_size_t(mid.size))' in gone, 'M goes with B'
+hole2_env = content[content.index('if let hole2 = StikJITHelper.poolHole2 {'):][:300]
+assert 'setenv("WINE_IOS_JIT_HOLE2", String(format: "%lx:%lx", hole2.off, hole2.end), 1)' in hole2_env
+assert 'unsetenv("WINE_IOS_JIT_HOLE2")' in hole2_env
+assert content.index('if let hole = StikJITHelper.poolHole {') < content.index('if let hole2 = StikJITHelper.poolHole2 {')
+allocator = (root / 'app/Madeira/JITAllocator.c').read_text()
+assert 'vm_address_t ra = win + winsz + (vm_address_t)madeira_early_pool_size;' in allocator, \
+    'the mapping the placeholder ran into is recorded too'
+assert 'ml1135: the placeholder ended at the mapping' in swift
+print('PASS: pool-mid takes the largest free run between the regions as region M after B, aliases A, M and B in one '
+      'reservation (M given back on failure) and exports WINE_IOS_JIT_HOLE2 only with M')
 
 # pool-pair (GTA build 364, 21:00 / 23:47): two runs above the window instead of the 464 MB hole below it
 pair = swift[swift.index('let pairOff = '):swift.index('if pairA == nil && largest < vm_address_t(poolSize) {')]
@@ -139,6 +210,7 @@ harness = r'''
 #include <stdint.h>
 #include <string.h>
 static size_t ios_jit_hole_off, ios_jit_hole_end;
+static size_t ios_jit_hole2_off, ios_jit_hole2_end;
 ''' + macro + helpers + runs_typedef + runs + r'''
 #define MB ((size_t)1 << 20)
 #define FAIL(...) do { fprintf(stderr, __VA_ARGS__); exit(1); } while (0)
@@ -149,6 +221,7 @@ static struct range live[4096];
 static int nlive;
 static size_t total, head, tail_resv;
 static unsigned long jumps, below;
+static size_t skipped_head;
 static size_t eff_end;                   /* ios_jit_hole_end_eff; 0 = ios_jit_hole_end */
 static size_t big_off, big_size;
 static int big_taken;
@@ -160,6 +233,8 @@ static void check_new( size_t off, size_t size )
     if (off + size > total) FAIL("range 0x%zx+0x%zx past the pool end\n", off, size);
     if (ios_jit_hole_end > ios_jit_hole_off && off < ios_jit_hole_end && off + size > ios_jit_hole_off)
         FAIL("range 0x%zx+0x%zx overlaps the hole [0x%zx,0x%zx)\n", off, size, ios_jit_hole_off, ios_jit_hole_end);
+    if (ios_jit_hole2_end > ios_jit_hole2_off && off < ios_jit_hole2_end && off + size > ios_jit_hole2_off)
+        FAIL("range 0x%zx+0x%zx overlaps hole 2 [0x%zx,0x%zx)\n", off, size, ios_jit_hole2_off, ios_jit_hole2_end);
     for (i = 0; i < nlive; i++)
         if (live[i].live && off < live[i].off + live[i].size && off + size > live[i].off)
             FAIL("range 0x%zx+0x%zx overlaps live 0x%zx+0x%zx\n", off, size, live[i].off, live[i].size);
@@ -169,7 +244,8 @@ static void check_new( size_t off, size_t size )
 static int head_alloc( size_t size )   /* ios_pool_alloc_range_ex's bump */
 {
     size_t limit = total - tail_resv;
-    size_t cand = ios_pool_hole_head_place( head, size, ios_jit_hole_off, HOLE_END_EFF );
+    size_t cand = ios_pool_holes_head_place( head, size, ios_jit_hole_off, HOLE_END_EFF,
+                                             ios_jit_hole2_off, ios_jit_hole2_end );
     if (big_size && size >= 64 * ((size_t)1 << 20) && !big_taken && size <= big_size)
     {   /* the big-image slot */
         check_new( big_off, size );
@@ -178,7 +254,20 @@ static int head_alloc( size_t size )   /* ios_pool_alloc_range_ex's bump */
     }
     if (cand + size > limit) return 0;
     check_new( cand, size );
-    if (cand != head) jumps++;
+    if (cand != head)
+    {
+        size_t po[3], ps[3], kept = 0;
+        int np = ios_pool_skip_pieces( head, cand, ios_jit_hole_off, HOLE_END_EFF, ios_jit_hole2_off, ios_jit_hole2_end, po, ps ), k;
+        jumps++;
+        for (k = 0; k < np; k++)
+        {
+            if (k && po[k] < po[k - 1] + ps[k - 1]) FAIL("skipped pieces out of order\n");
+            if (IOS_POOL_IN_HOLE(po[k]) || IOS_POOL_IN_HOLE(po[k] + ps[k] - 1)) FAIL("a skipped piece in a hole\n");
+            if (po[k] < head || po[k] + ps[k] > cand) FAIL("a skipped piece outside the jump\n");
+            kept += ps[k];
+        }
+        skipped_head += kept;
+    }
     head = cand + size;
     return 1;
 }
@@ -187,7 +276,8 @@ static int tail_alloc( size_t size )   /* NtAllocateVirtualMemoryEx's EC_CODE ca
 {
     int split = ios_jit_hole_end > ios_jit_hole_off;
     size_t cur = tail_resv, start, added, off;
-    if (split) start = ios_pool_hole_tail_start( total, cur, size, ios_jit_hole_off, HOLE_END_EFF );
+    if (split) start = ios_pool_holes_tail_start( total, cur, size, ios_jit_hole_off, HOLE_END_EFF,
+                                                  ios_jit_hole2_off, ios_jit_hole2_end );
     else start = cur;
     tail_resv = start + size;
     added = start + size - cur;
@@ -222,6 +312,35 @@ static void model( size_t pool, size_t h0, size_t h1, int rounds, size_t *heads,
             else { size_t t = (size_t)0x100000 << rnd(8); if (tail_alloc( t )) *tails += t; }
         }
     }
+}
+
+/* pool-mid: the random model with two holes (hole 1 below hole 2) */
+static void model2( size_t pool, size_t a0, size_t a1, size_t b0, size_t b1, int rounds, size_t *heads, size_t *tails )
+{
+    ios_jit_hole2_off = b0; ios_jit_hole2_end = b1;
+    model( pool, a0, a1, rounds, heads, tails );
+    ios_jit_hole2_off = ios_jit_hole2_end = 0;
+}
+
+/* RDR2 on build 470 (2026-10-09 14:33): A 285 MB | early mapping 71 MB | 213 MB free |
+ * stack 7 MB | B 319 MB. 462 MB of image copies, FEX code 128 + 16 MB from the pool
+ * (region C full) after the first 300 MB, then d3dcompiler_47.dll (720 KB) last.
+ * mid = 0: the 470 pool (one hole over all of it); mid = 1: pool-mid. Returns the step
+ * that failed, 0 if none. */
+static int rdr2_470( int mid )
+{
+    /* M is the 213 MB run rounded down to 16 MB (poolRunSize): 208 MB, the rest stays in hole 2 */
+    size_t a = 285 * MB, m0 = a + 71 * MB, m1 = m0 + 208 * MB, b0 = m0 + 213 * MB + 7 * MB + 0x40000, i;
+    total = 0x38000000; head = 0; tail_resv = 0; nlive = 0;
+    if (b0 + 319 * MB > total) FAIL("rdr2 layout does not fit the span\n");
+    ios_jit_hole_off = a; ios_jit_hole_end = mid ? m0 : b0;
+    ios_jit_hole2_off = mid ? m1 : 0; ios_jit_hole2_end = mid ? b0 : 0;
+    for (i = 0; i < 300; i += 4) if (!head_alloc( 4 * MB )) return 1;
+    if (!tail_alloc( 128 * MB ) || !tail_alloc( 16 * MB )) return 2;
+    for (i = 300; i < 462; i += 3) if (!head_alloc( 3 * MB )) return 3;
+    if (!head_alloc( 0xb4000 )) return 4;                                           /* d3dcompiler_47.dll */
+    ios_jit_hole2_off = ios_jit_hole2_end = 0;
+    return 0;
 }
 
 /* GTA V Enhanced + Social Club, sizes from the 2026-10-02 logs: returns the step that failed, 0 if none */
@@ -282,7 +401,58 @@ int main( void )
     if (ios_pool_hole_tail_start( 600 * MB, 7 * MB, 16 * MB, 0, 0 ) != 7 * MB) FAIL("tail start without hole\n");
     if (ios_pool_hole_between( 600 * MB, 1 * MB, 1 * MB, 0, 0 )) FAIL("between without hole\n");
     if (IOS_POOL_IN_HOLE(0) || IOS_POOL_IN_HOLE(0x4000) || IOS_POOL_IN_HOLE(~(size_t)0)) FAIL("IN_HOLE without hole\n");
+    if (ios_pool_holes_head_place( 0x1234000, 0x8000, 0, 0, 0, 0 ) != 0x1234000 ||
+        ios_pool_holes_tail_start( 600 * MB, 7 * MB, 16 * MB, 0, 0, 0, 0 ) != 7 * MB ||
+        ios_pool_holes_between( 600 * MB, 1 * MB, 1 * MB, 0, 0, 0, 0 ))
+        FAIL("two-hole helpers without holes\n");
     printf("PASS: without WINE_IOS_JIT_HOLE the helpers are the old bump, carve and room\n");
+
+    /* pool-mid helpers against the one-hole ones, and the skipped pieces */
+    {
+        size_t h1o = 285 * MB, h1e = 356 * MB, h2o = 569 * MB, h2e = 576 * MB, tot = 896 * MB, po[3], ps[3];
+        size_t cur, sz;
+        for (cur = 0; cur < tot; cur += 3 * MB + 0x4000)
+            for (sz = 0x4000; sz < 300 * MB; sz = sz * 3 + 0x4000)
+            {
+                if (ios_pool_holes_head_place( cur, sz, h1o, h1e, 0, 0 ) != ios_pool_hole_head_place( cur, sz, h1o, h1e ))
+                    FAIL("two-hole head place with one hole differs\n");
+                if (ios_pool_holes_tail_start( tot, cur, sz, h1o, h1e, 0, 0 ) != ios_pool_hole_tail_start( tot, cur, sz, h1o, h1e ))
+                    FAIL("two-hole tail start with one hole differs\n");
+                {
+                    size_t h = ios_pool_holes_head_place( cur, sz, h1o, h1e, h2o, h2e );
+                    if (h < cur || (h < h1e && h + sz > h1o) || (h < h2e && h + sz > h2o)) FAIL("head into a hole\n");
+                }
+                if (cur + sz <= tot)
+                {
+                    size_t t = ios_pool_holes_tail_start( tot, cur, sz, h1o, h1e, h2o, h2e ), off;
+                    if (t < cur || t + sz > tot) continue;
+                    off = tot - t - sz;
+                    if ((off < h1e && off + sz > h1o) || (off < h2e && off + sz > h2o)) FAIL("tail carve into a hole\n");
+                }
+            }
+        if (ios_pool_skip_pieces( 280 * MB, 576 * MB, h1o, h1e, h2o, h2e, po, ps ) != 2 ||
+            po[0] != 280 * MB || ps[0] != 5 * MB || po[1] != h1e || ps[1] != h2o - h1e)
+            FAIL("skip pieces across both holes\n");
+        if (ios_pool_skip_pieces( 300 * MB, 600 * MB, h1o, h1e, h2o, h2e, po, ps ) != 2 ||
+            po[0] != h1e || ps[0] != h2o - h1e || po[1] != h2e || ps[1] != 24 * MB)
+            FAIL("skip pieces from inside hole 1\n");
+        if (ios_pool_skip_pieces( 280 * MB, 285 * MB, h1o, h1e, 0, 0, po, ps ) != 1 || po[0] != 280 * MB || ps[0] != 5 * MB)
+            FAIL("skip pieces below one hole\n");
+        if (ios_pool_skip_pieces( h1o, h1e, h1o, h1e, h2o, h2e, po, ps ) != 0) FAIL("a hole is no piece\n");
+        if (ios_pool_skip_pieces( 0, 0x2000, 0, 0, 0, 0, po, ps ) != 0) FAIL("a piece under 16 KB\n");
+        if (!IOS_POOL_IN_HOLE(h1o) && 0) FAIL("x\n");
+        ios_jit_hole_off = h1o; ios_jit_hole_end = h1e; ios_jit_hole2_off = h2o; ios_jit_hole2_end = h2e;
+        if (!IOS_POOL_IN_HOLE(h2o) || !IOS_POOL_IN_HOLE(h2e - 0x4000) || IOS_POOL_IN_HOLE(h2e) || IOS_POOL_IN_HOLE(h2o - 0x4000) ||
+            !IOS_POOL_IN_HOLE(h1o) || IOS_POOL_IN_HOLE(h1e))
+            FAIL("IN_HOLE with two holes\n");
+        if (ios_pool_holes_between( tot, 100 * MB, 100 * MB, h1o, h1e, h2o, h2e ) != (h1e - h1o) + (h2e - h2o))
+            FAIL("room excludes both holes\n");
+        if (ios_pool_holes_between( tot, 400 * MB, 100 * MB, h1o, h1e, h2o, h2e ) != h2e - h2o)
+            FAIL("room once the head passed hole 1\n");
+        ios_jit_hole_off = ios_jit_hole_end = ios_jit_hole2_off = ios_jit_hole2_end = 0;
+        printf("PASS: pool-mid helpers equal the one-hole ones without a second hole, never hand out either hole, "
+               "and the skipped pieces are the pool memory in between\n");
+    }
 
     /* the 16:33 layout: A = 592 MB, stack gap ~5.7 MB, B = 288 MB */
     a = 592 * MB; b = a + 0x5bc000 + 0x4000 * 3; c = b + 288 * MB;
@@ -323,6 +493,20 @@ int main( void )
     if ((n = gta_scenario( 592 * MB, 0, 0 )) != 4) FAIL("GTA scenario on the 592 MB pool failed at step %d, not 4\n", n);
     if ((n = gta_scenario( c, a, b )) != 0) FAIL("GTA scenario on the split pool failed at step %d\n", n);
     printf("PASS: GTA-shaped run: the 592 MB pool refuses libcef.dll, the split pool (592 + 288 MB) serves it all\n");
+    if ((n = rdr2_470( 0 )) != 3 && n != 4) FAIL("RDR2 470 layout without pool-mid failed at step %d, not 3/4\n", n);
+    if ((n = rdr2_470( 1 )) != 0) FAIL("RDR2 470 layout with pool-mid failed at step %d\n", n);
+    printf("PASS: RDR2 build 470 layout: the 604 MB pool runs the image copies dry, with the 208 MB third region "
+           "(812 MB) everything, d3dcompiler_47.dll included, fits\n");
+    jumps = below = 0; skipped_head = 0;
+    model2( 0x38000000, 285 * MB, 356 * MB, 569 * MB, 576 * MB, 300, &heads, &tails );
+    if (!jumps || !below || !skipped_head) FAIL("the two-hole model never jumped (%lu), carved below (%lu) or kept a piece\n",
+                                                jumps, below);
+    printf("PASS: two-hole model, 300 runs: %zu MB head + %zu MB tail (%lu head jumps, %lu carves below a hole, "
+           "%zu MB of skipped pieces kept), nothing in either hole, no overlap\n", heads >> 20, tails >> 20, jumps, below,
+           skipped_head >> 20);
+    model2( 0x38000000, 64 * MB, 64 * MB + 0x4000, 64 * MB + 0x8000, 64 * MB + 0xc000, 100, &heads, &tails );
+    model2( 0x38000000, 0x38000000 - 0x14000, 0x38000000 - 0x10000, 0x38000000 - 0xc000, 0x38000000 - 0x8000, 100, &heads, &tails );
+    printf("PASS: two 16 KB holes close together near either end are never handed out\n");
     model( 592 * MB, 0, 0, 300, &heads, &tails );
     printf("PASS: unsplit model, 300 runs: %zu MB head + %zu MB tail, no overlap\n", heads >> 20, tails >> 20);
     if ((n = gta373( 0 )) != 3) FAIL("build 373 without the slot failed at step %d, not 3 (libcef.dll)\n", n);

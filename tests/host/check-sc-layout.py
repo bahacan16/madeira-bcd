@@ -90,7 +90,7 @@ assert loop.index('if (ios_pool_keep_big( ios_pool_freelist[i].size, alloc_size,
     < loop.index('ios_pool_range_execable('), 'a kept range is not salvaged first'
 assert 'bump_ok = bump_cand + alloc_size <= pool_limit && IOS_POOL_IN_REACH(bump_cand);' in alloc
 bump = alloc[alloc.index('if (off == (size_t)-1)'):]
-assert 'size_t cand = ios_pool_hole_head_place( jit_pool_offset, alloc_size,' in bump
+assert 'size_t cand = ios_pool_holes_head_place( jit_pool_offset, alloc_size,' in bump   # pool-mid: both holes
 assert 'if (cand + alloc_size <= pool_limit\n            && IOS_POOL_IN_REACH(cand))' in bump, 'bump_ok mirrors the bump'
 
 nt = native[native.index('NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process'):]
