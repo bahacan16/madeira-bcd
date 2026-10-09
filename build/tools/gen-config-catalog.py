@@ -133,6 +133,22 @@ OVERLAY = {
                         "Horizon Zero Dawn needs it (its constant buffers sit in spaces 6 and 8). Shaders converted "
                         "with it on are cached apart from the others. Read once per session.",
                 "sources": ["madeira-d3d12/src/unix/madeira_ir_unix.mm", "madeira-d3d12/src/pe/madeira_d3d12.c"]},
+    "env.MADEIRA_GAME_DIALOG_CURSOR": {"category": "Windows, display & input", "title": "Cursor over a game's launcher or message box",
+                "kind": "bool", "default": "1",
+                "note": "Default on. A game session draws no cursor: the finger is the pointer. While the game shows a "
+                        "launcher or message box, the arrow is drawn where the finger last touched (where the click "
+                        "lands) and goes away with the box. Tap the button itself to press it. 0: no cursor, as "
+                        "before. Desktop (Dock) sessions keep their own cursor."},
+    # madeira-bcd: tools/patch-winemetal-null-fragment.py (winemetal reads it).
+    "gs-null-fragment": {"category": "Direct3D 12", "title": "Empty fragment function for pipelines without a pixel shader",
+                "kind": "bool", "default": "1", "sources": ["tools/patch-winemetal-null-fragment.py"],
+                "note": "Default on. Metal aborts on a mesh pipeline (geometry shader or tessellation emulation) "
+                        "with rasterization on and no fragment function, while D3D allows a pipeline with no pixel "
+                        "shader. On: such a pipeline gets an empty fragment function and writes no render target, "
+                        "as in D3D; depth and stencil work as before. Horizon Zero Dawn's pipeline thread died "
+                        "without it and the game stopped after its first frame. 0: such a pipeline is refused "
+                        "instead (the geometry shader is dropped). Pipelines with a pixel shader are not touched. "
+                        "Read once per session."},
     "env.MADEIRA_BAND_CENSUS": {"category": "Debugging / logs", "title": "Log the 64 GB address band by piece",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: about once a minute and when a large reserve fails, [band] lines say what "

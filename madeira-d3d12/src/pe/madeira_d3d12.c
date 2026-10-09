@@ -12343,6 +12343,237 @@ static void mad_libshare_add(UINT64 k0, UINT64 k1, obj_handle_t lib, obj_handle_
     ReleaseSRWLockExclusive(&g_libshare_lock);
 }
 
+/* madeira-bcd rsig-miss: the converter's code 4
+ * (IRErrorCodeResourceNotReferencedByRootSignature) names no resource, and
+ * Horizon Zero Dawn (build 469, 2026-10-09 13:57) lost 116 DXIL vertex and
+ * pixel shaders to it. This names them. The shader's bindings come from its
+ * PSV0 part (kind, space, first and last register), its stage from the DXIL
+ * program header. A binding is covered by a root CBV/SRV/UAV or root constants
+ * of the same kind, space and register, by a table range of the same kind and
+ * space that holds all of its registers (an unbounded shader array needs an
+ * unbounded range), or by a static sampler, each visible to the stage (compute
+ * sees every parameter). Log only, on the failure path; nothing converts
+ * differently. Once per shader (container digest), 24 shaders at most. */
+/* rsig-miss-test:begin */
+static const unsigned char *mad_dxbc_part(const unsigned char *b, SIZE_T n, const char *cc, UINT32 *len) {
+    int bad = 0;
+    UINT32 nchunk, i;
+    if (!b || n < 32 || memcmp(b, "DXBC", 4) != 0) return NULL;
+    nchunk = rs_rd(b, n, 28, &bad);
+    if (bad || nchunk == 0 || nchunk > 64) return NULL;
+    for (i = 0; i < nchunk; i++) {
+        UINT32 off = rs_rd(b, n, 32 + 4 * (SIZE_T)i, &bad), sz;
+        if (bad || (SIZE_T)off + 8 > n) return NULL;
+        sz = rs_rd(b, n, (SIZE_T)off + 4, &bad);
+        if (bad || (SIZE_T)off + 8 + sz > n) return NULL;
+        if (memcmp(b + off, cc, 4) == 0) { *len = sz; return b + off + 8; }
+    }
+    return NULL;
+}
+
+/* The visibility the shader needs (MADEIRA_IR_VIS_*) from the DXIL program
+ * header's shader kind; ALL for compute and anything unknown. */
+static UINT32 mad_dxil_stage_vis(const unsigned char *b, SIZE_T n, const char **stage) {
+    UINT32 len = 0, ver;
+    int bad = 0;
+    const unsigned char *p = mad_dxbc_part(b, n, "DXIL", &len);
+    *stage = "?";
+    if (!p || len < 4) return MADEIRA_IR_VIS_ALL;
+    ver = rs_rd(p, len, 0, &bad);
+    switch ((ver >> 16) & 0xffff) {
+    case 0: *stage = "PS"; return MADEIRA_IR_VIS_PIXEL;
+    case 1: *stage = "VS"; return MADEIRA_IR_VIS_VERTEX;
+    case 2: *stage = "GS"; return MADEIRA_IR_VIS_GEOMETRY;
+    case 3: *stage = "HS"; return MADEIRA_IR_VIS_HULL;
+    case 4: *stage = "DS"; return MADEIRA_IR_VIS_DOMAIN;
+    case 5: *stage = "CS"; return MADEIRA_IR_VIS_ALL;
+    default: return MADEIRA_IR_VIS_ALL;
+    }
+}
+
+static int mad_rsig_vis_ok(UINT32 vis, UINT32 want) {
+    return vis == MADEIRA_IR_VIS_ALL || want == MADEIRA_IR_VIS_ALL || vis == want;
+}
+
+/* 1 when the root signature holds registers [lo, hi] (hi 0xffffffff:
+ * unbounded) of range kind rk in space sp for a stage that needs want. */
+static int mad_rsig_covers(const struct mad_rootsig *rs, UINT32 rk, UINT32 sp, UINT32 lo, UINT32 hi, UINT32 want) {
+    UINT i, j;
+    if (!rs) return 0;
+    for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
+        const struct madeira_ir_root_param *p = &rs->params[i];
+        if (!mad_rsig_vis_ok(p->visibility, want)) continue;
+        switch (p->type) {
+        case MADEIRA_IR_PARAM_CONSTANTS:
+        case MADEIRA_IR_PARAM_CBV:
+        case MADEIRA_IR_PARAM_SRV:
+        case MADEIRA_IR_PARAM_UAV:
+            if (rk == (p->type == MADEIRA_IR_PARAM_SRV ? MADEIRA_IR_RANGE_SRV : p->type == MADEIRA_IR_PARAM_UAV
+                       ? MADEIRA_IR_RANGE_UAV : MADEIRA_IR_RANGE_CBV) &&
+                p->register_space == sp && p->shader_register == lo && hi == lo) return 1;
+            break;
+        case MADEIRA_IR_PARAM_TABLE:
+            for (j = 0; j < p->num_ranges && (UINT64)p->first_range + j < rs->nranges; j++) {
+                const struct madeira_ir_root_range *r = &rs->ranges[p->first_range + j];
+                if (r->range_type != rk || r->register_space != sp || !r->num_descriptors || lo < r->base_register) continue;
+                if (r->num_descriptors == 0xffffffffu) return 1;
+                if (hi != 0xffffffffu && (UINT64)hi <= (UINT64)r->base_register + r->num_descriptors - 1) return 1;
+            }
+            break;
+        }
+    }
+    if (rk == MADEIRA_IR_RANGE_SAMPLER)
+        for (i = 0; i < rs->nsamplers && i < 32; i++) {
+            const struct madeira_ir_static_sampler *s = &rs->samplers[i];
+            if (mad_rsig_vis_ok(s->visibility, want) && s->register_space == sp && s->shader_register == lo && hi == lo)
+                return 1;
+        }
+    return 0;
+}
+
+static void mad_rsig_put(char *out, SIZE_T cap, SIZE_T *used, const char *fmt, ...) {
+    va_list ap;
+    int w;
+    if (*used + 1 >= cap) return;
+    va_start(ap, fmt);
+    w = vsnprintf(out + *used, cap - *used, fmt, ap);
+    va_end(ap);
+    if (w > 0) *used += (SIZE_T)w < cap - *used ? (SIZE_T)w : cap - *used - 1;
+}
+
+static void mad_rsig_put_regs(char *out, SIZE_T cap, SIZE_T *used, char reg, UINT32 lo, UINT32 hi, UINT32 sp) {
+    if (hi == lo) mad_rsig_put(out, cap, used, "%c%u space %u", reg, lo, sp);
+    else if (hi == 0xffffffffu) mad_rsig_put(out, cap, used, "%c%u-unbounded space %u", reg, lo, sp);
+    else mad_rsig_put(out, cap, used, "%c%u-%c%u space %u", reg, lo, reg, hi, sp);
+}
+
+static const char *mad_rsig_vis_name(UINT32 v) {
+    switch (v) {
+    case MADEIRA_IR_VIS_VERTEX: return "VS";
+    case MADEIRA_IR_VIS_HULL: return "HS";
+    case MADEIRA_IR_VIS_DOMAIN: return "DS";
+    case MADEIRA_IR_VIS_GEOMETRY: return "GS";
+    case MADEIRA_IR_VIS_PIXEL: return "PS";
+    default: return "all";
+    }
+}
+
+/* The shader's bindings no root-signature entry covers ("SRV t5 space 1, ...")
+ * into miss, every binding into all; returns the number missing, -1 without a
+ * readable PSV0 part. */
+static int mad_rsig_miss(const struct mad_rootsig *rs, const unsigned char *b, SIZE_T n, UINT32 want,
+                         char *miss, SIZE_T miss_cap, char *all, SIZE_T all_cap, UINT *nbind) {
+    UINT32 len = 0, rti, nres, bsz, k;
+    int bad = 0, nmiss = 0;
+    SIZE_T off, um = 0, ua = 0;
+    const unsigned char *p = mad_dxbc_part(b, n, "PSV0", &len);
+    if (miss_cap) miss[0] = 0;
+    if (all_cap) all[0] = 0;
+    *nbind = 0;
+    if (!p) return -1;
+    rti = rs_rd(p, len, 0, &bad);
+    off = 4 + (SIZE_T)rti;
+    nres = rs_rd(p, len, off, &bad);
+    off += 4;
+    if (bad) return -1;
+    if (!nres) return 0;
+    bsz = rs_rd(p, len, off, &bad);
+    off += 4;
+    if (bad || bsz < 16 || (UINT64)off + (UINT64)nres * bsz > len) return -1;
+    *nbind = nres;
+    for (k = 0; k < nres; k++, off += bsz) {
+        UINT32 ty = rs_rd(p, len, off, &bad), sp = rs_rd(p, len, off + 4, &bad);
+        UINT32 lo = rs_rd(p, len, off + 8, &bad), hi = rs_rd(p, len, off + 12, &bad), rk;
+        const char *kind;
+        char reg;
+        switch (ty) {
+        case 1: rk = MADEIRA_IR_RANGE_SAMPLER; kind = "sampler"; reg = 's'; break;
+        case 2: rk = MADEIRA_IR_RANGE_CBV; kind = "CBV"; reg = 'b'; break;
+        case 3: case 4: case 5: rk = MADEIRA_IR_RANGE_SRV; kind = "SRV"; reg = 't'; break;
+        case 6: case 7: case 8: case 9: rk = MADEIRA_IR_RANGE_UAV; kind = "UAV"; reg = 'u'; break;
+        default: continue;
+        }
+        mad_rsig_put(all, all_cap, &ua, "%s%s ", ua ? ", " : "", kind);
+        mad_rsig_put_regs(all, all_cap, &ua, reg, lo, hi, sp);
+        if (mad_rsig_covers(rs, rk, sp, lo, hi, want)) continue;
+        nmiss++;
+        mad_rsig_put(miss, miss_cap, &um, "%s%s ", um ? ", " : "", kind);
+        mad_rsig_put_regs(miss, miss_cap, &um, reg, lo, hi, sp);
+    }
+    return nmiss;
+}
+
+/* "table{CBV b0 space 6, SRV t0-t15 space 0} PS; root CBV b1 space 8 all; ..." */
+static void mad_rsig_describe(const struct mad_rootsig *rs, char *out, SIZE_T cap) {
+    static const char kinds[4][8] = { "SRV", "UAV", "CBV", "sampler" };
+    static const char regs[4] = { 't', 'u', 'b', 's' };
+    SIZE_T used = 0;
+    UINT i, j;
+    if (cap) out[0] = 0;
+    if (!rs) { mad_rsig_put(out, cap, &used, "none (the pipeline has no root signature)"); return; }
+    for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
+        const struct madeira_ir_root_param *p = &rs->params[i];
+        if (i) mad_rsig_put(out, cap, &used, "; ");
+        if (p->type == MADEIRA_IR_PARAM_TABLE) {
+            mad_rsig_put(out, cap, &used, "table{");
+            for (j = 0; j < p->num_ranges && (UINT64)p->first_range + j < rs->nranges; j++) {
+                const struct madeira_ir_root_range *r = &rs->ranges[p->first_range + j];
+                UINT32 t = r->range_type < 4 ? r->range_type : 0;
+                mad_rsig_put(out, cap, &used, "%s%s ", j ? ", " : "", kinds[t]);
+                mad_rsig_put_regs(out, cap, &used, regs[t], r->base_register,
+                                  r->num_descriptors == 0xffffffffu ? 0xffffffffu
+                                  : r->base_register + (r->num_descriptors ? r->num_descriptors - 1 : 0),
+                                  r->register_space);
+            }
+            mad_rsig_put(out, cap, &used, "} %s", mad_rsig_vis_name(p->visibility));
+        } else if (p->type == MADEIRA_IR_PARAM_CONSTANTS) {
+            mad_rsig_put(out, cap, &used, "%u constants b%u space %u %s", p->num_constants, p->shader_register,
+                         p->register_space, mad_rsig_vis_name(p->visibility));
+        } else {
+            mad_rsig_put(out, cap, &used, "root %s %c%u space %u %s",
+                         p->type == MADEIRA_IR_PARAM_CBV ? "CBV" : p->type == MADEIRA_IR_PARAM_SRV ? "SRV" : "UAV",
+                         p->type == MADEIRA_IR_PARAM_CBV ? 'b' : p->type == MADEIRA_IR_PARAM_SRV ? 't' : 'u',
+                         p->shader_register, p->register_space, mad_rsig_vis_name(p->visibility));
+        }
+    }
+    if (rs->nsamplers) mad_rsig_put(out, cap, &used, "%s%u static sampler(s)", used ? "; " : "", rs->nsamplers);
+}
+/* rsig-miss-test:end */
+
+static void mad_rsig_miss_log(const char *tag, const struct mad_rootsig *rs, const void *dxil, SIZE_T n) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static UINT64 seen[24];
+    static UINT nseen;
+    const unsigned char *b = (const unsigned char *)dxil;
+    UINT64 h = 0;
+    UINT i, nb = 0;
+    const char *stage;
+    UINT32 want;
+    char miss[400], all[400], desc[900];
+    int m;
+    if (!b || n < 32) return;
+    memcpy(&h, b + 4, sizeof h);   /* the container digest */
+    AcquireSRWLockExclusive(&lock);
+    for (i = 0; i < nseen && seen[i] != h; i++) ;
+    if (i < nseen || nseen >= 24) { ReleaseSRWLockExclusive(&lock); return; }
+    seen[nseen++] = h;
+    ReleaseSRWLockExclusive(&lock);
+    want = mad_dxil_stage_vis(b, n, &stage);
+    m = mad_rsig_miss(rs, b, n, want, miss, sizeof miss, all, sizeof all, &nb);
+    mad_rsig_describe(rs, desc, sizeof desc);
+    if (m < 0)
+        d3d12_log("[madeira-d3d12] rsig-miss %s (%s shader %016llx): no readable PSV0 part\n", tag, stage,
+                  (unsigned long long)h);
+    else if (!m)
+        d3d12_log("[madeira-d3d12] rsig-miss %s (%s shader %016llx): all %u bindings are in the root signature as "
+                  "this runtime reads it, the converter still refused: %s\n", tag, stage, (unsigned long long)h, nb, all);
+    else
+        d3d12_log("[madeira-d3d12] rsig-miss %s (%s shader %016llx): %d of %u bindings in no root-signature entry "
+                  "visible to it: %s | all: %s\n", tag, stage, (unsigned long long)h, m, nb, miss, all);
+    d3d12_log("[madeira-d3d12] rsig-miss %s (%s shader %016llx) root signature: %s\n", tag, stage,
+              (unsigned long long)h, desc);
+}
+
 /* ml1990: the inputs of one conversion request, shared by the first call and
  * any retry so the two can never disagree about what is being converted. */
 static void mad_fill_convert_inputs(struct madeira_ir_convert_args *a, struct mad_rootsig *rs,
@@ -12464,6 +12695,8 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
                   a.ret_error_code, (unsigned long long)dxil_len,
                   b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
         if (a.ret_note[0]) d3d12_log("[madeira-d3d12] converter service: %s\n", a.ret_note);
+        if (a.ret_backend != MADEIRA_IR_BACKEND_AIRCONV && a.ret_status == MADEIRA_IR_COMPILE_FAILED && a.ret_error_code == 4)
+            mad_rsig_miss_log(tag, rs, dxil, dxil_len);   /* madeira-bcd rsig-miss */
         /* A small container fits in the log whole; that is worth more than a
          * file that may never be written. */
         if (dxil_len <= 1024) {

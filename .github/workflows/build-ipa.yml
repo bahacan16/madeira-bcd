@@ -1081,6 +1081,16 @@ jobs:
       - name: Patch winemetal pipeline cache warm-up
         run: python3 tools/patch-winemetal-pso-warm.py
 
+      # Metal aborts on a mesh pipeline with rasterization on and no fragment
+      # function; D3D allows a pipeline with no pixel shader. Horizon Zero
+      # Dawn's vertex + geometry shader pipelines killed its pipeline thread
+      # and the game hung after its first frame (build 469). Such a pipeline
+      # now gets an empty fragment function and no colour writes (madeira.cfg
+      # gs-null-fragment = 0 refuses it instead). Pipelines that have a
+      # fragment function are untouched. Native only.
+      - name: Patch winemetal empty fragment function
+        run: python3 tools/patch-winemetal-null-fragment.py
+
       # Is God of War at 1080p GPU-bound? The logs had no GPU timing. The
       # [frame] instrument (server_ios.c, MADEIRA_FRAME_STATS=1, off by
       # default) gets each command buffer's GPU start/end, so it can print the
@@ -1179,6 +1189,15 @@ jobs:
           python3 tests/host/check-fullscreen-window.py
           python3 tests/host/check-dxbc-register-spaces.py
           python3 tests/host/check-metal-gap.py
+
+      # A mesh pipeline without a fragment function gets an empty one instead
+      # of Metal's abort (gs-null-fragment, on). The converter's code 4 names
+      # no resource: the D3D12 runtime logs which bindings no root-signature
+      # entry covers (logging only).
+      - name: Check the empty fragment function and the root-signature miss log
+        run: |
+          python3 tests/host/check-null-fragment.py
+          python3 tests/host/check-rsig-miss.py
 
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.

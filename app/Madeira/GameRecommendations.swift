@@ -251,16 +251,21 @@ enum GameRecommendations {
         resolution: "1920x1080", display: "fit")
 
     /// Horizon Zero Dawn (Complete Edition, GOG or Steam), still being brought
-    /// up: the list for build 469's test. Its shaders keep their constant
+    /// up: the list for build 471's test. Its shaders keep their constant
     /// buffers, samplers and textures in register spaces 6 and 8, which build
-    /// 466 refused (the game then crashed); MFC ships with build 468.
+    /// 466 refused (the game then crashed); MFC ships with build 468. Build 469
+    /// drew the first frame and hung (a pipeline without a pixel shader, fixed
+    /// in 471); DXGI now lists the virtual monitor's own modes, as user32 does,
+    /// so the game can pick this screen's resolution.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 1,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 2,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         dxbc-register-spaces = 1
         swap-mb = 3072
+        env.DXMT_WSI_MONITOR_IDENTITY = 1
+        env.DXMT_WSI_MODE_TABLE = 1
         """,
         avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit")
 

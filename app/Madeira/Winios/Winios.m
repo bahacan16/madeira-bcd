@@ -834,6 +834,8 @@ static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags
     pthread_mutex_unlock(&g_input_q.lock);
 }
 
+static void winios_game_cursor_touch(int x, int y);   /* cursor section, below */
+
 /* Public C entry points for Swift / UIKit gesture handlers.
  * Coordinates are in iOS view-local pixels; we scale to a fixed
  * 1024×768 logical surface inside winios_pProcessEvents to match
@@ -841,6 +843,7 @@ static void winios_q_push_ev(unsigned int type, int x, int y, unsigned int flags
 void winios_post_touch_down(int x, int y) {
     fprintf(stderr, "[winios] post_touch_down x=%d y=%d\n", x, y); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_game_cursor_touch(x, y);
 }
 
 void winios_post_touch_move(int x, int y) {
@@ -849,11 +852,13 @@ void winios_post_touch_move(int x, int y) {
         fprintf(stderr, "[winios] post_touch_move x=%d y=%d (n=%u)\n", x, y, cnt); fflush(stderr);
     }
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_game_cursor_touch(x, y);
 }
 
 void winios_post_touch_up(int x, int y) {
     fprintf(stderr, "[winios] post_touch_up x=%d y=%d\n", x, y); fflush(stderr);
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE, 0);
+    winios_game_cursor_touch(x, y);
 }
 
 /* Key press bridge. vk = Windows virtual-key code, down = 1 for press,
@@ -1156,6 +1161,7 @@ static BOOL winios_covers_desktop(CGRect px) {
 }
 
 static void winios_forget_cursor_layer(void);   /* cursor section, below */
+static void winios_game_cursor_refresh(void);   /* cursor section, below */
 
 /* main thread only. Removes the compositor view and every window layer. */
 static void winios_drop_compositor(const char *why) {
@@ -1190,6 +1196,7 @@ static BOOL winios_game_window_shown(NSNumber *key) {
         fprintf(stderr, "[winios] game window hwnd=0x%llx not drawn (%s)\n", key.unsignedLongLongValue,
                 metal ? "presents through Metal" : rv ? "covers the guest desktop" : "no position yet");
         fflush(stderr);
+        winios_game_cursor_refresh();
     }
     return NO;
 }
@@ -1339,6 +1346,7 @@ static void winios_remove_layer(HWND hwnd) {
             [l removeFromSuperlayer];
             [g_layers removeObjectForKey:key];
             [g_px_rects removeObjectForKey:key];
+            winios_game_cursor_refresh();
         }
         CAMetalLayer *ml = g_metal_layers[key];
         if (ml) {
@@ -1667,6 +1675,7 @@ void winios_window_visibility(HWND hwnd, int visible) {
         [CATransaction commit];
         winios_sync_metal_hidden(@((uintptr_t)hwnd), l);
         winios_swap_layer_note(@((uintptr_t)hwnd), "parent shown or hidden");
+        winios_game_cursor_refresh();
         static unsigned n;
         if (++n <= 64 || (n % 128) == 0) {
             fprintf(stderr, "[winios] inherited visibility hwnd=%p visible=%d\n", hwnd, !hidden);
@@ -1732,6 +1741,7 @@ void winios_window_frame(HWND hwnd, int x, int y, int w, int h, int visible,
         [CATransaction commit];
         winios_sync_metal_hidden(key, l);
         winios_swap_layer_note(key, "window frame");
+        winios_game_cursor_refresh();
     });
 }
 
@@ -2232,6 +2242,24 @@ static UIImage *winios_cursor_image(void) {
 static int g_cur_w, g_cur_h, g_cur_hx, g_cur_hy;
 static CGPoint g_cursor_pos_px;
 
+/* madeira-bcd: the game-mode dialog cursor. A game session draws no cursor:
+ * the finger is the pointer. Over a launcher or message box that the game-mode
+ * overlay draws, that left the owner looking for a pointer that was not there
+ * (Horizon Zero Dawn's warning box, build 469, log 13:57: the finger went down
+ * on the text, was dragged and lifted below the box, so nothing was clicked).
+ * While such a window is on screen the arrow (or the program's cursor image)
+ * is drawn where the finger last touched, which is where the click lands, and
+ * it goes away with the last such window or when the program hides its
+ * cursor. env.MADEIRA_GAME_DIALOG_CURSOR = 0 turns it off. */
+static BOOL g_game_cursor_seen;          /* a touch placed it since the overlay appeared */
+static BOOL g_game_cursor_prog_hidden;   /* the program hid its cursor */
+static _Atomic int g_game_cursor_drawn;  /* it is on screen; read off the main thread by winios_pointer */
+
+static int winios_game_cursor_enabled(void) {
+    const char *e = getenv("MADEIRA_GAME_DIALOG_CURSOR");
+    return !(e && *e == '0');
+}
+
 /* Both Wine bitmaps and the built-in fallback have a desktop-pixel size.
  * A fixed 21-point fallback grows relative to a 1080p desktop fitted into a
  * portrait view. Keep the arrow's shape and use a normal 32-pixel height. */
@@ -2246,11 +2274,14 @@ static void winios_forget_cursor_layer(void) {
     [g_cursor_layer removeFromSuperlayer];
     g_cursor_layer = nil;
     g_cur_w = g_cur_h = g_cur_hx = g_cur_hy = 0;
+    g_game_cursor_seen = NO;
+    g_game_cursor_prog_hidden = NO;
+    atomic_store_explicit(&g_game_cursor_drawn, 0, memory_order_relaxed);
 }
 
 /* main thread only */
 static void winios_ensure_cursor_layer(void) {
-    if (g_cursor_layer || !g_compositor_view || g_comp_game) return;
+    if (g_cursor_layer || !g_compositor_view || (g_comp_game && !winios_game_cursor_enabled())) return;
     UIImage *img = winios_cursor_image();
     g_cursor_layer = [CALayer layer];
     g_cursor_layer.zPosition = 10000;   /* above every window layer */
@@ -2258,6 +2289,7 @@ static void winios_ensure_cursor_layer(void) {
     g_cursor_layer.contents = (id)img.CGImage;
     g_cursor_layer.bounds = CGRectMake(0, 0, img.size.width, img.size.height);
     g_cursor_layer.magnificationFilter = kCAFilterNearest;
+    if (g_comp_game) g_cursor_layer.hidden = YES;   /* winios_game_cursor_refresh shows it */
     [g_compositor_view.layer addSublayer:g_cursor_layer];
 }
 
@@ -2308,10 +2340,14 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
     if (w <= 0 || h <= 0 || !bgra) return;
     NSData *data = [NSData dataWithBytes:bgra length:(size_t)w * h * 4];
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!winios_desktop_session()) return;   /* game sessions: no drawn arrow */
-        winios_ensure_compositor();
-        if (!g_compositor_view) return;
+        if (!winios_desktop_session()) {   /* game sessions: only the dialog cursor */
+            if (!winios_game_cursor_enabled() || !g_comp_game || !g_compositor_view) return;
+        } else {
+            winios_ensure_compositor();
+            if (!g_compositor_view) return;
+        }
         winios_ensure_cursor_layer();
+        if (!g_cursor_layer) return;
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
         CGImageRef img = CGImageCreate(w, h, 8, 32, w * 4, cs,
@@ -2328,12 +2364,66 @@ void winios_cursor_set(unsigned int cur_id, int w, int h, int hot_x, int hot_y, 
         }
         CGDataProviderRelease(dp);
         CGColorSpaceRelease(cs);
+        winios_game_cursor_refresh();
     });
 }
 
 void winios_cursor_show(int show) {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_comp_game) {   /* the dialog cursor shows only over a dialog */
+            g_game_cursor_prog_hidden = !show;
+            winios_game_cursor_refresh();
+            return;
+        }
         if (g_cursor_layer) g_cursor_layer.hidden = !show;
+    });
+}
+
+/* main thread only: a window the game-mode overlay draws (a launcher or a
+ * message box) is on screen. Its layers are the only ones in g_layers there;
+ * a game window parked off screen before it presents does not count. */
+static BOOL winios_game_dialog_visible(void) {
+    if (!g_compositor_view) return NO;
+    CGRect view = g_compositor_view.bounds;
+    for (CALayer *l in g_layers.allValues)
+        if (!l.hidden && CGRectIntersectsRect(l.frame, view)) return YES;
+    return NO;
+}
+
+/* main thread only: the game-mode cursor is drawn while a dialog is on screen,
+ * a touch has placed it and the program shows its cursor. */
+static void winios_game_cursor_refresh(void) {
+    if (!g_comp_game || !g_cursor_layer) return;
+    BOOL show = g_game_cursor_seen && !g_game_cursor_prog_hidden && winios_game_dialog_visible();
+    if (g_cursor_layer.hidden == !show) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g_cursor_layer.hidden = !show;
+    [CATransaction commit];
+    atomic_store_explicit(&g_game_cursor_drawn, show ? 1 : 0, memory_order_relaxed);
+    static unsigned said;
+    if (said++ < 8) {
+        fprintf(stderr, "[winios] game-mode dialog cursor %s (MADEIRA_GAME_DIALOG_CURSOR=0 turns it off)\n",
+                show ? "shown" : "hidden");
+        fflush(stderr);
+    }
+}
+
+/* A touch in a game session (desktop pixels, as posted to Wine): the dialog
+ * cursor goes where the finger is, while a dialog is on screen. */
+static void winios_game_cursor_touch(int x, int y) {
+    if (winios_desktop_session() || !winios_game_cursor_enabled()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_comp_game || !g_compositor_view || !winios_game_dialog_visible()) return;
+        winios_ensure_cursor_layer();
+        if (!g_cursor_layer) return;
+        g_game_cursor_seen = YES;
+        g_cursor_pos_px = CGPointMake(x, y);
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        winios_cursor_place();
+        [CATransaction commit];
+        winios_game_cursor_refresh();
     });
 }
 
@@ -2341,6 +2431,13 @@ void winios_cursor_show(int show) {
  * engine owns the cursor position. */
 void winios_pointer(int x, int y, unsigned int flags, unsigned int data) {
     winios_q_push_ev(WINIOS_EV_MOUSE, x, y, flags, data);
+    /* a mouse or trackpad took over from the finger: its own cursor
+     * (HardwareInput's DirectCursorOverlay) is the one to see, not two */
+    if (atomic_load_explicit(&g_game_cursor_drawn, memory_order_relaxed))
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_game_cursor_seen = NO;
+            winios_game_cursor_refresh();
+        });
     /* ml641: ONLY an ABSOLUTE move carries a position. A relative move carries a
      * DELTA, so handing it to the cursor layer would fling the drawn arrow to the
      * top-left corner on every event. Relative mode is mouse-look, where the game

@@ -134,11 +134,13 @@ assert 'semaphoreFastPath: true, fpsMode: 4' in gta['switches'] and 'nvidia: tru
 assert 'env.MADEIRA_FASTSYNC_SEM = 1' in presets['gta5e-other']['lines']
 assert 'resolution: "1280x720"' in presets['ghost-of-tsushima']['switches'] and 'avx: true' in presets['ghost-of-tsushima']['switches']
 assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
-# Horizon Zero Dawn, still being brought up: build 469's test list (register spaces other than 0).
+# Horizon Zero Dawn, still being brought up: build 471's test list (register spaces other than 0,
+# and DXGI lists the virtual monitor's own modes so the game can pick this screen's resolution).
 hzd = presets['horizon-zero-dawn']
-assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'swap-mb = 3072'], hzd['lines']
-assert hzd['version'] == 1 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467 and 470 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 469\'s test list')
+assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'swap-mb = 3072',
+                            'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1'], hzd['lines']
+assert hzd['version'] == 2 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467 and 470 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 471\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')
