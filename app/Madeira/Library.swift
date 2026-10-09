@@ -749,7 +749,8 @@ final class LibraryModel: ObservableObject {
         var entry = entry
         // madeira-bcd: a game seen for the first time gets Madeira's recommended settings
         // (GameRecommendationsApply.swift): a finished Steam download, a new or saved entry.
-        GameRecommendations.prepare(&entry)
+        let isNew = !next.contains { $0.id == entry.id || (entry.steamAppID != nil && $0.steamAppID == entry.steamAppID) }
+        GameRecommendations.prepare(&entry, new: isNew)
         // A Steam game has one entry: a details page opened before its card first saved
         // one (refreshSteamMetadata) updates that entry.
         if let i = next.firstIndex(where: { $0.id == entry.id }) ??
@@ -2775,7 +2776,8 @@ struct LibraryView: View {
         }
         .sheet(isPresented: $browser) {
             NavigationStack { ExecutableBrowser(folder: LibraryModel.drive) { entry in
-                model.save(entry); browser = false; selected = entry
+                // madeira-bcd: the page shows the entry as stored, with its recommended settings.
+                model.save(entry); browser = false; selected = model.entries.first { $0.id == entry.id } ?? entry
             } }
         }
         .sheet(item: $selected) { entry in
@@ -2971,7 +2973,9 @@ struct LibraryDetail: View {
     /// which this page then shows (GameRecommendationsApply.swift).
     private func prepareRecommendation() {
         recommended = GameRecommendations.recommendation(for: entry)
-        if GameRecommendations.prepare(&entry) { model.save(entry) }
+        // A copy the library has not stored (a Steam game's first page) is a new entry.
+        let isNew = !model.entries.contains { $0.id == entry.id }
+        if GameRecommendations.prepare(&entry, new: isNew) { model.save(entry) }
     }
     /// Reset to Recommended: the recommendation's config and switches, written at once.
     private func resetToRecommended() {

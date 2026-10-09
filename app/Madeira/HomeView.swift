@@ -1211,7 +1211,7 @@ struct GameSettingsSheet: View {
                         }
                     }
                 } footer: {
-                    Text(GameRecommendations.note(recommended))
+                    Text(GameRecommendations.note(recommended, home: true))
                 }
             }
             .navigationTitle(game.title)

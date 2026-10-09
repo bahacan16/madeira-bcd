@@ -553,11 +553,12 @@ check('ResolutionChoices.groups()' in block(content, 'private var resolutionPick
 check('Picker("Aspect & scaling"' in detail and 'entry.display = $0' in detail, 'game details: Aspect & scaling')
 # The Desktop's details page carries every setting a game's page does. What the Desktop
 # entry leaves out names or starts one particular program: its title and cover, how it
-# starts, its launch arguments, a Home Screen link, its executable. A block gated off
-# for the Desktop must be one of those and hold no other control.
+# starts, its launch arguments, a Home Screen link, its executable, a game's recommended
+# settings (madeira-bcd). A block gated off for the Desktop must be one of those and hold
+# no other control.
 form_body = detail[:detail.index('.navigationTitle("Game details")')]
 desktop_out = ('Section("Library details")', 'Picker("Start"', 'TextField("Launch arguments"',
-               'Text("Home Screen")', 'Section("Executable")')
+               'Text("Home Screen")', 'Section("Executable")', 'Button("Reset to Recommended"')
 desktop_controls = {'Picker("Start"', 'Toggle("Start Windows services first"'}
 hidden = []
 for gate in re.finditer(r'\bif\b[^{\n]*(?:entry\.desktop != true|entry\.usesLaunchOptions)[^{\n]*\{', form_body):

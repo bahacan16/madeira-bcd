@@ -19,6 +19,11 @@
 //  whatever the game holds; for a game without one it empties the game's
 //  config.
 //
+//  The config file and the switches LibraryPrefs keeps belong to the game's
+//  Windows path, which both interfaces share; both are written for both. A
+//  library entry's own fields (fastsync, FPS limit, resolution, scaling) are
+//  written with them, or later for an entry new to the library.
+//
 
 import Foundation
 
@@ -38,22 +43,34 @@ extension GameRecommendations {
         entry.desktop == true ? nil : recommendation(windowsPath: entry.windowsPath, steamAppID: entry.steamAppID)
     }
 
-    /// A library entry's recommendation, when one is due (see above). True when the
-    /// entry's own fields took it too, so the caller saves the entry.
+    /// A library entry's recommendation, when one is due (see above). `new`: the entry
+    /// is not in the library yet; it then also takes the fields of a list written for
+    /// its game before (by the home screen, or for an entry since removed). True when
+    /// the entry's own fields changed, so the caller saves the entry.
     @discardableResult
-    static func prepare(_ entry: inout LibraryEntry) -> Bool {
-        guard entry.desktop != true,
-              let found = due(entry.windowsPath, steamAppID: entry.steamAppID, ownLines: entry.config, title: entry.title),
-              put(found.rec, to: entry.windowsPath, found.kind, title: entry.title), found.kind == .firstSight else { return false }
-        takeEntryFields(found.rec, &entry)
+    static func prepare(_ entry: inout LibraryEntry, new: Bool = false) -> Bool {
+        guard entry.desktop != true else { return false }
+        if let found = due(entry.windowsPath, steamAppID: entry.steamAppID, ownLines: entry.config, title: entry.title),
+           put(found.rec, to: entry.windowsPath, found.kind, title: entry.title), found.kind == .firstSight {
+            takeEntryFields(found.rec, &entry)
+            return true
+        }
+        // After an update too: a new entry takes the list now recorded for its path.
+        guard new, let mark = marks[entry.windowsPath.lowercased()], !mark.isEmpty,
+              let rec = recommendation(for: entry), mark.hasPrefix(rec.id + "#") else { return false }
+        takeEntryFields(rec, &entry)
+        LogStore.shared.log("[recommended] \(entry.title): \(rec.id) v\(rec.version) fields for a new library entry")
         return true
     }
 
     /// A madeira-bcd home screen game (its program's path), before its settings or a start.
+    /// Lines in a library entry's upstream `config` field for the same program count as
+    /// the game's own.
     static func prepare(windowsPath: String, title: String) {
-        guard let found = due(windowsPath, steamAppID: nil, ownLines: nil, title: title),
-              put(found.rec, to: windowsPath, found.kind, title: title), found.kind == .firstSight else { return }
-        takeHomeSwitches(found.rec, windowsPath)
+        let key = windowsPath.lowercased()
+        let ownLines = LibraryModel.shared.entries.first { $0.desktop != true && $0.windowsPath.lowercased() == key }?.config
+        guard let found = due(windowsPath, steamAppID: nil, ownLines: ownLines, title: title) else { return }
+        put(found.rec, to: windowsPath, found.kind, title: title)
     }
 
     /// Game details › Reset to Recommended. Returns what was written; nil when the
@@ -72,15 +89,15 @@ extension GameRecommendations {
     static func reset(windowsPath: String, title: String) -> GameRecommendation? {
         guard let rec = recommendation(windowsPath: windowsPath, steamAppID: nil) else { clear(windowsPath, title: title); return nil }
         put(rec, to: windowsPath, .reset, title: title)
-        takeHomeSwitches(rec, windowsPath)
         return rec
     }
 
-    /// The line under Reset to Recommended.
-    static func note(_ rec: GameRecommendation?) -> String {
+    /// The line under Reset to Recommended; `home`: the madeira-bcd home screen's settings.
+    static func note(_ rec: GameRecommendation?, home: Bool = false) -> String {
         guard let rec else { return "Madeira has no recommended settings for this game yet; resetting empties this game's config." }
         let lines = GameProfile.parse(rec.config).count
-        let switches = rec.switchSummary.isEmpty ? "" : "; " + rec.switchSummary
+        let summary = rec.summary(home: home)
+        let switches = summary.isEmpty ? "" : "; " + summary
         return "Madeira's recommended settings for \(rec.title): \(lines) config lines\(switches). Resetting replaces this game's config and these switches with them."
     }
 
@@ -94,14 +111,14 @@ extension GameRecommendations {
 
     private static func due(_ windowsPath: String, steamAppID: Int?, ownLines: String?,
                             title: String) -> (rec: GameRecommendation, kind: Write)? {
+        let mark = marks[windowsPath.lowercased()]
+        guard mark != "", let rec = recommendation(windowsPath: windowsPath, steamAppID: steamAppID) else { return nil }
         let text = GameProfile(windowsPath: windowsPath).text
-        if let mark = marks[windowsPath.lowercased()] {
+        if let mark {
             // Written before: a newer list replaces it while the file is exactly what was written.
-            guard !mark.isEmpty, mark.hasSuffix("#" + fileHash(text)),
-                  let rec = recommendation(windowsPath: windowsPath, steamAppID: steamAppID), mark != stamp(rec) else { return nil }
+            guard mark != stamp(rec), mark.hasSuffix("#" + fileHash(text)) else { return nil }
             return (rec: rec, kind: .updated)
         }
-        guard let rec = recommendation(windowsPath: windowsPath, steamAppID: steamAppID) else { return nil }
         if !(text + (ownLines ?? "")).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // First seen with a config of its own: it stays, now and later.
             setMark("", windowsPath)
@@ -111,7 +128,10 @@ extension GameRecommendations {
         return (rec: rec, kind: .firstSight)
     }
 
-    /// The config file, and on first sight or a reset the switches LibraryPrefs keeps.
+    /// The config file, and on first sight or a reset the switches LibraryPrefs keeps for
+    /// the game's path: AVX, NVIDIA and Wine's C++ runtime, which both interfaces use,
+    /// and the home screen's forms of the rest (Safe thread sync is fastsync off; Screen
+    /// size takes the resolution when it is one of its sizes).
     @discardableResult
     private static func put(_ rec: GameRecommendation, to windowsPath: String, _ kind: Write, title: String) -> Bool {
         let file = GameProfile(windowsPath: windowsPath)
@@ -124,6 +144,8 @@ extension GameRecommendations {
             if let on = rec.avx { LibraryPrefs.setAVX(on, for: windowsPath) }
             if let on = rec.nvidia { LibraryPrefs.setNvidia(on, for: windowsPath) }
             if let on = rec.wineVCRT { LibraryPrefs.setWineVCRT(on, for: windowsPath) }
+            if let on = rec.fastSync { LibraryPrefs.setSafeSync(!on, for: windowsPath) }
+            if let size = rec.resolution, LibraryPrefs.screenSizes.contains(size) { LibraryPrefs.setScreen(size, for: windowsPath) }
         }
         setMark(stamp(rec), windowsPath)
         LogStore.shared.log("[recommended] \(title): \(rec.id) v\(rec.version) written (\(kind.rawValue))")
@@ -143,13 +165,6 @@ extension GameRecommendations {
         if let mode = rec.fpsMode { entry.fpsMode = mode }
         if let size = rec.resolution { entry.resolution = size }
         if let mode = rec.display { entry.display = mode == DisplayMode.fit.rawValue ? nil : mode }
-    }
-
-    /// The madeira-bcd home screen's forms of the same switches: Safe thread sync is
-    /// fastsync off; Screen size takes the resolution when it is one of its sizes.
-    private static func takeHomeSwitches(_ rec: GameRecommendation, _ windowsPath: String) {
-        if let on = rec.fastSync { LibraryPrefs.setSafeSync(!on, for: windowsPath) }
-        if let size = rec.resolution, LibraryPrefs.screenSizes.contains(size) { LibraryPrefs.setScreen(size, for: windowsPath) }
     }
 
     private static var marks: [String: String] {

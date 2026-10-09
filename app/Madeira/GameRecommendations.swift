@@ -15,9 +15,10 @@
 //  any time (GameRecommendationsApply.swift).
 //
 //  How a game is recognised:
-//    - A Steam game by its App ID or by its folder under steamapps\common,
-//      which Steam keeps the same from build to build.
-//    - Any other game by its program's file name, wherever it was installed.
+//    - A library Steam game by its App ID or by its folder under
+//      steamapps\common, which Steam keeps the same from build to build.
+//    - A program by its file name, wherever it was installed; only the
+//      game's own programs count, not a redistributable in its folder.
 //    - GTA V Enhanced by PlayGTAV.exe (or GTA5_Enhanced.exe) beside
 //      GTA5_Enhanced.exe: inside a Steam library it is the Steam copy,
 //      anywhere else another copy, and each has its own list.
@@ -25,7 +26,8 @@
 //  This file is Foundation only: tests/host/check-game-recommendations.py
 //  compiles it with a test harness. The lists are the working ones recorded
 //  in the private notes (OYUN-AYARLARI); a game that gets a newer working
-//  list gets it here too, with a higher `version`.
+//  list gets it here too, with a higher `version` (with every build, owner's
+//  order 2026-10-09).
 //
 
 import Foundation
@@ -58,15 +60,19 @@ struct GameRecommendation: Equatable {
     /// The config file's text as GameProfile stores it (one trailing newline).
     var fileText: String { config.hasSuffix("\n") ? config : config + "\n" }
 
-    /// A short list of the switches it sets, for the settings page.
-    var switchSummary: String {
+    /// A short list of the switches it sets, for Game details.
+    var switchSummary: String { summary(home: false) }
+
+    /// The same for the madeira-bcd home screen's settings, which have no fast
+    /// semaphore or FPS switches and show fastsync as Safe thread sync.
+    func summary(home: Bool) -> String {
         var parts: [String] = []
         if let avx { parts.append("AVX \(avx ? "on" : "off")") }
         if let nvidia { parts.append("NVIDIA \(nvidia ? "on" : "off")") }
         if let wineVCRT { parts.append("Wine's C++ runtime \(wineVCRT ? "on" : "off")") }
-        if fastSync == false { parts.append("fast synchronization off") }
-        if let semaphoreFastPath { parts.append("fast semaphore waits \(semaphoreFastPath ? "on" : "off")") }
-        if let fpsMode {
+        if fastSync == false { parts.append(home ? "safe thread sync on" : "fast synchronization off") }
+        if !home, let semaphoreFastPath { parts.append("fast semaphore waits \(semaphoreFastPath ? "on" : "off")") }
+        if !home, let fpsMode {
             let label = [1: "60", 3: "30", 4: "40", 0: "display maximum", 2: "uncapped"][fpsMode] ?? "\(fpsMode)"
             parts.append("FPS limit \(label)")
         }
@@ -83,7 +89,7 @@ enum GameRecommendations {
         id: "rdr2-steam", title: "Red Dead Redemption 2 (Steam)", version: 1,
         config: """
         # Madeira's recommended settings for Red Dead Redemption 2 (Steam).
-        # Game details › Reset to Recommended brings them back.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
         d3d12-caps-log = 2
         d3d12-shader-pack = 1
         replay-split = 1
@@ -130,7 +136,7 @@ enum GameRecommendations {
         id: "gta5e-steam", title: "GTA V Enhanced (Steam)", version: 1,
         config: """
         # Madeira's recommended settings for GTA V Enhanced (Steam).
-        # Game details › Reset to Recommended brings them back.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
         d3d12-caps-log = 2
         d3d12-core-dll = 1
         d3d12-msaa8 = 1
@@ -175,7 +181,7 @@ enum GameRecommendations {
         id: "gta5e-other", title: "GTA V Enhanced (not Steam)", version: 1,
         config: """
         # Madeira's recommended settings for GTA V Enhanced outside Steam.
-        # Game details › Reset to Recommended brings them back.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
         vram-mb = 4096
         d3d12-core-dll = 1
         d3d12-typed-uav-load = 1
@@ -201,7 +207,7 @@ enum GameRecommendations {
         id: "ghost-of-tsushima", title: "Ghost of Tsushima", version: 1,
         config: """
         # Madeira's recommended settings for Ghost of Tsushima.
-        # Game details › Reset to Recommended brings them back.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
         dxil-tess = 0
         sampler-reduction = 3
         ind-count = 6000
@@ -216,7 +222,7 @@ enum GameRecommendations {
         id: "god-of-war", title: "God of War", version: 1,
         config: """
         # Madeira's recommended settings for God of War.
-        # Game details › Reset to Recommended brings them back.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
         dxmt = d3d11.mipClampBC=2
         swap-mb = 6144
         swap-min-kb = 1024
@@ -234,39 +240,43 @@ enum GameRecommendations {
     /// Steam App IDs.
     static let rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500
 
-    /// The recommendation for a library entry, or nil.
-    /// - windowsPath: the entry's path; a program ("C:\Games\GoW\GoW.exe") or,
-    ///   for a Steam game, its install folder ("C:\...\steamapps\common\Red Dead Redemption 2").
-    /// - steamAppID: set for a Steam game.
-    /// - fileExists: whether a C:\ path exists (a file beside the program, or
-    ///   in a Steam game's folder).
+    /// The recommendation for a game, or nil.
+    /// - windowsPath: a program ("C:\Games\GoW\GoW.exe"), or a library Steam
+    ///   game's install folder ("C:\...\steamapps\common\Red Dead Redemption 2").
+    /// - steamAppID: set for a library Steam game.
+    /// - fileExists: whether a C:\ path exists (GTA5_Enhanced.exe beside a program).
     static func match(windowsPath: String, steamAppID: Int?, fileExists: (String) -> Bool) -> GameRecommendation? {
         let path = windowsPath.replacingOccurrences(of: "/", with: "\\").trimmingSuffix("\\")
         let parts = path.lowercased().split(separator: "\\").map(String.init)
         guard let last = parts.last else { return nil }
-        let isProgram = last.hasSuffix(".exe")
-        // The folder the program lives in, or the Steam game's install folder.
-        let folder = isProgram ? (path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? "") : path
         let steamFolder = steamCommonFolder(parts)
+        guard last.hasSuffix(".exe") else {
+            // A library Steam game: its App ID, or its folder under steamapps\common.
+            if steamAppID == rdr2AppID || steamFolder == "red dead redemption 2" { return rdr2Steam }
+            if steamAppID == gta5EnhancedAppID || steamFolder == "grand theft auto v enhanced" { return gta5EnhancedSteam }
+            if steamAppID == ghostAppID { return ghostOfTsushima }
+            if steamAppID == godOfWarAppID { return godOfWar }
+            return nil
+        }
+        // A program, wherever it was installed: only the game's own programs, so a
+        // redistributable inside a game's folder gets nothing.
         let inSteam = steamAppID != nil || steamFolder != nil
-        let exe = isProgram ? last : nil
-
-        // Steam games: the App ID, or the folder under steamapps\common.
-        if steamAppID == rdr2AppID || steamFolder == "red dead redemption 2" { return rdr2Steam }
-        if steamAppID == gta5EnhancedAppID || steamFolder == "grand theft auto v enhanced" { return gta5EnhancedSteam }
-        // GTA V Enhanced elsewhere: its launcher or game program beside GTA5_Enhanced.exe
-        // (the legacy edition has PlayGTAV.exe too, beside GTA5.exe).
-        if !inSteam, let exe, exe == "playgtav.exe" || exe == "gta5_enhanced.exe", fileExists(folder + "\\GTA5_Enhanced.exe") {
-            return gta5EnhancedOther
-        }
-        // Other games by their program, wherever they were installed.
-        if steamAppID == ghostAppID || exe == "ghostoftsushima.exe" || (inSteam && !isProgram && fileExists(folder + "\\GhostOfTsushima.exe")) {
+        switch last {
+        case "playgtav.exe", "gta5_enhanced.exe":
+            // GTA V Enhanced (the legacy edition has PlayGTAV.exe too, beside GTA5.exe):
+            // inside a Steam library the Steam copy, anywhere else another copy.
+            let folder = path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? ""
+            guard fileExists(folder + "\\GTA5_Enhanced.exe") else { return nil }
+            return inSteam ? gta5EnhancedSteam : gta5EnhancedOther
+        case "rdr2.exe", "playrdr2.exe":
+            return inSteam ? rdr2Steam : nil
+        case "ghostoftsushima.exe":
             return ghostOfTsushima
-        }
-        if steamAppID == godOfWarAppID || exe == "gow.exe" || (inSteam && !isProgram && fileExists(folder + "\\GoW.exe")) {
+        case "gow.exe":
             return godOfWar
+        default:
+            return nil
         }
-        return nil
     }
 
     /// The folder name right under steamapps\common, lowercased, or nil.

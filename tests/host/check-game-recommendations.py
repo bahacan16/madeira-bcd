@@ -59,7 +59,7 @@ assert 'static let all = [rdr2Steam, gta5EnhancedSteam, gta5EnhancedOther, ghost
 catalog_keys = set(re.findall(r'ConfigOption\(key: "([^"]+)"', catalog))
 for ident, p in presets.items():
     assert p['version'] >= 1, ident
-    assert p['lines'][0].startswith('# Madeira') and p['lines'][1].startswith('# Game details'), ident
+    assert p['lines'][0].startswith('# Madeira') and p['lines'][1].startswith('# Reset to Recommended'), ident
     seen = set()
     for line in p['lines'][2:]:
         assert line == line.strip() and not line.startswith('#'), (ident, line)
@@ -128,20 +128,24 @@ print('PASS: RDR2 (Steam) is the owner\'s 463 list line for line with its switch
 match = block(lists_src, 'static func match(', '\n    }\n')
 assert 'rdr2AppID = 1174180, gta5EnhancedAppID = 3240220, ghostAppID = 2215430, godOfWarAppID = 1593500' in lists_src
 assert 'steamFolder == "red dead redemption 2"' in match and 'steamFolder == "grand theft auto v enhanced"' in match
-assert 'exe == "ghostoftsushima.exe"' in match and 'exe == "gow.exe"' in match
-assert 'if !inSteam, let exe, exe == "playgtav.exe" || exe == "gta5_enhanced.exe", fileExists(folder + "\\\\GTA5_Enhanced.exe")' in match
-assert match.index('gta5EnhancedSteam }') < match.index('return gta5EnhancedOther')
+assert 'case "ghostoftsushima.exe":' in match and 'case "gow.exe":' in match and 'case "rdr2.exe", "playrdr2.exe":' in match
+assert 'case "playgtav.exe", "gta5_enhanced.exe":' in match and 'return inSteam ? gta5EnhancedSteam : gta5EnhancedOther' in match
+assert 'guard fileExists(folder + "\\\\GTA5_Enhanced.exe") else { return nil }' in match and 'default:\n            return nil' in match
 
 # Where the app applies them.
 save = block(library, '    func save(_ entry: LibraryEntry) {', '\n    }\n')
-assert save.index('GameRecommendations.prepare(&entry)') < save.index('persist(next)')
+assert save.index('let isNew = !next.contains { $0.id == entry.id || (entry.steamAppID != nil && $0.steamAppID == entry.steamAppID) }') \
+    < save.index('GameRecommendations.prepare(&entry, new: isNew)') < save.index('persist(next)')
 init = block(library, '    private init() {', '\n    }\n')
 assert init.index('resetPhoneResolution()') < init.index('applyRecommendations()')
 apply_all = block(library, '    private func applyRecommendations() {', '\n    }\n')
 assert 'guard !readOnly' in apply_all and 'GameRecommendations.prepare(&next[i])' in apply_all and 'persist(next)' in apply_all
 detail = block(library, 'struct LibraryDetail: View {', '\n/// madeira-bcd: a game\'s own options as the fork stores them')
 assert '.onAppear { migrateEntryOptions(); prepareRecommendation(); reloadBCD() }' in detail
-assert 'if GameRecommendations.prepare(&entry) { model.save(entry) }' in detail
+assert 'let isNew = !model.entries.contains { $0.id == entry.id }' in detail
+assert 'if GameRecommendations.prepare(&entry, new: isNew) { model.save(entry) }' in detail
+# Adding a game by hand opens its page with the entry the library stored.
+assert 'model.save(entry); browser = false; selected = model.entries.first { $0.id == entry.id } ?? entry' in library
 assert 'recommended = GameRecommendations.reset(&entry)' in detail
 reset_section = detail[detail.index('Button("Reset to Recommended", systemImage: "arrow.counterclockwise")'):]
 assert reset_section.index('Button("Reset", role: .destructive) { resetToRecommended() }') < reset_section.index('Text(GameRecommendations.note(recommended))')
@@ -149,22 +153,25 @@ assert reset_section.index('Button("Reset", role: .destructive) { resetToRecomme
 assert detail.index('Button("Remove from library"') < detail.index('Button("Reset to Recommended"') < detail.index('if let error { Section')
 assert '!remove, !confirmReset else { return }' in detail
 launch = block(content, '    private func launchLibraryEntry(_ entry: LibraryEntry) {', '\n    }\n')
-assert launch.index('if GameRecommendations.prepare(&entry) { library.save(entry) }') < launch.index('BCDLaunch.applyLibrary(entry, sessionLog: false)')
+assert launch.index('if GameRecommendations.prepare(&entry, new: isNew) { library.save(entry) }') < launch.index('BCDLaunch.applyLibrary(entry, sessionLog: false)')
 home_launch = block(home, '    private func launch(_ game: LibraryGame) {', '\n    }\n')
 assert home_launch.index('GameRecommendations.prepare(windowsPath: exe.windowsPath, title: game.title)') < home_launch.index('request.avx = LibraryPrefs.avx')
 sheet = block(home, 'struct GameSettingsSheet: View {', '\n// MARK: - App settings')
 assert 'recommended = GameRecommendations.reset(windowsPath: exePath, title: game.title)' in sheet
 assert sheet.index('Label("Save and play"') < sheet.index('Label("Reset to Recommended", systemImage: "arrow.counterclockwise")')
+assert 'Text(GameRecommendations.note(recommended, home: true))' in sheet
 assert 'guard !prepared else { return }' in sheet and sheet.count('prepareRecommendation()') == 3
 for name in ('GameRecommendations.swift', 'GameRecommendationsApply.swift'):
     assert project.count(f'/* {name} in Sources */') == 2, name   # PBXBuildFile and the Sources phase
     assert project.count(f'/* {name} */') == 3, name              # fileRef, PBXFileReference and the group
 # The rules: first sight only for a game with nothing of its own; switches only on first sight or a reset.
 due = block(apply_src, '    private static func due(', '\n    }\n')
-assert 'guard !mark.isEmpty, mark.hasSuffix("#" + fileHash(text))' in due
+assert due.index('guard mark != "", let rec = recommendation(') < due.index('let text = GameProfile(windowsPath: windowsPath).text')
+assert 'guard mark != stamp(rec), mark.hasSuffix("#" + fileHash(text)) else { return nil }' in due
 assert '!(text + (ownLines ?? "")).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty' in due and 'setMark("", windowsPath)' in due
 put = block(apply_src, '    private static func put(', '\n    }\n')
 assert 'guard file.text == rec.fileText' in put and 'if kind != .updated {' in put
+assert 'LibraryPrefs.setSafeSync(!on, for: windowsPath)' in put and 'LibraryPrefs.setScreen(size, for: windowsPath)' in put
 print('PASS: first sight in the library (start-up, save, Game details, start) and the home screen; Reset to Recommended last on both pages')
 
 # The Swift fixture: the real files with small stand-ins for the app types they use.
@@ -178,7 +185,9 @@ enum CoverStore {
 
 enum DisplayMode: String { case fit, fill, stretch, aspect }
 
-enum LibraryModel {
+final class LibraryModel {
+    static let shared = LibraryModel()
+    var entries: [LibraryEntry] = []
     static var drive: URL { URL(fileURLWithPath: ProcessInfo.processInfo.environment["MADEIRA_TEST_DRIVE"]!, isDirectory: true) }
 }
 
@@ -250,10 +259,15 @@ check(id(rdr2, 1174180) == "rdr2-steam", "RDR2 by its App ID")
 check(id(rdr2) == "rdr2-steam", "RDR2 by its Steam folder")
 check(id("D:\\SteamLibrary\\steamapps\\common\\Red Dead Redemption 2\\") == "rdr2-steam", "another Steam library, trailing backslash")
 check(id(#"C:\Games\Red Dead Redemption 2\RDR2.exe"#) == "none", "RDR2 outside Steam has no list")
+check(id(rdr2 + #"\RDR2.exe"#) == "rdr2-steam" && id(rdr2 + #"\PlayRDR2.exe"#) == "rdr2-steam", "RDR2's programs inside Steam")
+check(id(rdr2 + #"\Redistributables\vc_redist.x64.exe"#) == "none", "a redistributable in a game's Steam folder")
 let gta = steam + #"\Grand Theft Auto V Enhanced"#
 check(id(gta, 3240220) == "gta5e-steam", "GTA V Enhanced by its App ID")
 check(id(gta) == "gta5e-steam", "GTA V Enhanced by its Steam folder")
 check(id(gta + #"\PlayGTAV.exe"#, files: [gta + #"\GTA5_Enhanced.exe"#]) == "gta5e-steam", "PlayGTAV.exe inside Steam is the Steam copy")
+let renamed = steam + #"\GTAV Enhanced Copy"#
+check(id(renamed + #"\PlayGTAV.exe"#, files: [renamed + #"\GTA5_Enhanced.exe"#]) == "gta5e-steam", "in any Steam library folder")
+check(id(gta + #"\_CommonRedist\vc_redist.x64.exe"#, files: [gta + #"\GTA5_Enhanced.exe"#]) == "none", "not its redistributables")
 let other = #"C:\Games\GTA V Enhanced"#
 check(id(other + #"\PlayGTAV.exe"#, files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "PlayGTAV.exe elsewhere")
 check(id(other + #"\GTA5_Enhanced.exe"#, files: [other + #"\GTA5_Enhanced.exe"#]) == "gta5e-other", "GTA5_Enhanced.exe elsewhere")
@@ -264,7 +278,7 @@ check(id(other + #"\PlayGTAV.exe"#) == "none", "PlayGTAV.exe without GTA5_Enhanc
 check(id(#"C:\GhostOfTsushima\GhostOfTsushima.exe"#) == "ghost-of-tsushima", "GoT by its program")
 check(id(#"E:\Some Other Folder\ghostoftsushima.EXE"#) == "ghost-of-tsushima", "GoT anywhere, in any case")
 check(id(steam + #"\Ghost of Tsushima DIRECTOR'S CUT"#, 2215430) == "ghost-of-tsushima", "GoT from Steam")
-check(id(steam + #"\Ghost"#, 1, files: [steam + #"\Ghost\GhostOfTsushima.exe"#]) == "ghost-of-tsushima", "a Steam folder holding GoT's program")
+check(id(steam + #"\Ghost"#, 1, files: [steam + #"\Ghost\GhostOfTsushima.exe"#]) == "none", "a library Steam game is its App ID or folder name")
 check(id(#"C:\God of War\GoW.exe"#) == "god-of-war", "GoW by its program")
 check(id(steam + #"\God of War"#, 1593500) == "god-of-war", "GoW from Steam")
 check(id(#"C:\Games\God of War Ragnarok\GoWR.exe"#) == "none", "Ragnarok is another game")
@@ -280,6 +294,9 @@ for rec in R.all {
 }
 check(R.gta5EnhancedSteam.switchSummary == "AVX off, NVIDIA on, Wine's C++ runtime off, fast semaphore waits on, FPS limit 40",
       R.gta5EnhancedSteam.switchSummary)
+check(R.gta5EnhancedSteam.summary(home: true) == "AVX off, NVIDIA on, Wine's C++ runtime off", R.gta5EnhancedSteam.summary(home: true))
+check(R.note(R.ghostOfTsushima, home: true).contains("1280x720") && !R.note(R.ghostOfTsushima, home: true).contains("semaphore"),
+      R.note(R.ghostOfTsushima, home: true))
 check(R.note(R.rdr2Steam).contains("36 config lines") && R.note(nil).contains("no recommended settings"), R.note(R.rdr2Steam))
 
 // First sight, the player's changes, newer lists and Reset to Recommended.
@@ -328,6 +345,7 @@ var gow = LibraryEntry(title: "God of War", windowsPath: gowExe)
 gow.config = "dxmt = d3d11.mipClampBC=1"
 check(!R.prepare(&gow) && file(gowExe).isEmpty && mark(gowExe) == "", "lines in upstream's config field are the game's own")
 check(R.reset(&gow)?.id == "god-of-war" && gow.resolution == "1920x1080" && gow.config == nil, "God of War Reset")
+check(LibraryPrefs.screen(gowExe) == "1920x1080" && !LibraryPrefs.safeSync(gowExe), "the home screen's forms of the switches too")
 var desk = LibraryEntry(title: "Desktop", windowsPath: #"C:\windows\system32\explorer.exe"#)
 desk.desktop = true
 check(!R.prepare(&desk) && R.recommendation(for: desk) == nil, "the Desktop has none")
@@ -353,9 +371,34 @@ LibraryPrefs.setScreen("", for: play)
 check(R.reset(windowsPath: play, title: "GTA V Enhanced")?.id == "gta5e-other" && LibraryPrefs.screen(play) == "1280x720", "the home screen's Reset")
 var playEntry = LibraryEntry(title: "GTA V Enhanced", windowsPath: play)
 check(!R.prepare(&playEntry), "the library's entry for the same program sees it was written")
+check(R.prepare(&playEntry, new: true) && playEntry.resolution == "1280x720" && playEntry.fastSync == true,
+      "an entry new to the library takes the fields of a list written before")
+var page = LibraryEntry(title: "Red Dead Redemption 2", windowsPath: rdr2, steamAppID: 1174180)
+page.display = "fill"
+check(R.prepare(&page, new: true) && page.display == nil && page.fastSync == true && file(rdr2) == R.rdr2Steam.fileText,
+      "a Steam game's first page made before the library stored its entry")
+let gotSteam = steam + #"\Ghost of Tsushima DIRECTOR'S CUT"#
+let olderGoT = "# an older list\nswap-mb = 2048\n"
+GameProfile(windowsPath: gotSteam).text = olderGoT
+marks = (UserDefaults.standard.dictionary(forKey: key) as? [String: String]) ?? [:]
+marks[gotSteam.lowercased()] = "ghost-of-tsushima#0#" + String(CoverStore.stableHash(olderGoT), radix: 16)
+UserDefaults.standard.set(marks, forKey: key)
+var gotEntry = LibraryEntry(title: "Ghost of Tsushima", windowsPath: gotSteam, steamAppID: 2215430)
+check(R.prepare(&gotEntry, new: true) && file(gotSteam) == R.ghostOfTsushima.fileText && gotEntry.resolution == "1280x720",
+      "a new entry whose untouched older list is updated takes the list's fields too")
+let ownExe = #"C:\Games\Ghost Own\GhostOfTsushima.exe"#
+GameProfile(windowsPath: ownExe).text = "dxil-tess = 1\n"
+var own = LibraryEntry(title: "Ghost of Tsushima", windowsPath: ownExe)
+check(!R.prepare(&own, new: true) && mark(ownExe) == "" && own.resolution == "1408x648" && !LibraryPrefs.avx(ownExe),
+      "a config of its own stays its own for a new entry too")
 let got = #"C:\GoT\GhostOfTsushima.exe"#
 R.prepare(windowsPath: got, title: "Ghost of Tsushima")
 check(LibraryPrefs.avx(got) && LibraryPrefs.nvidia(got) && LibraryPrefs.screen(got) == "1280x720", "GoT on the home screen")
+// Lines in the library entry's upstream config field for the same program are the game's own.
+let otherGoW = #"C:\Other\GoW.exe"#
+LibraryModel.shared.entries = [LibraryEntry(title: "God of War", windowsPath: otherGoW, config: "dxmt = d3d11.mipClampBC=1")]
+R.prepare(windowsPath: otherGoW, title: "God of War")
+check(file(otherGoW).isEmpty && mark(otherGoW) == "" && LibraryPrefs.screen(otherGoW).isEmpty, "the library's own lines count on the home screen")
 check(LogStore.shared.lines.contains { $0.hasPrefix("[recommended] Red Dead Redemption 2: rdr2-steam v1 written (first sight)") }, "log line")
 UserDefaults.standard.removeObject(forKey: key)
 print("PASS: the home screen shares the files and records; Safe thread sync and Screen size take the list's values")
