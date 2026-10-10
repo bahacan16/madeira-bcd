@@ -349,9 +349,13 @@ enum GameRecommendations {
     /// Build 490's list keeps the game's two 32 MB readback buffers, where the
     /// GPU writes the depth pyramid the CPU culls with, on Metal's own memory
     /// instead of the file-backed swap tier (readback-swap = 0); vis-trace now
-    /// also compares every pyramid readback with the GPU's own copy.
+    /// also compares every pyramid readback with the GPU's own copy. Build
+    /// 491's list reads a table's single constant buffers when the draw is
+    /// recorded, as NVIDIA's driver and vkd3d-proton do (static-cbv): with
+    /// vkd3d-proton, Horizon Zero Dawn Remastered's foliage flicker stops when
+    /// that is extended to every such constant buffer.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 13,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 14,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -367,6 +371,7 @@ enum GameRecommendations {
         view-census = 1
         vis-trace = 1
         desc-guard = 1
+        static-cbv = 1
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1

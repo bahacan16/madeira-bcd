@@ -911,7 +911,15 @@ struct mad_rootsig {
      * converted only with its unbounded ranges given a size, 2 once that did not
      * help MAD_UNB_FAILS_MAX times; unb_fails counts those. */
     volatile LONG unb_state, unb_fails;
+    /* madeira-bcd static-cbv: per table parameter, its single-descriptor CBV
+     * ranges (table offsets, at most 8; bit k of scbv_vol set: range k is
+     * DESCRIPTORS_VOLATILE, as every 1.0 range is) and the table's extent in
+     * descriptors when every range is bounded and it is at most
+     * MAD_SCBV_MAX_EXT (else 0: the table is not copied) */
+    UINT8 scbv_n[MAD_ROOT_PARAM_MAX], scbv_vol[MAD_ROOT_PARAM_MAX];
+    UINT16 scbv_off[MAD_ROOT_PARAM_MAX][8], scbv_ext[MAD_ROOT_PARAM_MAX];
 };
+#define MAD_SCBV_MAX_EXT 64u
 struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
     obj_handle_t rps;          /* Metal render pipeline state */
@@ -1399,6 +1407,7 @@ enum mad_ck {
     MC_CROOTSIG, MC_CROOT, MC_CROOT_CONST,
     MC_QUERY_BEGIN, MC_QUERY_END, MC_QUERY_RESOLVE,   /* ml1088: occlusion queries */
     MC_BARRIER,   /* ml1091: a ResourceBarrier; ends an open compute or blit encoder so the fence chain orders what follows */
+    MC_CBV_LATCH,   /* madeira-bcd static-cbv: a table's constant-buffer descriptors as they were when a draw was recorded */
 };
 struct mad_cmd {
     enum mad_ck kind;
@@ -1431,6 +1440,7 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
         struct { float rgba[4]; } blend;
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
+        struct { UINT bp, index, data, n; UINT64 va; } latch;   /* madeira-bcd static-cbv: bind point (0 graphics, 1 compute), parameter, descriptors in cdata */
     } u;
 };
 
@@ -1466,6 +1476,11 @@ struct mad_list {
      * buffers are POINTERS in a table, so root constants consumed as a CBV need a
      * GPU-visible copy with a per-dispatch lifetime -- which is what this ring is. */
     UINT32 *cdata; unsigned ncdata, cdcap;   /* root constant words, referenced by MC_ROOT_CONST */
+    /* madeira-bcd static-cbv: what is bound while recording (root signatures and
+     * tables per bind point, 0 graphics / 1 compute; the CBV/SRV/UAV heap) and
+     * the last latch per parameter (its table and cdata offset + 1) */
+    struct mad_rootsig *rec_rs[2]; UINT64 rec_tab[2][MAD_ROOT_PARAM_MAX]; struct mad_heap *rec_heap;
+    UINT64 lat_va[2][MAD_ROOT_PARAM_MAX]; unsigned lat_data[2][MAD_ROOT_PARAM_MAX];
 };
 
 static struct mad_cmd *mad_list_push(struct mad_list *l, enum mad_ck kind) {
@@ -1543,6 +1558,8 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
     l->ncmds = 0;
     l->nused = 0;
     l->ncdata = 0;
+    l->rec_rs[0] = l->rec_rs[1] = NULL; l->rec_heap = NULL;   /* madeira-bcd static-cbv */
+    memset(l->rec_tab, 0, sizeof l->rec_tab); memset(l->lat_va, 0, sizeof l->lat_va); memset(l->lat_data, 0, sizeof l->lat_data);
     mad_list_rings_rewind(l);   /* ml1061: only reuses chunks the GPU has finished with */
     return S_OK;
 }
@@ -1731,6 +1748,11 @@ struct mad_exec {
      * argument records are copied when it ends (mad_ic_encode) */
     struct { struct mad_resource *args; UINT64 off; UINT32 count, stride; UINT16 kind; const struct mad_pso *pso; } ic[64]; unsigned nic;
     struct mad_skinx *sk;   /* madeira-bcd skin-check: this replay's state, check frames only (mad_skin_begin) */
+    /* madeira-bcd static-cbv: the latest latch per bind point (0 graphics, 1
+     * compute) and parameter (cdata offset + 1), and the table copy made for it
+     * (in which ring chunk, for which table and latch) */
+    UINT64 lat_va[2][MAD_ROOT_PARAM_MAX]; unsigned lat_data[2][MAD_ROOT_PARAM_MAX], lat_n[2][MAD_ROOT_PARAM_MAX];
+    UINT64 sc_src[2][MAD_ROOT_PARAM_MAX], sc_dst[2][MAD_ROOT_PARAM_MAX]; unsigned sc_lat[2][MAD_ROOT_PARAM_MAX], sc_chunk[2][MAD_ROOT_PARAM_MAX];
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
                              struct mad_resource *depth, const struct mad_rtvp *dp, unsigned seq, unsigned draws);
@@ -3629,6 +3651,169 @@ static int exec_ring_take(struct mad_exec *e, obj_handle_t *buf, UINT64 *off, vo
     return exec_ring_take_n(e, 1, buf, off, cpu, gpu);
 }
 
+/* madeira-bcd STATIC-CBV (madeira.cfg static-cbv, opt-in). D3D12 lets a
+ * driver read a table's descriptors when the GPU runs; NVIDIA's driver, and
+ * vkd3d-proton for single-descriptor CBV ranges ("hoisting", every one of them
+ * with VKD3D_CONFIG=force_static_cbv), read a constant-buffer descriptor when
+ * the draw is RECORDED. A game that rewrites such a descriptor after recording
+ * the draw (in the same list, before ExecuteCommandLists, or while the GPU still
+ * runs it) draws right there and wrong here: that draw reads another object's
+ * constants (Horizon Zero Dawn Remastered's foliage flicker on Proton stops with
+ * force_static_cbv). Here every draw or dispatch that is recorded latches the
+ * single-descriptor CBV ranges of the tables bound at that moment (MC_CBV_LATCH,
+ * only when they changed), and at replay the GPU reads a copy of the table
+ * (bounded tables of up to MAD_SCBV_MAX_EXT descriptors, in the argument ring's
+ * chunk of the draw's own slot, so it is resident): the other descriptors as
+ * the heap holds them at ExecuteCommandLists, the latched constant buffers as
+ * recorded.
+ *   static-cbv = 1  ranges NOT marked DESCRIPTORS_VOLATILE are used as recorded
+ *                   (vkd3d-proton's default; D3D12 forbids changing those
+ *                   after the table is set, so a game that keeps the rule
+ *                   renders exactly as before)
+ *   static-cbv = 2  every such range, VOLATILE ones too (force_static_cbv)
+ *   static-cbv = 3  latch and count only: how many latched descriptors had
+ *                   been rewritten by ExecuteCommandLists (rendering unchanged) */
+static int g_scbv_on = -1;
+static volatile LONG g_scbv_latches, g_scbv_checked, g_scbv_changed, g_scbv_checked_vol, g_scbv_changed_vol, g_scbv_copies, g_scbv_reused, g_scbv_skipped;
+static int mad_scbv_on(void) {
+    if (g_scbv_on < 0) {
+        long long v = mad_cfg_int_pe("static-cbv", 0);   /* fix: a draw's single-descriptor CBV table ranges are read when it is recorded (vkd3d-proton's hoisting); 1 = not VOLATILE ones, 2 = all, 3 = count only */
+        g_scbv_on = v >= 1 && v <= 3 ? (int)v : 0;
+        if (g_scbv_on)
+            d3d12_log("[static-cbv] madeira-bcd static-cbv = %d: single-descriptor CBV table ranges are latched when a draw or dispatch is recorded; %s\n",
+                      g_scbv_on, g_scbv_on == 1 ? "the GPU reads a copy of the table with the ranges not marked VOLATILE as recorded"
+                                 : g_scbv_on == 2 ? "the GPU reads a copy of the table with all of them as recorded"
+                                                  : "only counted (rendering unchanged)");
+    }
+    return g_scbv_on;
+}
+/* At the record of a draw or dispatch (bp 0 graphics, 1 compute): latch what
+ * changed since this parameter's last latch. */
+static void mad_scbv_latch(struct mad_list *l, int bp) {
+    const struct mad_rootsig *rs = l->rec_rs[bp];
+    const struct mad_heap *h = l->rec_heap;
+    unsigned i, k;
+    if (!rs || !h || !h->cpu || !h->count) return;
+    for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
+        UINT64 va = l->rec_tab[bp][i], rel, slot;
+        unsigned n = rs->scbv_n[i], at;
+        struct mad_cmd *c;
+        if (!n || !va || va < h->gpu_address) continue;
+        rel = va - h->gpu_address;
+        if (rel % sizeof(struct mad_descriptor)) continue;
+        slot = rel / sizeof(struct mad_descriptor);
+        if (slot >= h->count) continue;
+        if (l->lat_va[bp][i] == va && l->lat_data[bp][i]) {   /* the same values as the last latch: nothing to record */
+            const UINT32 *prev = &l->cdata[l->lat_data[bp][i] - 1];
+            for (k = 0; k < n; k++) {
+                UINT64 sl = slot + rs->scbv_off[i][k];
+                if (sl >= h->count || memcmp(&prev[k * 6], &h->cpu[sl], sizeof(struct mad_descriptor))) break;
+            }
+            if (k == n) continue;
+        }
+        if (!mad_grow((void **)&l->cdata, &l->cdcap, l->ncdata + n * 6, sizeof *l->cdata)) return;
+        at = l->ncdata;
+        for (k = 0; k < n; k++) {
+            UINT64 sl = slot + rs->scbv_off[i][k];
+            if (sl < h->count) memcpy(&l->cdata[at + k * 6], &h->cpu[sl], sizeof(struct mad_descriptor));
+            else memset(&l->cdata[at + k * 6], 0, sizeof(struct mad_descriptor));
+        }
+        c = mad_list_push(l, MC_CBV_LATCH);
+        if (!c) return;
+        l->ncdata += n * 6;
+        c->u.latch.bp = (UINT)bp; c->u.latch.index = i; c->u.latch.data = at; c->u.latch.n = n; c->u.latch.va = va;
+        l->lat_va[bp][i] = va; l->lat_data[bp][i] = at + 1;
+        InterlockedIncrement(&g_scbv_latches);
+    }
+}
+/* At replay: remember the latch, and count the latched descriptors the heap no
+ * longer holds (the game rewrote them between the record and now). */
+static void mad_scbv_replay(struct mad_exec *e, const struct mad_cmd *c) {
+    const struct mad_heap *h = e->srv;
+    unsigned bp = c->u.latch.bp, i = c->u.latch.index, k;
+    if (bp > 1 || i >= MAD_ROOT_PARAM_MAX) return;
+    e->lat_va[bp][i] = c->u.latch.va; e->lat_data[bp][i] = c->u.latch.data + 1; e->lat_n[bp][i] = c->u.latch.n;
+    if (!h || !h->cpu || c->u.latch.va < h->gpu_address) return;
+    {
+        const struct mad_rootsig *rs = bp ? e->crs : e->rs;
+        UINT64 slot = (c->u.latch.va - h->gpu_address) / sizeof(struct mad_descriptor);
+        if (!rs || rs->scbv_n[i] != c->u.latch.n) return;
+        for (k = 0; k < c->u.latch.n; k++) {
+            UINT64 sl = slot + rs->scbv_off[i][k];
+            int vol = (rs->scbv_vol[i] >> k) & 1;
+            if (sl >= h->count) break;
+            InterlockedIncrement(vol ? &g_scbv_checked_vol : &g_scbv_checked);
+            if (memcmp(&e->l->cdata[c->u.latch.data + k * 6], &h->cpu[sl], sizeof(struct mad_descriptor)))
+                InterlockedIncrement(vol ? &g_scbv_changed_vol : &g_scbv_changed);
+        }
+    }
+}
+/* Before a draw's or dispatch's argument slot (static-cbv = 1): copies of the
+ * latched tables, in the chunk the slot will be taken from. Returns the root
+ * values to encode (tmp when anything was replaced). */
+static const UINT64 *mad_scbv_root(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root, UINT64 *tmp, unsigned bp) {
+    struct mad_list *l = e->l;
+    const unsigned per = MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES;
+    const struct mad_heap *h = e->srv;
+    unsigned i, k, nt = 0, bytes = 0, slots, chunk, todo[MAD_ROOT_PARAM_MAX];
+    if (!h || !h->cpu || bp > 1) return root;
+    for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
+        UINT64 va = root[i], rel;
+        if (!rs->scbv_n[i] || !va || e->lat_va[bp][i] != va || !e->lat_data[bp][i] || e->lat_n[bp][i] != rs->scbv_n[i]) continue;
+        if (g_scbv_on == 1 && rs->scbv_vol[i] == (UINT8)((1u << rs->scbv_n[i]) - 1)) continue;   /* only VOLATILE ranges: read as the heap holds them */
+        rel = va - h->gpu_address;
+        if (!rs->scbv_ext[i] || va < h->gpu_address || rel % sizeof(struct mad_descriptor) ||
+            rel / sizeof(struct mad_descriptor) + rs->scbv_ext[i] > h->count) { InterlockedIncrement(&g_scbv_skipped); continue; }
+        todo[nt++] = i; bytes += rs->scbv_ext[i] * (unsigned)sizeof(struct mad_descriptor);
+    }
+    if (!nt) return root;
+    memcpy(tmp, root, MAD_ROOT_PARAM_MAX * sizeof *tmp);
+    chunk = l->ring_used / per;
+    for (k = 0; k < nt; k++) {   /* every one already copied, by this replay, into the chunk the slot comes from? */
+        i = todo[k];
+        if (!e->sc_dst[bp][i] || e->sc_src[bp][i] != root[i] || e->sc_lat[bp][i] != e->lat_data[bp][i] || e->sc_chunk[bp][i] != chunk) break;
+    }
+    if (k == nt && chunk < l->nrings) {
+        for (k = 0; k < nt; k++) tmp[todo[k]] = e->sc_dst[bp][todo[k]];
+        InterlockedIncrement(&g_scbv_reused);
+        return tmp;
+    }
+    slots = (bytes + MAD_ARG_SLOT_BYTES - 1) / MAD_ARG_SLOT_BYTES;
+    if (slots + 1 > per) return root;
+    if ((l->ring_used % per) + slots + 1 > per) l->ring_used += per - (l->ring_used % per);   /* the copies and the slot in one chunk */
+    chunk = l->ring_used / per;
+    if (chunk >= l->nrings && !mad_list_ring_grow(e)) return root;
+    {
+        unsigned slot = l->ring_used % per, used = 0;
+        unsigned char *cpu = (unsigned char *)l->ring_cpu[chunk] + (size_t)slot * MAD_ARG_SLOT_BYTES;
+        UINT64 gpu = l->ring_gpu[chunk] + (UINT64)slot * MAD_ARG_SLOT_BYTES;
+        for (k = 0; k < nt; k++) {
+            unsigned j, ext;
+            UINT64 s0;
+            i = todo[k]; ext = rs->scbv_ext[i];
+            s0 = (root[i] - h->gpu_address) / sizeof(struct mad_descriptor);
+            memcpy(cpu + used, &h->cpu[s0], (size_t)ext * sizeof(struct mad_descriptor));   /* the table as the heap holds it now */
+            for (j = 0; j < rs->scbv_n[i]; j++)   /* its constant buffers as they were when the draw was recorded */
+                if (rs->scbv_off[i][j] < ext && (g_scbv_on == 2 || !((rs->scbv_vol[i] >> j) & 1)))
+                    memcpy(cpu + used + (size_t)rs->scbv_off[i][j] * sizeof(struct mad_descriptor), &l->cdata[e->lat_data[bp][i] - 1 + j * 6],
+                           sizeof(struct mad_descriptor));
+            tmp[i] = gpu + used;
+            e->sc_src[bp][i] = root[i]; e->sc_lat[bp][i] = e->lat_data[bp][i]; e->sc_chunk[bp][i] = chunk; e->sc_dst[bp][i] = gpu + used;
+            used += ext * (unsigned)sizeof(struct mad_descriptor);
+        }
+        l->ring_used += slots;
+        InterlockedIncrement(&g_scbv_copies);
+    }
+    return tmp;
+}
+static void mad_scbv_report(UINT64 presents) {
+    d3d12_log("[static-cbv] present #%llu: %ld latches; rewritten between the draw's record and ExecuteCommandLists: %ld of %ld latched "
+              "descriptors of ranges not marked VOLATILE, %ld of %ld of VOLATILE ones; %ld table copies (%ld reused), %ld tables not copied "
+              "(unbounded, over %u descriptors or outside the heap)\n",
+              (unsigned long long)presents, (long)g_scbv_latches, (long)g_scbv_changed, (long)g_scbv_checked, (long)g_scbv_changed_vol,
+              (long)g_scbv_checked_vol, (long)g_scbv_copies, (long)g_scbv_reused, (long)g_scbv_skipped, MAD_SCBV_MAX_EXT);
+}
+
 /* ---- madeira-bcd: SYNC DIAGNOSTICS ---------------------------------------
  * Ghost of Tsushima draws one-frame "shapes in the air" (a rock, a tree
  * smeared by motion blur, lighting from a frame that never was) about once a
@@ -4272,7 +4457,11 @@ static int exec_arg_slot_for(struct mad_exec *e, const struct mad_rootsig *rs, c
     struct mad_list *l = e->l;
     unsigned chunk, slot;
     UINT64 sd_root[MAD_ROOT_PARAM_MAX];   /* madeira-bcd: sync diagnostics, see mad_sd_root */
+    UINT64 sc_root[MAD_ROOT_PARAM_MAX];   /* madeira-bcd static-cbv */
+    const unsigned sc_bp = root == e->croot ? 1u : 0u;
+    const int sc_on = (g_scbv_on == 1 || g_scbv_on == 2) && rs && root && (root == e->root || root == e->croot);
     if (g_sd_state > 0 && rs && root) root = mad_sd_root(e, rs, root, sd_root, pso);
+    if (sc_on) root = mad_scbv_root(e, rs, root, sc_root, sc_bp);
     chunk = l->ring_used / (MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES);
     slot = l->ring_used % (MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES);
     if (chunk >= l->nrings && !mad_list_ring_grow(e)) return 0;   /* ml1061: pooled, GPU-lifetime aware */
@@ -8391,7 +8580,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_PSO: if (c->u.pso && c->u.pso->is_compute) e.cpso = c->u.pso; else e.pso = c->u.pso;
             if (g_sd_state > 0 && g_pso_first && c->u.pso && !c->u.pso->first_used) mad_pso_first(c->u.pso);   /* madeira-bcd: pso-first-use */
             break;
-        case MC_CROOTSIG: e.crs = c->u.rootsig; break;
+        case MC_CROOTSIG: e.crs = c->u.rootsig; memset(e.lat_va[1], 0, sizeof e.lat_va[1]); break;   /* madeira-bcd static-cbv: latches are per signature */
         case MC_CROOT: if (c->u.root.index < MAD_ROOT_PARAM_MAX) e.croot[c->u.root.index] = c->u.root.value; break;
         case MC_CROOT_CONST:
             if (c->u.rconst.index < MAD_ROOT_PARAM_MAX && c->u.rconst.dst + c->u.rconst.n <= 64)
@@ -8435,7 +8624,8 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (c->u.clear.nrect) exec_clear_rects(&e, l, c);   /* madeira-bcd clear-rects */
             else exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags);
             break;
-        case MC_ROOTSIG: e.rs = c->u.rootsig; break;
+        case MC_ROOTSIG: e.rs = c->u.rootsig; memset(e.lat_va[0], 0, sizeof e.lat_va[0]); break;   /* madeira-bcd static-cbv: latches are per signature */
+        case MC_CBV_LATCH: mad_scbv_replay(&e, c); break;   /* madeira-bcd static-cbv */
         case MC_ROOT_CONST:
             if (c->u.rconst.index < MAD_ROOT_PARAM_MAX && c->u.rconst.dst + c->u.rconst.n <= 64)
                 memcpy(&e.consts[c->u.rconst.index][c->u.rconst.dst], &l->cdata[c->u.rconst.data], c->u.rconst.n * 4);
@@ -12669,10 +12859,12 @@ static HRESULT device_CreateRootSignature_impl(ID3D12Device *This, UINT node,
              * table offset. Reading a 1.0 blob with the 1.1 stride would shift
              * every later range, so the stride follows the declared version. */
             UINT32 stride = (version == 2) ? 24 : 20;
+            UINT32 pos = 0, ext = 0, bounded = 1;   /* madeira-bcd static-cbv: the table's layout */
             for (UINT32 j = 0; j < nr; j++) {
                 struct madeira_ir_root_range *rg = &r->ranges[r->nranges + j];
                 SIZE_T b0 = roff + (SIZE_T)stride * j;
                 UINT32 rt = rs_rd(p, n, b0,      &bad);
+                UINT32 rflags = stride == 24 ? rs_rd(p, n, b0 + 16, &bad) : D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;   /* 1.0: volatile */
                 rg->num_descriptors = rs_rd(p, n, b0 + 4,  &bad);
                 rg->base_register   = rs_rd(p, n, b0 + 8,  &bad);
                 rg->register_space  = rs_rd(p, n, b0 + 12, &bad);
@@ -12687,7 +12879,20 @@ static HRESULT device_CreateRootSignature_impl(ID3D12Device *This, UINT node,
                     rootsig_Release((ID3D12RootSignature *)r);
                     return E_INVALIDARG;
                 }
+                {   /* madeira-bcd static-cbv: offsets as the converter lays the table out (mad_dg_extent) */
+                    UINT32 start = rg->table_offset == 0xffffffffu ? pos : rg->table_offset;
+                    if (rg->num_descriptors == 0xffffffffu || rg->num_descriptors > 4096) bounded = 0;
+                    else {
+                        if (start + rg->num_descriptors > ext) ext = start + rg->num_descriptors;
+                        pos = start + rg->num_descriptors;
+                        if (rg->range_type == MADEIRA_IR_RANGE_CBV && rg->num_descriptors == 1 && r->scbv_n[i] < 8 && start < 0xffffu) {
+                            if (rflags & D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE) r->scbv_vol[i] |= (UINT8)(1u << r->scbv_n[i]);
+                            r->scbv_off[i][r->scbv_n[i]++] = (UINT16)start;
+                        }
+                    }
+                }
             }
+            r->scbv_ext[i] = bounded && ext && ext <= MAD_SCBV_MAX_EXT ? (UINT16)ext : 0;
             r->nranges += nr;
             break;
         }
@@ -16455,12 +16660,20 @@ static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *T
     if (c) c->u.pso = (struct mad_pso *)pso;
 }
 static void STDMETHODCALLTYPE list_SetGraphicsRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs) {
-    struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_ROOTSIG);
+    struct mad_list *l = (struct mad_list *)This;
+    struct mad_cmd *c = mad_list_push(l, MC_ROOTSIG);
     if (c) c->u.rootsig = (struct mad_rootsig *)rs;
+    if (c && mad_scbv_on()) {   /* madeira-bcd static-cbv: a new signature invalidates the bound tables */
+        l->rec_rs[0] = (struct mad_rootsig *)rs; memset(l->rec_tab[0], 0, sizeof l->rec_tab[0]); memset(l->lat_va[0], 0, sizeof l->lat_va[0]);
+    }
 }
 static void STDMETHODCALLTYPE list_SetComputeRootSignature(ID3D12GraphicsCommandList *This, ID3D12RootSignature *rs) {
-    struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_CROOTSIG);
+    struct mad_list *l = (struct mad_list *)This;
+    struct mad_cmd *c = mad_list_push(l, MC_CROOTSIG);
     if (c) c->u.rootsig = (struct mad_rootsig *)rs;
+    if (c && mad_scbv_on()) {   /* madeira-bcd static-cbv */
+        l->rec_rs[1] = (struct mad_rootsig *)rs; memset(l->rec_tab[1], 0, sizeof l->rec_tab[1]); memset(l->lat_va[1], 0, sizeof l->lat_va[1]);
+    }
 }
 static void mad_record_croot(struct mad_list *l, UINT index, UINT64 value, int resolve) {
     struct mad_cmd *c;
@@ -16468,6 +16681,7 @@ static void mad_record_croot(struct mad_list *l, UINT index, UINT64 value, int r
     c = mad_list_push(l, MC_CROOT);
     if (!c) return;
     c->u.root.index = index; c->u.root.value = value;
+    if (!resolve && g_scbv_on > 0) l->rec_tab[1][index] = value;   /* madeira-bcd static-cbv: a table */
     if (resolve) { UINT64 off = 0; mad_list_note_used(l, mad_resolve_address(l->device, value, &off)); }
 }
 static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(ID3D12GraphicsCommandList *This, UINT index, D3D12_GPU_VIRTUAL_ADDRESS a) { mad_record_croot((struct mad_list *)This, index, a, 1); }
@@ -16764,6 +16978,7 @@ static void mad_record_root(struct mad_list *l, UINT index, UINT64 value, int re
     c = mad_list_push(l, MC_ROOT);
     if (!c) return;
     c->u.root.index = index; c->u.root.value = value;
+    if (!resolve && g_scbv_on > 0) l->rec_tab[0][index] = value;   /* madeira-bcd static-cbv: a table */
     if (resolve) {
         UINT64 off = 0;
         mad_list_note_used(l, mad_resolve_address(l->device, value, &off));
@@ -16807,6 +17022,7 @@ static void STDMETHODCALLTYPE list_SetDescriptorHeaps(ID3D12GraphicsCommandList 
         if (!h || !h->buffer) continue;
         if (h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) c->u.heaps.smp = h; else c->u.heaps.srv = h;
     }
+    if (c->u.heaps.srv) l->rec_heap = c->u.heaps.srv;   /* madeira-bcd static-cbv */
 }
 static void STDMETHODCALLTYPE list_RSSetViewports(ID3D12GraphicsCommandList *This, UINT n, const D3D12_VIEWPORT *vp) {
     struct mad_cmd *c;
@@ -16860,19 +17076,25 @@ static void STDMETHODCALLTYPE list_IASetVertexBuffers(ID3D12GraphicsCommandList 
 }
 static void STDMETHODCALLTYPE list_DrawInstanced(ID3D12GraphicsCommandList *This,
         UINT vcount, UINT icount, UINT vstart, UINT istart) {
-    struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_DRAW);
+    struct mad_cmd *c;
+    if (g_scbv_on > 0) mad_scbv_latch((struct mad_list *)This, 0);   /* madeira-bcd static-cbv */
+    c = mad_list_push((struct mad_list *)This, MC_DRAW);
     if (!c) return;
     c->u.draw.vcount = vcount; c->u.draw.icount = icount; c->u.draw.vstart = vstart; c->u.draw.istart = istart;
 }
 static void STDMETHODCALLTYPE list_DrawIndexedInstanced(ID3D12GraphicsCommandList *This,
         UINT icount, UINT inst, UINT start, INT base, UINT istart) {
-    struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_DRAW_INDEXED);
+    struct mad_cmd *c;
+    if (g_scbv_on > 0) mad_scbv_latch((struct mad_list *)This, 0);   /* madeira-bcd static-cbv */
+    c = mad_list_push((struct mad_list *)This, MC_DRAW_INDEXED);
     if (!c) return;
     c->u.drawi.icount = icount; c->u.drawi.inst = inst; c->u.drawi.start = start;
     c->u.drawi.base = base; c->u.drawi.istart = istart;
 }
 static void STDMETHODCALLTYPE list_Dispatch(ID3D12GraphicsCommandList *This, UINT x, UINT y, UINT z) {
-    struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_DISPATCH);
+    struct mad_cmd *c;
+    if (g_scbv_on > 0) mad_scbv_latch((struct mad_list *)This, 1);   /* madeira-bcd static-cbv */
+    c = mad_list_push((struct mad_list *)This, MC_DISPATCH);
     if (c) { c->u.dispatch.x = x; c->u.dispatch.y = y; c->u.dispatch.z = z; }
 }
 static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *This, UINT n, const D3D12_RESOURCE_BARRIER *b) {
@@ -16947,6 +17169,7 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(ID3D12GraphicsCommandList *Th
     if (count_buf && said_count++ < 1)
         d3d12_log("[madeira-d3d12] ExecuteIndirect: count buffers are not honoured yet; issuing all %u records\n", max_count);
     if (max_count > 8192) { if (said_big++ < 4) d3d12_log("[madeira-d3d12] ExecuteIndirect: %u records capped at 8192\n", max_count); max_count = 8192; }
+    if (g_scbv_on > 0) mad_scbv_latch((struct mad_list *)This, kind == MC_DISPATCH_INDIRECT ? 1 : 0);   /* madeira-bcd static-cbv */
     c = mad_list_push((struct mad_list *)This, kind);
     if (!c) return;
     c->u.ind.args = (struct mad_resource *)args; c->u.ind.off = args_off; c->u.ind.count = max_count;
@@ -18628,7 +18851,8 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     /* ml1056: no release -- the drawable was never ours (see swap_Present). */
     s->presents++;
     mad_perf_present();   /* ml1108 */
-    if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);   /* madeira-bcd vis-trace */
+    if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);
+    if (g_scbv_on > 0 && s->presents % 300 == 0) mad_scbv_report(s->presents);   /* madeira-bcd static-cbv */   /* madeira-bcd vis-trace */
     g_census_on = (s->presents >= 1500 && s->presents < 3000 && (s->presents % 200) == 0);   /* ml899 */
     if (g_capture_on) g_census_on = 1;   /* ml1098 */
     if (mad_skin_on()) mad_skin_present(s->presents);   /* madeira-bcd skin-check */

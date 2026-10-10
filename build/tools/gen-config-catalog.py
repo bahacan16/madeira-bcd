@@ -258,6 +258,14 @@ OVERLAY = {
                         "mips, up to 64x64) is not copied; the CPU fills it with 4096, so a game that culls on the CPU "
                         "against it culls nothing (everything is drawn: slower). A test, not a fix. Read once per game "
                         "start."},
+    "static-cbv": {"category": "Direct3D 12", "title": "Constant buffers as the draw was recorded",
+                "kind": "int", "default": "0",
+                "note": "Default off: the GPU reads every descriptor of a table when it runs. 1: a descriptor table's "
+                        "single constant-buffer ranges are read when each draw or dispatch is recorded, as NVIDIA's "
+                        "driver and vkd3d-proton do; a game that rewrites one after recording the draw no longer makes "
+                        "that draw use another object's constants. Ranges marked VOLATILE stay as before. 2: VOLATILE "
+                        "ones too (vkd3d-proton's force_static_cbv). 3: only count the rewrites ([static-cbv] lines). "
+                        "Read once per game start."},
     "readback-swap": {"category": "Direct3D 12", "title": "D3D12 readback buffers on file-backed memory",
                 "kind": "bool", "default": "1",
                 "note": "Default on: like upload buffers (upload-swap), READBACK buffers of 8 MB or more live on "

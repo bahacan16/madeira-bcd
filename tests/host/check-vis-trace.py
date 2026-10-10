@@ -120,8 +120,8 @@ check('a line per present, after the present is counted',
 for key in ('typed-view-shadow', 'vis-trace', 'readback-far'):
     check('settings catalog: ' + key, 'ConfigOption(key: "%s"' % key in catalog)
 hzd = block(recs, 'static let horizonZeroDawn = GameRecommendation(', 'avx: false')
-check('Horizon Zero Dawn (v13): shadow, fence-strict, vis-trace, desc-guard and readback-swap = 0 on, readback-far not',
-      'version: 13' in hzd and 'typed-view-shadow = 1' in hzd and 'fence-strict = 1' in hzd and 'vis-trace = 1' in hzd and
+check('Horizon Zero Dawn (v14): shadow, fence-strict, vis-trace, desc-guard and readback-swap = 0 on, readback-far not',
+      'version: 14' in hzd and 'typed-view-shadow = 1' in hzd and 'fence-strict = 1' in hzd and 'vis-trace = 1' in hzd and
       'desc-guard = 1' in hzd and 'readback-swap = 0' in hzd and 'readback-far' not in hzd)
 rbs = body('static int mad_readback_swap_on(void) {')
 check('readback-swap: on by default (as before); off keeps only READBACK buffers off the file tier',

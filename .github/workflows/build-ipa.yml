@@ -1279,6 +1279,10 @@ jobs:
       - name: Check the shared argument ring
         run: python3 tests/host/check-ring-share.py
 
+      # madeira-bcd: static-cbv (Horizon Zero Dawn): table constant buffers as each draw was recorded.
+      - name: Check static-cbv
+        run: python3 tests/host/check-static-cbv.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
