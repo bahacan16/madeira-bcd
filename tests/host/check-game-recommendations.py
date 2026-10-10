@@ -165,23 +165,25 @@ assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
 # Version 9 (build 485): none of those helped (owner, 484 test), so they are gone again;
 # typed buffer views start at Apple's 16-byte boundary, and skin-check traces whole frames and
 # dumps the compute skinning's data, comparing what the GPU read with what the CPU wrote.
+# Version 10 (build 486): the characters came out whole on 485; typed views start exactly at
+# their first element where the probe allows (plants and lighting still flickered), and the
+# skinning diagnostics are gone again (view-census stays, it counts views left with an offset).
 hzd = presets['horizon-zero-dawn']
 assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'msc-unbounded-retry = 1', 'msc-fail-memo = 1',
                             'pso-placeholder = 1', 'pso-lazy-libs = 1', 'clear-rects = 1',
-                            'typed-view-align = 16',
-                            'skin-check = 1', 'skin-check-trace = 1', 'skin-dump = 1', 'view-census = 1',
+                            'typed-view-align = 4', 'view-census = 1',
                             'swap-mb = 6144', 'swap-mode = 2', 'swap-min-mb = 1',
                             'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1',
                             'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1',
                             'env.MADEIRA_LOCK_ORPHAN = stamped', 'env.WINEDEBUG = fixme-input'], hzd['lines']
-assert hzd['version'] == 9 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
+assert hzd['version'] == 10 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
 assert not any(line.startswith(('d3d12-wave-ops', 'd3d12-raw-typed-views', 'typed-uav-atomic', 'ignore-volatile-metadata',
                                  'env.FEX_MEMCPYSETTSOENABLED', 'env.FEX_STRICTINPROCESSSPLITLOCKS'))
                for p in presets.values() for line in p['lines']), 'the build 484 experiment is in no list'
 assert not any(line.startswith(('pso-lazy-libs', 'clear-rects', 'skin-check', 'skin-dump', 'view-census', 'typed-view-align',
                                  'env.FEX_VECTORTSOENABLED = 1'))
                for p in presets.values() if p is not hzd for line in p['lines']), 'the build 481-485 switches are Horizon Zero Dawn\'s only'
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 480 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 485\'s test list')
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 480 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 486\'s test list')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')

@@ -64,15 +64,22 @@ BUILDDEF=()
 echo "=== helper kernels (metallib) ==="
 KDEF=""
 # madeira-bcd clear-rects: should its clear functions not compile, the file is
-# compiled again without them, so the other kernels never depend on them.
+# compiled again without them, so the other kernels never depend on them. The
+# typed-view-align texture-buffer probe goes first the same way.
 mad_kernels_metal() {
     xcrun -sdk iphoneos metal -std=metal3.0 "$@" -o "$OUT/mad_kernels.metallib" "$SRC/mad_kernels.metal" 2> "$OUT/mad_kernels.err"
 }
 if command -v xcrun > /dev/null 2>&1 &&
    { mad_kernels_metal ||
-     { echo "::warning::helper kernels: the clear-rects functions did not compile -- built without them"
+     { echo "::warning::helper kernels: the first compile failed -- trying without the texture-buffer probe"
        head -20 "$OUT/mad_kernels.err"
-       mad_kernels_metal -DMAD_NO_CLEAR_RECTS; }; }; then
+       mad_kernels_metal -DMAD_NO_TEXBUF_PROBE; } ||
+     { echo "::warning::helper kernels: trying without the clear-rects functions"
+       head -20 "$OUT/mad_kernels.err"
+       mad_kernels_metal -DMAD_NO_CLEAR_RECTS; } ||
+     { echo "::warning::helper kernels: trying without the probe and the clear-rects functions"
+       head -20 "$OUT/mad_kernels.err"
+       mad_kernels_metal -DMAD_NO_TEXBUF_PROBE -DMAD_NO_CLEAR_RECTS; }; }; then
     (cd "$OUT" && xxd -i mad_kernels.metallib > mad_kernels_metallib.h)
     KDEF="-DMAD_HAVE_KERNELS"
     echo "  $(wc -c < "$OUT/mad_kernels.metallib" | tr -d ' ') bytes"

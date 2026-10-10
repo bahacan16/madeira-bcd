@@ -109,7 +109,7 @@ check('the clear shaders sit behind MAD_NO_CLEAR_RECTS, after the other kernels'
 check('the shaders write what the runtime binds: fragment buffer 0, depth(any), a layer per instance',
       guard.count('[[buffer(0)]]') == 4 and '[[depth(any)]]' in guard and '[[render_target_array_index]]' in guard)
 check('the build compiles the helpers again without them when they do not compile',
-      'mad_kernels_metal -DMAD_NO_CLEAR_RECTS;' in build and 'mad_kernels_metal ||' in build)
+      'mad_kernels_metal -DMAD_NO_TEXBUF_PROBE -DMAD_NO_CLEAR_RECTS;' in build and 'mad_kernels_metal ||' in build)
 check('in the settings catalog, off by default',
       'key: "clear-rects"' in catalog and 'defaultValue: "0"' in catalog[catalog.index('key: "clear-rects"'):][:300])
 

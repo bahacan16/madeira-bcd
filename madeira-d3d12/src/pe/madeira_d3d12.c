@@ -10248,20 +10248,133 @@ static int mad_typed_uav_atomic(void) {
  * start is aligned to N bytes, never below what Metal reports for the pixel
  * format (minimumLinearTextureAlignmentForPixelFormat, asked once per format
  * and logged; view-census asks and logs it without changing anything), and a
- * view Metal refuses at that alignment is made at 64 as before. */
+ * view Metal refuses at that alignment is made at 64 as before.
+ *
+ * Build 485 (Horizon Zero Dawn, 2026-10-10 09:35): 16 brought the characters
+ * back, so the converted shaders do not apply a float4 view's element offset.
+ * Views of 1-, 2- and 4-byte elements still get offsets of 1-3 elements at 16:
+ * a 1228-byte R32 view two compute passes read every frame started 4 bytes
+ * past a 16-byte boundary in some frames and on one in others, and plants and
+ * lighting flicker. typed-view-align = 4 starts every texture exactly at its
+ * view's first element (no element offset at all), below the 16 bytes Metal
+ * documents. Before the first view a probe (mad_texbuf_probe in
+ * mad_kernels.metal) reads texture buffers made at +4 and +20 (R32), +2 (R16)
+ * and +1 (R8) over the bytes 0, 1, 2, ...; element sizes whose reads come back
+ * right start exactly, the others at a 16-byte boundary as with 16. */
 static int g_tv_align = -1;
+static int g_tv_exact = -1;   /* typed-view-align = 4, the probe's result: -1 not run; bit 0: 4-byte and wider elements, bit 1: 2-byte, bit 2: 1-byte */
+static SRWLOCK g_tv_probe_lock = SRWLOCK_INIT;
 static UINT16 g_tv_floor[1024];   /* Metal's minimum per pixel format; 0 = not asked yet */
-static volatile LONG g_tv_said, g_tv_fallback;
-static UINT mad_tv_align(struct mad_device *d, enum WMTPixelFormat pf) {
-    UINT want, fl;
+static volatile LONG g_tv_said, g_tv_fallback, g_tv_eoff_views, g_tv_exact_views;
+static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element offset, by pixel format (view-census) */
+static int mad_tv_mode(void) {
     if (g_tv_align < 0) {
-        long long v = mad_cfg_int_pe("typed-view-align", 0);   /* fix attempt: texture-buffer views start at a 16- or 256-byte boundary instead of 64 */
-        g_tv_align = v == 16 || v == 256 ? (int)v : 64;
-        if (g_tv_align != 64)
+        long long v = mad_cfg_int_pe("typed-view-align", 0);   /* fix: texture-buffer views start at their first element (4, probed) or at a 16- or 256-byte boundary, instead of 64 */
+        int a = v == 4 || v == 16 || v == 256 ? (int)v : 64;
+        if (a == 4)
+            d3d12_log("[typed-view] madeira-bcd typed-view-align = 4: typed-buffer views start exactly at their first element where "
+                      "a probe shows Metal reads such textures right, else at a 16-byte boundary\n");
+        else if (a != 64)
             d3d12_log("[typed-view] madeira-bcd typed-view-align = %d: typed-buffer views start at a %d-byte boundary, never below "
-                      "Metal's minimum for the format, instead of 64\n", g_tv_align, g_tv_align);
+                      "Metal's minimum for the format, instead of 64\n", a, a);
+        g_tv_align = a;
     }
-    want = (UINT)g_tv_align;
+    return g_tv_align;
+}
+/* typed-view-align = 4: four texture buffers off a 16-byte boundary, read on
+ * the GPU once; returns the g_tv_exact bits. A texture Metal refuses is made
+ * at offset 0 instead so the kernel still runs, and its element size fails. */
+static int mad_tv_probe(struct mad_device *d) {
+    static const struct { enum WMTPixelFormat pf; UINT off, bytes; } t[4] = {
+        { WMTPixelFormatR32Uint, 4, 4 }, { WMTPixelFormatR32Uint, 20, 4 }, { WMTPixelFormatR16Uint, 2, 2 }, { WMTPixelFormatR8Uint, 1, 1 } };
+    struct WMTComputePipelineInfo ci; struct WMTBufferInfo bs, bd; struct WMTTextureInfo ti;
+    struct wmtcmd_compute_setpso sp; struct wmtcmd_compute_settexture st[4]; struct wmtcmd_compute_setbuffer sb;
+    struct wmtcmd_compute_dispatch dsp;
+    obj_handle_t fn = 0, pso = 0, err = 0, src = 0, dst = 0, tex[4] = { 0 }, cb = 0, enc = 0, pool;
+    const UINT32 *o; int mask = 0, made = 0, ran = 0, i, n = 0;
+    char what[96];
+    d3d12_log("[typed-view] typed-view-align = 4: probing texture buffers that start off a 16-byte boundary\n");
+    if (!mad_kernels_ready(d) || !d->k_lib || !(fn = MTLLibrary_newFunction(d->k_lib, "mad_texbuf_probe"))) {
+        d3d12_log("[typed-view] probe: no helper kernel in this build; views start at a 16-byte boundary\n");
+        return 0;
+    }
+    pool = NSAutoreleasePool_alloc_init();
+    memset(&ci, 0, sizeof ci); ci.compute_function = fn;
+    pso = MTLDevice_newComputePipelineState(d->mtl_device, &ci, &err);
+    if (err) mad_log_nserror("mad_texbuf_probe", err);
+    NSObject_release(fn);
+    memset(&bs, 0, sizeof bs); bs.length = 256; bs.options = WMTResourceStorageModeShared;
+    memset(&bd, 0, sizeof bd); bd.length = 64; bd.options = WMTResourceStorageModeShared;
+    if (pso) src = MTLDevice_newBuffer(d->mtl_device, &bs);
+    if (src) dst = MTLDevice_newBuffer(d->mtl_device, &bd);
+    if (dst && bs.memory.ptr && bd.memory.ptr) {
+        for (i = 0; i < 256; i++) ((unsigned char *)bs.memory.ptr)[i] = (unsigned char)i;
+        memset(bd.memory.ptr, 0xff, 64);
+        for (i = 0; i < 4; i++) {
+            memset(&ti, 0, sizeof ti);
+            ti.pixel_format = t[i].pf; ti.width = 8; ti.height = 1; ti.depth = 1; ti.array_length = 1;
+            ti.type = WMTTextureTypeTextureBuffer; ti.mipmap_level_count = 1; ti.sample_count = 1;
+            ti.usage = WMTTextureUsageShaderRead; ti.options = WMTResourceStorageModeShared;
+            tex[i] = MTLBuffer_newTexture(src, &ti, t[i].off, 8 * t[i].bytes);
+            if (tex[i] && ti.gpu_resource_id) { made |= 1 << i; continue; }
+            if (tex[i]) NSObject_release(tex[i]);
+            ti.gpu_resource_id = 0;
+            tex[i] = MTLBuffer_newTexture(src, &ti, 0, 8 * t[i].bytes);   /* refused off the boundary: bound at 0 so the kernel runs */
+        }
+        if (tex[0] && tex[1] && tex[2] && tex[3]) cb = MTLCommandQueue_commandBuffer(d->mtl_queue);
+        if (cb) { NSObject_retain(cb); enc = MTLCommandBuffer_computeCommandEncoder(cb, false); }
+        if (enc) {
+            memset(&sp, 0, sizeof sp); memset(st, 0, sizeof st); memset(&sb, 0, sizeof sb); memset(&dsp, 0, sizeof dsp);
+            sp.type = WMTComputeCommandSetPSO; sp.pso = pso;
+            sp.threadgroup_size.width = 1; sp.threadgroup_size.height = 1; sp.threadgroup_size.depth = 1;
+            for (i = 0; i < 4; i++) { st[i].type = WMTComputeCommandSetTexture; st[i].texture = tex[i]; st[i].index = (uint8_t)i; }
+            sb.type = WMTComputeCommandSetBuffer; sb.buffer = dst; sb.offset = 0; sb.index = 0;
+            dsp.type = WMTComputeCommandDispatch; dsp.size.width = 1; dsp.size.height = 1; dsp.size.depth = 1;
+            sp.next.ptr = &st[0]; st[0].next.ptr = &st[1]; st[1].next.ptr = &st[2]; st[2].next.ptr = &st[3]; st[3].next.ptr = &sb;
+            sb.next.ptr = &dsp;
+            MTLComputeCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&sp);
+            MTLCommandEncoder_endEncoding(enc);
+            MTLCommandBuffer_commit(cb);
+            MTLCommandBuffer_waitUntilCompleted(cb);
+            ran = MTLCommandBuffer_status(cb) != WMTCommandBufferStatusError;
+        }
+        o = (const UINT32 *)bd.memory.ptr;
+        if (ran) {
+            if ((made & 3) == 3 && o[0] == 0x07060504u && o[1] == 0x0b0a0908u && o[2] == 0x17161514u) mask |= 1;
+            if ((made & 4) && o[3] == 0x0302u) mask |= 2;
+            if ((made & 8) && o[4] == 0x01u) mask |= 4;
+        }
+        what[0] = 0;
+        if (mask & 1) n += snprintf(what + n, sizeof what - (size_t)n, "4-byte and wider elements");
+        if (mask & 2) n += snprintf(what + n, sizeof what - (size_t)n, "%s2-byte", n ? ", " : "");
+        if (mask & 4) snprintf(what + n, sizeof what - (size_t)n, "%s1-byte", n ? ", " : "");
+        if (!mask) snprintf(what, sizeof what, "none (a 16-byte boundary, as with typed-view-align = 16)");
+        d3d12_log("[typed-view] probe %s: R32 at +4 read %08x %08x (right: 07060504 0b0a0908), at +20 %08x (17161514); R16 at +2 %04x "
+                  "(0302); R8 at +1 %02x (01); Metal made %d of the 4 textures off the boundary -> exact starts for %s\n",
+                  ran ? "ran" : "did NOT run", o[0], o[1], o[2], o[3], o[4], __builtin_popcount((unsigned)made & 15u), what);
+    } else d3d12_log("[typed-view] probe: could not make its pipeline or buffers; views start at a 16-byte boundary\n");
+    for (i = 0; i < 4; i++) if (tex[i]) NSObject_release(tex[i]);
+    if (cb) NSObject_release(cb);
+    if (dst) NSObject_release(dst);
+    if (src) NSObject_release(src);
+    if (pso) NSObject_release(pso);
+    if (pool) NSObject_release(pool);
+    return mask;
+}
+static void mad_tv_probe_once(struct mad_device *d) {
+    if (g_tv_exact >= 0) return;
+    AcquireSRWLockExclusive(&g_tv_probe_lock);
+    if (g_tv_exact < 0) g_tv_exact = mad_tv_probe(d);
+    ReleaseSRWLockExclusive(&g_tv_probe_lock);
+}
+static UINT mad_tv_align(struct mad_device *d, enum WMTPixelFormat pf, UINT bytes) {
+    UINT want, fl;
+    want = (UINT)mad_tv_mode();
+    if (want == 4) {   /* exact: the element size itself where the probe passed */
+        if (g_tv_exact > 0 && ((bytes >= 4 && (g_tv_exact & 1)) || (bytes == 2 && (g_tv_exact & 2)) || (bytes == 1 && (g_tv_exact & 4))))
+            return bytes >= 16 ? 16 : bytes;
+        want = 16;
+    }
     if (want == 64 && g_view_census <= 0) return 64;   /* the default: as before, Metal is not asked */
     if ((UINT)pf >= sizeof g_tv_floor / sizeof g_tv_floor[0]) return 64;
     fl = g_tv_floor[pf];
@@ -10342,6 +10455,15 @@ static void mad_vc_report(void) {
               (long)g_tview_made, (long)g_vc_n[1], (long)g_vc_n[2], (long)g_vc_n[3], (long)g_vc_n[4], (long)g_vc_n[5], (long)g_vc_n[6],
               (long)g_vc_n[7], (long)g_vc_n[8], (long)g_vc_n[9], (long)g_vc_past[0], (long)g_vc_past[1], (long)g_vc_cbv_past,
               (long)g_vc_cbv_nores);
+    {   /* madeira-bcd typed-view-align */
+        char by[400]; int n = 0; unsigned pf;
+        by[0] = 0;
+        for (pf = 0; pf < sizeof g_tv_eoff_pf / sizeof g_tv_eoff_pf[0] && n < (int)sizeof by - 32; pf++)
+            if (g_tv_eoff_pf[pf]) n += snprintf(by + n, sizeof by - (size_t)n, " %u:%ld", pf, (long)g_tv_eoff_pf[pf]);
+        d3d12_log("[view-census] typed views made with an element offset (texture started before the view): %ld%s%s; started exactly "
+                  "below a 16-byte boundary: %ld (typed-view-align %d)\n", (long)g_tv_eoff_views, n ? ", by pixel format:" : "", by,
+                  (long)g_tv_exact_views, mad_tv_mode());
+    }
 }
 /* why (may be NULL): 0, or the g_vc_why index of a refusal (1-8) or of a view
  * cut short (9, still made). */
@@ -10358,11 +10480,12 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     mad_format_info(fmt, &bytes, &block);
     if (!bytes || block != 1) { if (why) *why = 4; return 0; }
     byte_off = first * bytes;
+    if (mad_tv_mode() == 4) mad_tv_probe_once(d);   /* madeira-bcd typed-view-align = 4: before the first view, outside the lock */
     EnterCriticalSection(&d->view_lock);   /* ml1049: creation races creation on another thread */
     for (k = 0; k < r->ntview; k++)
         if (r->tview[k].fmt == (UINT)fmt && r->tview[k].off == byte_off && r->tview[k].num == num && r->tview[k].uav == (UINT8)uav) break;
     if (k == r->ntview) {
-        UINT al = mad_tv_align(d, pf);   /* madeira-bcd typed-view-align: 64 unless the switch says otherwise */
+        UINT al = mad_tv_align(d, pf, bytes);   /* madeira-bcd typed-view-align: 64 unless the switch says otherwise */
         int cut;
     again:
         cut = 0;
@@ -10388,12 +10511,14 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
             ti.usage = (enum WMTTextureUsage)(ti.usage & ~WMTTextureUsageShaderAtomic); ti.gpu_resource_id = 0;
             tex = MTLBuffer_newTexture(r->buffer, &ti, aligned, bpr);
         } else if (ti.usage & WMTTextureUsageShaderAtomic) InterlockedIncrement(&g_typed_atomic_views);
-        if ((!tex || !ti.gpu_resource_id) && al != 64) {   /* madeira-bcd typed-view-align: refused at that boundary -- made at 64 as before */
+        if ((!tex || !ti.gpu_resource_id) && al != 64) {   /* madeira-bcd typed-view-align: refused at that boundary -- at 16 (an exact start), else at 64 as before */
+            UINT next = al < 16 ? 16 : 64;
             if (tex) NSObject_release(tex);
             if (InterlockedIncrement(&g_tv_fallback) <= 8)
-                d3d12_log("[typed-view] Metal refused a view of pixel format %u at a %u-byte boundary (offset %llu); made at 64 as before\n",
-                          (unsigned)pf, al, (unsigned long long)aligned);
-            al = 64;
+                d3d12_log("[typed-view] Metal refused a view of pixel format %u at a %u-byte boundary (offset %llu); made at %u\n",
+                          (unsigned)pf, al, (unsigned long long)aligned, next);
+            al = next;
+            ti.gpu_resource_id = 0;
             goto again;
         }
         if (cut && why) *why = 9;
@@ -10423,6 +10548,11 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         r->tview[k].eoff = (UINT8)elem_off;
         r->tview[k].tex = tex; r->tview[k].id = ti.gpu_resource_id;
         r->ntview = k + 1;   /* published last: a reader never sees a half-written entry */
+        if (elem_off) {   /* madeira-bcd: what typed-view-align leaves to the converter (view-census reports it) */
+            InterlockedIncrement(&g_tv_eoff_views);
+            if ((UINT)pf < sizeof g_tv_eoff_pf / sizeof g_tv_eoff_pf[0]) InterlockedIncrement(&g_tv_eoff_pf[pf]);
+        }
+        if (al < 16 && (aligned & 15)) InterlockedIncrement(&g_tv_exact_views);   /* an exact start off a 16-byte boundary */
         mad_vmap_put_locked(d, ti.gpu_resource_id, (UINT32)num, (UINT32)elem_off);
         mad_view_census("typed-buffer", r, r->ntview);
         if (said_ok++ < 12)

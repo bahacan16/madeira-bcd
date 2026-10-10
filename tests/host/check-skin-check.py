@@ -160,13 +160,14 @@ for key, kind, default in (('skin-check', 'int', '0'), ('skin-check-every', 'int
     check('catalog: ' + key + ' (' + kind + ', default ' + default + ')', m is not None and m.group(1) == kind and m.group(2) == default)
 hzd = recs[recs.index('static let horizonZeroDawn = GameRecommendation('):]
 hzd = hzd[:hzd.index('""",')]
-check('Horizon Zero Dawn\'s list turns both on', 'skin-check = 1' in hzd and 'view-census = 1' in hzd)
+check('Horizon Zero Dawn\'s list (v10): view-census on, the skinning diagnostics off again',
+      'view-census = 1' in hzd and 'skin-check' not in hzd and 'skin-dump' not in hzd)
 # build 485
 check('485: skin-check-trace, skin-dump and typed-view-align off by default',
       'mad_cfg_int_pe("skin-check-trace", 0)' in pe and 'mad_cfg_int_pe("skin-dump", 0)' in pe and
       'mad_cfg_int_pe("typed-view-align", 0)' in pe)
-check('typed-view-align: anything but 16 or 256 is 64, and 64 without view-census asks Metal nothing',
-      'g_tv_align = v == 16 || v == 256 ? (int)v : 64;' in pe and 'if (want == 64 && g_view_census <= 0) return 64;' in pe and
+check('typed-view-align: anything but 4, 16 or 256 is 64, and 64 without view-census asks Metal nothing',
+      'int a = v == 4 || v == 16 || v == 256 ? (int)v : 64;' in pe and 'if (want == 64 && g_view_census <= 0) return 64;' in pe and
       'if (want == 64) return 64;   /* view-census alone: logged, nothing changes */' in pe and 'if (fl > 256) fl = 256;' in pe)
 check('typed-view-align: the element offset is the one the view was made with', 'elem_off = r->tview[k].eoff;' in tbv and
       'r->tview[k].eoff = (UINT8)elem_off;' in tbv and '& ~(UINT64)63; elem_off = (r->tview[k].off' not in tbv)
@@ -184,8 +185,37 @@ check('pipelines: the input layout tag only with skin-check-trace, freed with th
       'if (g_skin_trace <= 0 || !il || !il->NumElements || !il->pInputElementDescs) return;' in pe and
       'free(p->il_tag);   /* madeira-bcd skin-check-trace */' in pe and
       'mad_bc_keep_ex(p->vs_hash, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, p->il_int);' in gp)
-check('Horizon Zero Dawn\'s list: typed-view-align 16, trace and dump on',
-      'typed-view-align = 16' in hzd and 'skin-check-trace = 1' in hzd and 'skin-dump = 1' in hzd)
+check('Horizon Zero Dawn\'s list: typed-view-align 4', 'typed-view-align = 4' in hzd and 'typed-view-align = 16' not in hzd)
+# build 486: typed-view-align = 4
+kern = (root / 'madeira-d3d12/src/pe/mad_kernels.metal').read_text()
+probe = body('static int mad_tv_probe(struct mad_device *d) {')
+check('486: the probe kernel reads texel 0 (and 1) of four texture buffers, behind its own guard, before the clear shaders',
+      '#ifndef MAD_NO_TEXBUF_PROBE' in kern and 'kernel void mad_texbuf_probe(' in kern and
+      kern.index('kernel void mad_texbuf_probe(') < kern.index('#ifndef MAD_NO_CLEAR_RECTS') and
+      all(x in kern for x in ('out[0] = t32.read(0u).x;', 'out[1] = t32.read(1u).x;', 'out[2] = t32b.read(0u).x;',
+                              'out[3] = t16.read(0u).x;', 'out[4] = t8.read(0u).x;')))
+check('486: the probe makes R32 at +4 and +20, R16 at +2, R8 at +1 over bytes 0, 1, 2, ... and wants those bytes back',
+      '{ WMTPixelFormatR32Uint, 4, 4 }, { WMTPixelFormatR32Uint, 20, 4 }, { WMTPixelFormatR16Uint, 2, 2 }, { WMTPixelFormatR8Uint, 1, 1 } };' in probe and
+      '((unsigned char *)bs.memory.ptr)[i] = (unsigned char)i;' in probe and
+      'o[0] == 0x07060504u && o[1] == 0x0b0a0908u && o[2] == 0x17161514u) mask |= 1;' in probe and
+      '(made & 4) && o[3] == 0x0302u) mask |= 2;' in probe and '(made & 8) && o[4] == 0x01u) mask |= 4;' in probe)
+check('486: a texture Metal refuses off the boundary is bound at 0 so the kernel still runs, and its size fails',
+      'tex[i] = MTLBuffer_newTexture(src, &ti, 0, 8 * t[i].bytes);' in probe and 'if (tex[i] && ti.gpu_resource_id) { made |= 1 << i; continue; }' in probe)
+check('486: the probe waits for its command buffer, counts an error as not run, and releases what it made',
+      'MTLCommandBuffer_waitUntilCompleted(cb);' in probe and 'ran = MTLCommandBuffer_status(cb) != WMTCommandBufferStatusError;' in probe and
+      'for (i = 0; i < 4; i++) if (tex[i]) NSObject_release(tex[i]);' in probe and 'if (pool) NSObject_release(pool);' in probe and
+      'NSObject_retain(cb);' in probe and 'if (cb) NSObject_release(cb);' in probe)
+check('486: no helper kernel (or no probe in it): no exact starts',
+      'd3d12_log("[typed-view] probe: no helper kernel in this build; views start at a 16-byte boundary\\n");\n        return 0;' in probe)
+check('486: probed once, before the first view and outside the view lock',
+      'if (mad_tv_mode() == 4) mad_tv_probe_once(d);' in tbv and
+      tbv.index('mad_tv_probe_once(d);') < tbv.index('EnterCriticalSection(&d->view_lock);') and
+      'if (g_tv_exact < 0) g_tv_exact = mad_tv_probe(d);' in pe)
+check('486: a refused start goes to 16 (from an exact start), else to 64',
+      'UINT next = al < 16 ? 16 : 64;' in tbv and 'al = next;' in tbv)
+check('486: view-census reports the views made with an element offset, by pixel format, and the exact starts',
+      'typed views made with an element offset (texture started before the view)' in pe and
+      'if (elem_off) {   /* madeira-bcd: what typed-view-align leaves to the converter (view-census reports it) */' in tbv)
 
 harness = r'''
 #include <stdio.h>
@@ -244,9 +274,13 @@ struct WMTTextureInfo { int pixel_format; uint32_t width, height, depth, array_l
 struct mad_descriptor { UINT64 gpu_va, texture_view_id, metadata; };
 struct mad_device { CRITICAL_SECTION view_lock; };
 static LONG g_tview_live, g_tview_made, g_typed_atomic_views;
-static int metal_refuses, grow_fails, refuse_unaligned64;
-static UINT tv_align = 64; static volatile LONG g_tv_fallback;
-static UINT mad_tv_align(struct mad_device *d, enum WMTPixelFormat pf) { (void)d; (void)pf; return tv_align; }
+static int metal_refuses, grow_fails, refuse_unaligned64, refuse_unaligned16;
+static UINT tv_align = 64; static volatile LONG g_tv_fallback, g_tv_eoff_views, g_tv_exact_views, g_tv_eoff_pf[1024];
+static int tv_mode = 64, probes;
+static int mad_tv_mode(void) { return tv_mode; }
+static void mad_tv_probe_once(struct mad_device *d) { (void)d; probes++; }
+/* tv_align 4 stands for the exact start: the element size */
+static UINT mad_tv_align(struct mad_device *d, enum WMTPixelFormat pf, UINT bytes) { (void)d; (void)pf; return tv_align == 4 ? (bytes < 16 ? bytes : 16) : tv_align; }
 static UINT64 next_id = 100;
 static int mad_map_texture_format(DXGI_FORMAT f, int flags, enum WMTPixelFormat *out, int *is_depth) {
     (void)flags; *is_depth = 0;
@@ -261,7 +295,7 @@ static void mad_format_info(DXGI_FORMAT f, UINT *bytes, UINT *block) {
 static int mad_typed_uav_atomic(void) { return 0; }
 static obj_handle_t MTLBuffer_newTexture(obj_handle_t b, struct WMTTextureInfo *ti, UINT64 off, UINT64 bpr) {
     (void)b; (void)bpr;
-    if (metal_refuses || (refuse_unaligned64 && (off & 63))) return NULL;
+    if (metal_refuses || (refuse_unaligned64 && (off & 63)) || (refuse_unaligned16 && (off & 15))) return NULL;
     ti->gpu_resource_id = next_id++;
     return (obj_handle_t)(uintptr_t)ti->gpu_resource_id;
 }
@@ -355,6 +389,21 @@ int main(void) {
         refuse_unaligned64 = 0; tv_align = 64;
         why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 2, 1, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 0,
                          "a cached view keeps the element offset it was made with");
+        /* 486: typed-view-align = 4 */
+        EXPECT(probes == 0 && g_tv_eoff_views == 4 && g_tv_exact_views == 0,
+               "without typed-view-align 4 nothing is probed; the views made with an element offset are counted");
+        tv_mode = 4; tv_align = 4;
+        why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 42, 7, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 0 &&
+                         e.gpu_va == buf32.gpu_address + 28 && last_vmap_b == 0 && probes == 1 && g_tv_exact_views == 1 &&
+                         g_tv_eoff_views == 4, "typed-view-align 4: an R32 view at element 7 starts exactly at byte 28, after the probe");
+        why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 2, 5, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 0 &&
+                         g_tv_exact_views == 1, "typed-view-align 4: a float4 view starts at its 16-byte element, not counted as below 16");
+        refuse_unaligned16 = 1; loglen = 0; logbuf[0] = 0;
+        why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 42, 9, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 1 &&
+                         g_tv_fallback == 2 && strstr(logbuf, "at a 4-byte boundary (offset 36); made at 16") != NULL && g_tv_eoff_views == 5,
+                         "Metal refuses the exact start: made at 16, one element in, and counted");
+        refuse_unaligned16 = 0; tv_mode = 64; tv_align = 64;
+        EXPECT(probes == 3, "the probe hook runs for every view made while the switch is 4 (it probes once itself)");
     }
     {   /* 485: copies of CPU-written memory against the CPU's bytes; skin-dump */
         unsigned char nowb[64];
@@ -512,6 +561,54 @@ int main(void) {
 }
 """
 
+# build 486: the typed-view-align policy itself (the real mad_tv_mode and mad_tv_align)
+harness3 = r"""
+#include <stdio.h>
+#include <stdarg.h>
+typedef unsigned UINT; typedef unsigned long long UINT64; typedef long LONG; typedef unsigned short UINT16;
+enum WMTPixelFormat { WMTPixelFormatR32Uint = 53 };
+struct mad_device { void *mtl_device; };
+static long long cfg; static long long mad_cfg_int_pe(const char *k, long long d) { (void)k; (void)d; return cfg; }
+static int logged;
+static void d3d12_log(const char *fmt, ...) { (void)fmt; logged++; }
+static int g_view_census;
+static LONG InterlockedIncrement(volatile LONG *p) { return ++*p; }
+static UINT64 metal_min = 16; static int asked;
+static UINT64 MTLDevice_minimumLinearTextureAlignmentForPixelFormat(void *d, enum WMTPixelFormat pf) { (void)d; (void)pf; asked++; return metal_min; }
+static int g_tv_align = -1, g_tv_exact = -1; static UINT16 g_tv_floor[1024]; static volatile LONG g_tv_said;
+""" + body('static int mad_tv_mode(void) {') + '\n' + body('static UINT mad_tv_align(struct mad_device *d, enum WMTPixelFormat pf, UINT bytes) {') + r"""
+static int bad;
+#define EXPECT(c, what) do { if (!(c)) { printf("FAIL %s\n", what); bad = 1; } else printf("ok   %s\n", what); } while (0)
+int main(void) {
+    struct mad_device d = { 0 };
+    cfg = 4; g_tv_exact = 7;
+    EXPECT(mad_tv_mode() == 4 && logged == 1, "4 is a value, logged once");
+    EXPECT(mad_tv_align(&d, WMTPixelFormatR32Uint, 4) == 4 && mad_tv_align(&d, WMTPixelFormatR32Uint, 2) == 2 &&
+           mad_tv_align(&d, WMTPixelFormatR32Uint, 1) == 1 && mad_tv_align(&d, WMTPixelFormatR32Uint, 8) == 8 &&
+           mad_tv_align(&d, WMTPixelFormatR32Uint, 16) == 16 && asked == 0,
+           "4, every size probed right: each view starts at its element size, Metal's linear minimum not asked");
+    g_tv_exact = 1;
+    EXPECT(mad_tv_align(&d, WMTPixelFormatR32Uint, 4) == 4 && mad_tv_align(&d, WMTPixelFormatR32Uint, 8) == 8 &&
+           mad_tv_align(&d, WMTPixelFormatR32Uint, 2) == 16 && mad_tv_align(&d, WMTPixelFormatR32Uint, 1) == 16,
+           "4, only 4-byte reads right: 4-byte and wider exact, 2- and 1-byte elements at 16");
+    g_tv_exact = 0;
+    EXPECT(mad_tv_align(&d, WMTPixelFormatR32Uint, 4) == 16, "4, the probe failed: 16 as with typed-view-align 16");
+    g_tv_exact = -1;
+    EXPECT(mad_tv_align(&d, WMTPixelFormatR32Uint, 4) == 16, "4, not probed (yet): 16");
+    metal_min = 64; g_tv_floor[53] = 0; g_tv_exact = 0;
+    EXPECT(mad_tv_align(&d, WMTPixelFormatR32Uint, 4) == 64, "4, probe failed, Metal asks 64 for the format: 64");
+    metal_min = 16; g_tv_floor[53] = 0;
+    g_tv_align = -1; cfg = 16; g_tv_exact = 7;
+    EXPECT(mad_tv_align(&d, WMTPixelFormatR32Uint, 4) == 16, "16 ignores the probe");
+    g_tv_align = -1; cfg = 0; asked = 0;
+    EXPECT(mad_tv_align(&d, WMTPixelFormatR32Uint, 4) == 64 && asked == 0, "unset: 64, Metal not asked");
+    g_tv_align = -1; cfg = 8;
+    EXPECT(mad_tv_mode() == 64, "8 is not a value: 64");
+    printf("%s\n", bad ? "harness FAILED" : "harness ok");
+    return bad;
+}
+"""
+
 cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
 if not cc:
     check('a host C compiler', False)
@@ -541,6 +638,18 @@ else:
             run = subprocess.run([str(exe2)], capture_output=True, text=True)
             print(run.stdout, end='')
             check('the root-signature walk behaves', run.returncode == 0)
+        src3 = Path(tmp) / 'skin3.c'
+        exe3 = Path(tmp) / 'skin3'
+        src3.write_text(harness3)
+        b = subprocess.run([cc, '-std=gnu11', '-Wall', '-Wno-unused-function', '-Wno-unused-variable', str(src3), '-o', str(exe3)],
+                           capture_output=True, text=True)
+        check('the typed-view-align policy compiles on the host', b.returncode == 0)
+        if b.returncode:
+            print(b.stderr[-3000:])
+        else:
+            run = subprocess.run([str(exe3)], capture_output=True, text=True)
+            print(run.stdout, end='')
+            check('the typed-view-align policy behaves', run.returncode == 0)
 
 if not ok:
     sys.exit(1)

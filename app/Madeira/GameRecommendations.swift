@@ -327,9 +327,16 @@ enum GameRecommendations {
     /// Apple's converter documents (a bone palette then has no padding
     /// elements), and skin-check traces whole frames, keeps the vertex shaders
     /// of meshes skinned there, dumps the compute skinning's data and compares
-    /// what the GPU read with what the CPU had written.
+    /// what the GPU read with what the CPU had written. On build 485 (09:35)
+    /// the characters came out whole: the dumped skinning matched a recompute
+    /// vertex for vertex, and the GPU read exactly the CPU's bytes. Plants and
+    /// lighting still flicker, and a small view two compute passes read every
+    /// frame started 4 bytes past a 16-byte boundary in some frames, so build
+    /// 486's list starts every typed view exactly at its first element where a
+    /// probe shows the GPU reads such textures right, and drops the skinning
+    /// diagnostics (view-census stays: it counts the views that keep an offset).
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 9,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 10,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -339,10 +346,7 @@ enum GameRecommendations {
         pso-placeholder = 1
         pso-lazy-libs = 1
         clear-rects = 1
-        typed-view-align = 16
-        skin-check = 1
-        skin-check-trace = 1
-        skin-dump = 1
+        typed-view-align = 4
         view-census = 1
         swap-mb = 6144
         swap-mode = 2

@@ -233,8 +233,10 @@ OVERLAY = {
                 "kind": "int", "default": "0",
                 "note": "Default 0 (64 bytes, as before). 16 or 256: a typed buffer view's texture starts at that "
                         "boundary, never below Metal's minimum for its format (logged once per format); 16 is what "
-                        "Apple's converter documents, so a float4 view has no padding elements. A view Metal refuses "
-                        "there is made at 64. Read once per game start."},
+                        "Apple's converter documents, so a float4 view has no padding elements. 4: every view's texture "
+                        "starts exactly at its first element, for the element sizes a GPU probe at the first view shows "
+                        "read right (logged); the others start at 16. A view Metal refuses there is made at 16, then 64. "
+                        "Read once per game start."},
     # madeira-bcd: A/B switches for the Sony ports' corrupted meshes (Horizon Zero Dawn, Ghost of Tsushima).
     "d3d12-wave-ops": {"category": "Direct3D 12", "title": "Report wave operations",
                 "kind": "bool", "default": "1",

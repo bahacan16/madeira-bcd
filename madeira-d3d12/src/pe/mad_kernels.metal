@@ -41,6 +41,30 @@ kernel void mad_probe_words(device const uint *src [[buffer(0)]],
         dst[i] = src[i];
 }
 
+// madeira-bcd typed-view-align = 4: what texture buffers made at offsets that
+// are not a multiple of 16 bytes read at their first texels. Metal documents a
+// 16-byte minimum, but the converter's typed reads only come out right when a
+// view's texture starts exactly at its first element. The runtime fills a
+// buffer with bytes 0, 1, 2, ... and compares. Compiled again without it
+// (-DMAD_NO_TEXBUF_PROBE) if it does not compile.
+#ifndef MAD_NO_TEXBUF_PROBE
+kernel void mad_texbuf_probe(texture_buffer<uint, access::read> t32 [[texture(0)]],
+                             texture_buffer<uint, access::read> t32b [[texture(1)]],
+                             texture_buffer<uint, access::read> t16 [[texture(2)]],
+                             texture_buffer<uint, access::read> t8 [[texture(3)]],
+                             device uint *out [[buffer(0)]],
+                             uint i [[thread_position_in_grid]])
+{
+    if (i != 0)
+        return;
+    out[0] = t32.read(0u).x;
+    out[1] = t32.read(1u).x;
+    out[2] = t32b.read(0u).x;
+    out[3] = t16.read(0u).x;
+    out[4] = t8.read(0u).x;
+}
+#endif
+
 // madeira-bcd clear-rects: ClearRenderTargetView / ClearDepthStencilView with
 // rectangles, as DXMT's D3D11 ClearView does them: one triangle over the whole
 // target per rectangle, cut by the scissor, one instance per array layer. The
