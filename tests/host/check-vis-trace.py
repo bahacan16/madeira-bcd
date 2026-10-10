@@ -90,9 +90,10 @@ rel = block(pe, 'static ULONG STDMETHODCALLTYPE res_Release(', '\n}\n')
 check('a released resource stops being refreshed before its memory goes',
       'if (r->cpu) mad_tvs_forget(r);' in rel and rel.index('mad_tvs_forget(r)') < rel.index('if (r->own_mem)'))
 check('view-census reports the copies', '[view-census] typed-view-shadow: %ld views read an aligned copy' in pe)
-check('vis-trace hooks: draws and dispatches counted only when on',
+check('vis-trace hooks: draws, dispatches and copies (by queue type) counted only when on',
       'case MC_DRAW: case MC_DRAW_INDEXED: exec_draw(&e, c); if (g_vt_on > 0) mad_vt_draw(&e, c); break;' in pe and
-      'case MC_DISPATCH: exec_dispatch(&e, c); if (g_vt_on > 0) InterlockedIncrement(&g_vt_disp); break;' in pe)
+      'case MC_DISPATCH: exec_dispatch(&e, c); if (g_vt_on > 0) { InterlockedIncrement(&g_vt_disp); InterlockedIncrement(&g_vt_disp_q[q->type & 3]); } break;' in pe and
+      'if (g_vt_on > 0) InterlockedIncrement(&g_vt_copy_q[q->type & 3]);' in pe)
 check('readbacks: looked at only with vis-trace or readback-far on; a filled one encodes no copy',
       'if ((g_vt_on > 0 || g_rbf_on > 0) && mad_vt_copy(e, c)) return;   /* madeira-bcd vis-trace / readback-far */' in pe)
 check('Queue::Wait: calls, fast-path passes and passes before the awaited batch was committed are counted (vis-trace on)',
@@ -284,15 +285,18 @@ int main(void) {
             e.enc_nrt = 5; e.enc_depth = &depth; mad_vt_draw(&e, &dc);
             dc.kind = MC_DRAW; dc.u.draw.vcount = 6; dc.u.draw.icount = 0; e.enc_nrt = 1; mad_vt_draw(&e, &dc);
             g_tv_eoff_views += 2; g_tvs_views += 1; g_vt_qw = 5; g_vt_qw_fast = 4; g_vt_qw_early = 1; g_sd_strict_waits += 3;
+            g_vt_disp_q[0] = 7; g_vt_disp_q[2] = 9; g_vt_copy_q[0] = 1; g_vt_copy_q[2] = 2; g_vt_copy_q[3] = 3;
             loglen = 0; logbuf[0] = 0;
             mad_vt_present(&d, 20);
             EXPECT(strstr(logbuf, "[vis-trace] present #20: draws 3 (depth-only 1, 3+ targets 1), indices 0.00M, dispatches 0, pyramid copies 2, "
                                   "offset views +2, shadowed +1; Queue::Wait 5 (fast path 4, before the awaited batch was committed 1; "
-                                  "fence-strict waits +3)") != NULL, "the per-present counts, reset after each line");
+                                  "fence-strict waits +3); dispatches by queue: direct 7, compute 9; copies by queue: direct 1, compute 2, copy 3")
+                   != NULL, "the per-present counts, reset after each line");
             if (bad) printf("%s", logbuf);
             loglen = 0; logbuf[0] = 0; mad_vt_present(&d, 21);
             EXPECT(strstr(logbuf, "present #21: draws 0 (depth-only 0, 3+ targets 0), indices 0.00M, dispatches 0, pyramid copies 0, offset views +0, "
-                                  "shadowed +0; Queue::Wait 0 (fast path 0, before the awaited batch was committed 0; fence-strict waits +0)") != NULL,
+                                  "shadowed +0; Queue::Wait 0 (fast path 0, before the awaited batch was committed 0; fence-strict waits +0); "
+                                  "dispatches by queue: direct 0, compute 0; copies by queue: direct 0, compute 0, copy 0") != NULL,
                    "and the next present starts from zero");
         }
     }

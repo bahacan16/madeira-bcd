@@ -7419,6 +7419,7 @@ static UINT mad_aspect_bpp(const struct mad_resource *r, UINT plane) {
 static int g_vt_on = -1, g_rbf_on = -1;
 static volatile LONG g_vt_draws, g_vt_depth, g_vt_mrt, g_vt_disp, g_vt_pyr, g_vt_rbf;
 static volatile LONG g_vt_qw, g_vt_qw_fast, g_vt_qw_early;   /* Queue::Wait calls; on the fast path; of those, before the signalling batch was committed */
+static volatile LONG g_vt_disp_q[4], g_vt_copy_q[4];   /* dispatches and copies by queue type (direct, bundle, compute, copy) */
 static volatile LONG64 g_vt_idx, g_vt_presents;
 struct mad_vt_rb { struct mad_queue *q; UINT64 batch; const unsigned char *cpu; UINT32 row, w, h, level; LONG64 frame; };
 #define MAD_VT_RB 16u
@@ -8433,9 +8434,11 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             if (g_sd_state > 0 && g_ic_frames) mad_ic_note(&e, c);   /* madeira-bcd: ind-count */
             break;
         }
-        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: exec_copy(&e, c); break;
+        case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: exec_copy(&e, c);
+            if (g_vt_on > 0) InterlockedIncrement(&g_vt_copy_q[q->type & 3]);   /* madeira-bcd vis-trace */
+            break;
         case MC_BLEND_FACTOR: memcpy(e.blend, c->u.blend.rgba, sizeof e.blend); e.has_blend = 1; break;
-        case MC_DISPATCH: exec_dispatch(&e, c); if (g_vt_on > 0) InterlockedIncrement(&g_vt_disp); break;   /* madeira-bcd vis-trace */
+        case MC_DISPATCH: exec_dispatch(&e, c); if (g_vt_on > 0) { InterlockedIncrement(&g_vt_disp); InterlockedIncrement(&g_vt_disp_q[q->type & 3]); } break;   /* madeira-bcd vis-trace */
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
         if (rs) {   /* madeira-bcd: replay split, summed per list */
@@ -18256,11 +18259,14 @@ static void mad_vt_present(struct mad_device *d, UINT64 presents) {
     UINT64 done;
     d3d12_log("[vis-trace] present #%llu: draws %ld (depth-only %ld, 3+ targets %ld), indices %.2fM, dispatches %ld, pyramid copies %ld%s, "
               "offset views +%ld, shadowed +%ld; Queue::Wait %ld (fast path %ld, before the awaited batch was committed %ld; fence-strict "
-              "waits +%ld)\n", (unsigned long long)presents, (long)InterlockedExchange(&g_vt_draws, 0),
+              "waits +%ld); dispatches by queue: direct %ld, compute %ld; copies by queue: direct %ld, compute %ld, copy %ld\n",
+              (unsigned long long)presents, (long)InterlockedExchange(&g_vt_draws, 0),
               (long)InterlockedExchange(&g_vt_depth, 0), (long)InterlockedExchange(&g_vt_mrt, 0), (double)InterlockedExchange64(&g_vt_idx, 0) / 1e6,
               (long)InterlockedExchange(&g_vt_disp, 0), (long)InterlockedExchange(&g_vt_pyr, 0), g_rbf_on > 0 ? " (filled with 4096)" : "",
               (long)(eoff - eoff_last), (long)(tvs - tvs_last), (long)InterlockedExchange(&g_vt_qw, 0), (long)InterlockedExchange(&g_vt_qw_fast, 0),
-              (long)InterlockedExchange(&g_vt_qw_early, 0), (long)(strict - strict_last));
+              (long)InterlockedExchange(&g_vt_qw_early, 0), (long)(strict - strict_last), (long)InterlockedExchange(&g_vt_disp_q[0], 0),
+              (long)InterlockedExchange(&g_vt_disp_q[2], 0), (long)InterlockedExchange(&g_vt_copy_q[0], 0), (long)InterlockedExchange(&g_vt_copy_q[2], 0),
+              (long)InterlockedExchange(&g_vt_copy_q[3], 0));
     eoff_last = eoff; tvs_last = tvs; strict_last = strict;
     g_vt_presents = (LONG64)presents;
     AcquireSRWLockExclusive(&g_vt_lock);
