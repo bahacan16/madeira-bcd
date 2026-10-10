@@ -247,7 +247,8 @@ static void d3d12_log(const char *fmt, ...) {
 typedef int64_t LONG64;
 static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { LONG64 o = *p; *p += v; return o; }
 static LONG InterlockedExchange(volatile LONG *p, LONG v) { LONG o = *p; *p = v; return o; }
-struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; };
+struct mad_tvs { LONG64 seen; };
+struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; struct mad_tvs *sh; };
 struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; int heap; };
 typedef struct mad_resource ID3D12Resource;
 static int released;
@@ -311,12 +312,14 @@ static UINT64 last_vmap_id; static UINT32 last_vmap_a, last_vmap_b;
 static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b) { (void)d; last_vmap_id = id; last_vmap_a = a; last_vmap_b = b; }
 static void mad_view_census(const char *kind, struct mad_resource *r, unsigned n) { (void)kind; (void)r; (void)n; }
 #define D3D12_HEAP_TYPE_UPLOAD 2
-static volatile LONG g_tvs_other; static int tvs_on, tvs_made;
+static volatile LONG g_tvs_other; static int tvs_on, tvs_made; static LONG64 g_presents_now;
+static struct mad_tvs tvs_rec[8];
 static int mad_tvs_on(void) { return tvs_on; }
 static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
-                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu) {
+                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu, struct mad_tvs **rec) {
     (void)d; (void)r; (void)byte_off; (void)bytes;
-    ti->width = (uint32_t)num; ti->gpu_resource_id = next_id++; *gpu = 0x70000000ull + 16u * (unsigned)tvs_made++;
+    ti->width = (uint32_t)num; ti->gpu_resource_id = next_id++; *gpu = 0x70000000ull + 16u * (unsigned)tvs_made;
+    *rec = &tvs_rec[tvs_made++ & 7]; (*rec)->seen = g_presents_now;
     return (obj_handle_t)(uintptr_t)ti->gpu_resource_id;
 }
 ''' + body('static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,') + r'''
@@ -427,8 +430,9 @@ int main(void) {
             why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 6, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 0 &&
                              e.gpu_va == 0x70000000ull && tvs_made == 1 && up.tview[up.ntview - 1].sh_gpu == 0x70000000ull &&
                              g_tv_eoff_views == eoff0 + 1, "487: on: an R32 view of UPLOAD memory off 16 bytes reads its aligned copy, no offset");
-            why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 6, 4, 0, &e, &why) == 1 && e.gpu_va == 0x70000000ull && tvs_made == 1,
-                             "487: the cached view keeps pointing at its copy");
+            g_presents_now = 40;
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 6, 4, 0, &e, &why) == 1 && e.gpu_va == 0x70000000ull && tvs_made == 1 &&
+                             tvs_rec[0].seen == 40, "487: the cached view keeps pointing at its copy, which is marked as in use");
             why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 8, 4, 0, &e, &why) == 1 && e.gpu_va == 0x5000 + 32 && tvs_made == 1 &&
                              ((e.metadata >> 32) & 0xff) == 0, "487: a view on a 16-byte boundary needs no copy");
             why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 9, 4, 1, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 1 &&

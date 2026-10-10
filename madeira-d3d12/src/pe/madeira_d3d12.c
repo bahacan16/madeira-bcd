@@ -831,7 +831,7 @@ struct mad_resource {
      * resource; released with it. */
     /* ml1049: growable, never evicted. The 16-entry ring released a Metal view
      * that descriptors still named as soon as a 17th distinct view appeared. */
-    struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; } *tview;   /* eoff: elements before the view's first (madeira-bcd typed-view-align); sh_gpu: its typed-view-shadow copy, 0 = none */
+    struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; struct mad_tvs *sh; } *tview;   /* eoff: elements before the view's first (madeira-bcd typed-view-align); sh_gpu / sh: its typed-view-shadow copy, 0 = none */
     unsigned ntview, tview_cap;
     void *view_old[24]; unsigned nview_old;   /* outgrown arrays, freed with the resource */
     unsigned srv_slot, uav_slot;              /* index + 1 in the device's srv_res / uav_res, 0 = absent (list_lock) */
@@ -10368,8 +10368,8 @@ static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element 
 #define MAD_TVS_MAX_VIEW (64u << 10)
 #define MAD_TVS_MAX_BYTES (64u << 20)
 #define MAD_TVS_MAX_N 16384u
-struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len; };
-static struct mad_tvs *g_tvs; static unsigned g_tvs_n, g_tvs_cap;
+struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len; volatile LONG64 seen; };   /* seen: the present its view was last made or looked up */
+static struct mad_tvs **g_tvs; static unsigned g_tvs_n, g_tvs_cap;
 static SRWLOCK g_tvs_lock = SRWLOCK_INIT;
 static obj_handle_t g_tvs_buf; static unsigned char *g_tvs_cpu; static UINT64 g_tvs_gpu; static UINT32 g_tvs_used;
 static volatile LONG64 g_tvs_bytes;
@@ -10606,10 +10606,11 @@ static int mad_tvs_on(void) {
 /* The shadow for one view: its texture (or 0, and the caller makes the view as
  * before), the copy's GPU address in *gpu. view_lock held. */
 static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
-                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu) {
+                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu, struct mad_tvs **rec) {
     UINT64 len = num * bytes, al;
     uint32_t w0 = ti->width;
     obj_handle_t tex = 0;
+    struct mad_tvs *t;
     if (byte_off >= r->size || !bytes) return 0;
     if (len > r->size - byte_off) len = r->size - byte_off;   /* past the end: what is there, as the plain view is cut short */
     len -= len % bytes;
@@ -10627,19 +10628,21 @@ static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, s
         mad_resident(d, nb);
         g_tvs_buf = nb; g_tvs_cpu = (unsigned char *)bi.memory.ptr; g_tvs_gpu = bi.gpu_address; g_tvs_used = 0;
     }
-    if (!mad_grow((void **)&g_tvs, &g_tvs_cap, g_tvs_n + 1, sizeof *g_tvs)) goto full;
+    if (!mad_grow((void **)&g_tvs, &g_tvs_cap, g_tvs_n + 1, sizeof *g_tvs) || !(t = malloc(sizeof *t))) goto full;
     memcpy(g_tvs_cpu + g_tvs_used, (const unsigned char *)r->cpu + byte_off, (size_t)len);
     ti->width = (uint32_t)(len / bytes);
     tex = MTLBuffer_newTexture(g_tvs_buf, ti, g_tvs_used, len);
     if (!tex || !ti->gpu_resource_id) {
         if (tex) NSObject_release(tex);
+        free(t);
         ti->gpu_resource_id = 0; ti->width = w0;
         ReleaseSRWLockExclusive(&g_tvs_lock);
         return 0;
     }
-    g_tvs[g_tvs_n].r = r; g_tvs[g_tvs_n].src = (const unsigned char *)r->cpu + byte_off;
-    g_tvs[g_tvs_n].dst = g_tvs_cpu + g_tvs_used; g_tvs[g_tvs_n].len = (UINT32)len;
-    g_tvs_n++;
+    t->r = r; t->src = (const unsigned char *)r->cpu + byte_off; t->dst = g_tvs_cpu + g_tvs_used; t->len = (UINT32)len;
+    t->seen = g_presents_now;
+    g_tvs[g_tvs_n++] = t;
+    *rec = t;
     *gpu = g_tvs_gpu + g_tvs_used;
     g_tvs_used += (UINT32)al; g_tvs_bytes += (LONG64)al;
     ReleaseSRWLockExclusive(&g_tvs_lock);
@@ -10652,13 +10655,22 @@ full:
                   g_tvs_n, (long long)(g_tvs_bytes >> 10));
     return 0;
 }
-/* At every ExecuteCommandLists, before its lists are replayed. */
+/* At every ExecuteCommandLists, before its lists are replayed. A game that
+ * sub-allocates a ring makes one view per frame and range, so copies pile up
+ * (a few thousand an hour): the ones whose view was made or looked up in the
+ * last 16 presents are compared every time, the rest once every 64 presents. */
 static void mad_tvs_refresh(void) {
-    unsigned i; LONG n = 0;
+    static LONG64 last_sweep = -1;
+    LONG64 now = g_presents_now;
+    unsigned i; LONG n = 0; int sweep = 0;
     if (!g_tvs_n) return;
     AcquireSRWLockExclusive(&g_tvs_lock);
-    for (i = 0; i < g_tvs_n; i++)
-        if (memcmp(g_tvs[i].dst, g_tvs[i].src, g_tvs[i].len)) { memcpy(g_tvs[i].dst, g_tvs[i].src, g_tvs[i].len); n++; }
+    if (now / 64 != last_sweep) { last_sweep = now / 64; sweep = 1; }
+    for (i = 0; i < g_tvs_n; i++) {
+        struct mad_tvs *t = g_tvs[i];
+        if (!sweep && now - t->seen > 16) continue;
+        if (memcmp(t->dst, t->src, t->len)) { memcpy(t->dst, t->src, t->len); n++; }
+    }
     ReleaseSRWLockExclusive(&g_tvs_lock);
     if (n) InterlockedExchangeAdd(&g_tvs_copies, n);
 }
@@ -10667,7 +10679,7 @@ static void mad_tvs_forget(struct mad_resource *r) {
     unsigned i, w = 0;
     if (!g_tvs_n) return;
     AcquireSRWLockExclusive(&g_tvs_lock);
-    for (i = 0; i < g_tvs_n; i++) if (g_tvs[i].r != r) g_tvs[w++] = g_tvs[i];
+    for (i = 0; i < g_tvs_n; i++) { if (g_tvs[i]->r != r) g_tvs[w++] = g_tvs[i]; else free(g_tvs[i]); }
     g_tvs_n = w;
     ReleaseSRWLockExclusive(&g_tvs_lock);
 }
@@ -10677,6 +10689,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
                                  UINT64 first, UINT64 num, int uav, struct mad_descriptor *e, int *why) {
     enum WMTPixelFormat pf; int is_depth = 0; UINT bytes, block; unsigned k;
     UINT64 byte_off, aligned, elem_off, width, bpr, sh_gpu = 0;
+    struct mad_tvs *sh = NULL;
     struct WMTTextureInfo ti;
     obj_handle_t tex;
     static unsigned said_fail, said_ok;
@@ -10709,9 +10722,9 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         ti.options = r->cpu ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;
         if (uav && (pf == WMTPixelFormatR32Uint || pf == WMTPixelFormatR32Sint) && mad_typed_uav_atomic())   /* madeira-bcd, opt-in */
             ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageShaderAtomic);
-        sh_gpu = 0; tex = 0;
+        sh_gpu = 0; sh = NULL; tex = 0;
         if (elem_off && mad_tvs_on()) {   /* madeira-bcd typed-view-shadow: an aligned copy instead of an element offset */
-            if (!uav && r->cpu && r->heap == D3D12_HEAP_TYPE_UPLOAD) tex = mad_tvs_view(d, r, &ti, byte_off, num, bytes, &sh_gpu);
+            if (!uav && r->cpu && r->heap == D3D12_HEAP_TYPE_UPLOAD) tex = mad_tvs_view(d, r, &ti, byte_off, num, bytes, &sh_gpu, &sh);
             if (!tex) InterlockedIncrement(&g_tvs_other);
         }
         if (tex) elem_off = 0;
@@ -10757,7 +10770,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         InterlockedIncrement(&g_tview_live); InterlockedIncrement(&g_tview_made);
         k = r->ntview;
         r->tview[k].fmt = (UINT)fmt; r->tview[k].off = byte_off; r->tview[k].num = num; r->tview[k].uav = (UINT8)uav;
-        r->tview[k].eoff = (UINT8)elem_off; r->tview[k].sh_gpu = sh_gpu;
+        r->tview[k].eoff = (UINT8)elem_off; r->tview[k].sh_gpu = sh_gpu; r->tview[k].sh = sh;
         r->tview[k].tex = tex; r->tview[k].id = ti.gpu_resource_id;
         r->ntview = k + 1;   /* published last: a reader never sees a half-written entry */
         if (elem_off) {   /* madeira-bcd: what typed-view-align leaves to the converter (view-census reports it) */
@@ -10773,6 +10786,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
                       (unsigned)width, (unsigned long long)elem_off);
     }
     elem_off = r->tview[k].eoff;   /* as the view was made (madeira-bcd typed-view-align may have moved its start) */
+    if (r->tview[k].sh) r->tview[k].sh->seen = g_presents_now;   /* madeira-bcd typed-view-shadow: in use, refresh it every time */
     e->gpu_va = r->tview[k].sh_gpu ? r->tview[k].sh_gpu : r->gpu_address + r->tview[k].off;   /* madeira-bcd typed-view-shadow: the copy */
     e->texture_view_id = r->tview[k].id;
     e->metadata = ((num * bytes) & 0xffffffffull) | ((elem_off & 0x7fffffffull) << 32) | (1ull << 63);

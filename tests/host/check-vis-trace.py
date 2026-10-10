@@ -77,11 +77,12 @@ check('typed-view-shadow, vis-trace and readback-far are off by default',
 tbv = body('static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,')
 check('a view is copied only with an element offset, the switch on, an SRV of UPLOAD memory; others are counted',
       'if (elem_off && mad_tvs_on()) {' in tbv and
-      'if (!uav && r->cpu && r->heap == D3D12_HEAP_TYPE_UPLOAD) tex = mad_tvs_view(d, r, &ti, byte_off, num, bytes, &sh_gpu);' in tbv and
+      'if (!uav && r->cpu && r->heap == D3D12_HEAP_TYPE_UPLOAD) tex = mad_tvs_view(d, r, &ti, byte_off, num, bytes, &sh_gpu, &sh);' in tbv and
       'if (!tex) InterlockedIncrement(&g_tvs_other);' in tbv and
       'if (tex) elem_off = 0;\n        else tex = MTLBuffer_newTexture(r->buffer, &ti, aligned, bpr);' in tbv)
-check('the descriptor names the copy, and the view remembers it',
-      'r->tview[k].eoff = (UINT8)elem_off; r->tview[k].sh_gpu = sh_gpu;' in tbv and
+check('the descriptor names the copy, and the view remembers it (and marks it in use when it is looked up)',
+      'r->tview[k].eoff = (UINT8)elem_off; r->tview[k].sh_gpu = sh_gpu; r->tview[k].sh = sh;' in tbv and
+      'if (r->tview[k].sh) r->tview[k].sh->seen = g_presents_now;' in tbv and
       'e->gpu_va = r->tview[k].sh_gpu ? r->tview[k].sh_gpu : r->gpu_address + r->tview[k].off;' in tbv)
 ecl = block(pe, 'static void STDMETHODCALLTYPE queue_ExecuteCommandLists(', '\n}\n')
 check('every ExecuteCommandLists refreshes the copies (before a worker or the replay sees the lists) and loads vis-trace',
@@ -161,8 +162,9 @@ static int mad_grow(void **arr, unsigned *cap, unsigned need, size_t elem) {
 #define MAD_TVS_MAX_VIEW (64u << 10)
 #define MAD_TVS_MAX_BYTES (64u << 20)
 #define MAD_TVS_MAX_N 16384u
-struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len; };
-static struct mad_tvs *g_tvs; static unsigned g_tvs_n, g_tvs_cap;
+struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len; volatile LONG64 seen; };
+static struct mad_tvs **g_tvs; static unsigned g_tvs_n, g_tvs_cap;
+static volatile LONG64 g_presents_now;
 static SRWLOCK g_tvs_lock = SRWLOCK_INIT;
 static obj_handle_t g_tvs_buf; static unsigned char *g_tvs_cpu; static UINT64 g_tvs_gpu; static UINT32 g_tvs_used;
 static volatile LONG64 g_tvs_bytes;
@@ -190,39 +192,48 @@ int main(void) {
     struct mad_resource up = { upmem, sizeof upmem, 0, 0 };
     struct WMTTextureInfo ti;
     UINT64 gpu = 0, gpu2 = 0;
+    struct mad_tvs *rec = NULL, *rec2 = NULL;
     unsigned i;
     for (i = 0; i < sizeof upmem; i++) upmem[i] = (unsigned char)(i * 7);
     /* typed-view-shadow */
     ti.width = 308; ti.gpu_resource_id = 0;
-    EXPECT(mad_tvs_view(&d, &up, &ti, 4, 307, 4, &gpu) != 0 && ti.width == 307 && gpu == 0x100000000ull && last_off == 0 &&
+    EXPECT(mad_tvs_view(&d, &up, &ti, 4, 307, 4, &gpu, &rec) != 0 && rec && rec->len == 1228 && ti.width == 307 && gpu == 0x100000000ull && last_off == 0 &&
            !memcmp(g_tvs_cpu, upmem + 4, 1228) && g_tvs_n == 1 && chunks == 1 && residents == 1 && g_tvs_views == 1,
            "a 307-element R32 view at +4: its bytes copied to the start of a new resident chunk, the texture 307 wide");
     ti.width = 9; ti.gpu_resource_id = 0;
-    EXPECT(mad_tvs_view(&d, &up, &ti, 2000, 8, 4, &gpu2) != 0 && gpu2 == 0x100000000ull + 1232 && last_off == 1232 && g_tvs_n == 2,
+    EXPECT(mad_tvs_view(&d, &up, &ti, 2000, 8, 4, &gpu2, &rec2) != 0 && gpu2 == 0x100000000ull + 1232 && last_off == 1232 && g_tvs_n == 2,
            "the next copy starts at the next 16-byte boundary (1228 -> 1232)");
     g_tvs_copies = 0; mad_tvs_refresh();
     EXPECT(g_tvs_copies == 0, "refresh: nothing changed, nothing copied");
     upmem[4 + 100] ^= 0xff; mad_tvs_refresh();
     EXPECT(g_tvs_copies == 1 && g_tvs_cpu[100] == upmem[104], "refresh: the CPU rewrote the range, the copy follows");
+    g_presents_now = 30; rec->seen = 10; rec2->seen = 25; g_tvs_copies = 0;
+    mad_tvs_refresh();   /* the first refresh in a new 64-present period sweeps everything */
+    upmem[4 + 101] ^= 0xff; upmem[2000] ^= 0xff; mad_tvs_refresh();
+    EXPECT(g_tvs_copies == 1 && g_tvs_cpu[101] != upmem[105] && g_tvs_cpu[1232] == upmem[2000],
+           "refresh: a copy whose view was last used more than 16 presents ago waits for the sweep, a recent one is refreshed");
+    g_presents_now = 64; mad_tvs_refresh();
+    EXPECT(g_tvs_copies == 2 && g_tvs_cpu[101] == upmem[105], "refresh: the sweep every 64 presents brings the old copy up to date");
     {   /* forgotten with its resource */
         static unsigned char other[256]; struct mad_resource o = { other, sizeof other, 0, 0 };
         UINT64 g3 = 0; unsigned char *dst;
-        ti.width = 9; EXPECT(mad_tvs_view(&d, &o, &ti, 4, 8, 4, &g3) != 0 && g_tvs_n == 3, "a third view, of another resource");
-        dst = g_tvs[2].dst; mad_tvs_forget(&o); other[4] ^= 0xff; mad_tvs_refresh();
+        struct mad_tvs *r3 = NULL;
+        ti.width = 9; EXPECT(mad_tvs_view(&d, &o, &ti, 4, 8, 4, &g3, &r3) != 0 && g_tvs_n == 3 && r3 == g_tvs[2], "a third view, of another resource");
+        dst = g_tvs[2]->dst; mad_tvs_forget(&o); other[4] ^= 0xff; g_presents_now = 128; mad_tvs_refresh();
         EXPECT(g_tvs_n == 2 && dst[0] != other[4], "forget: the released resource's copy is no longer refreshed, the others are");
     }
     ti.width = 77; loglen = 0;
-    EXPECT(mad_tvs_view(&d, &up, &ti, 4, (64u << 10) / 4 + 1, 4, &gpu) == 0 && ti.width == 77 && g_tvs_full == 1,
+    EXPECT(mad_tvs_view(&d, &up, &ti, 4, (64u << 10) / 4 + 1, 4, &gpu, &rec) == 0 && ti.width == 77 && g_tvs_full == 1,
            "a view over 64 KB is refused, the texture's width left as it was");
     ti.width = 5;
-    EXPECT(mad_tvs_view(&d, &up, &ti, sizeof upmem - 8, 307, 4, &gpu) != 0 && ti.width == 2,
+    EXPECT(mad_tvs_view(&d, &up, &ti, sizeof upmem - 8, 307, 4, &gpu, &rec) != 0 && ti.width == 2,
            "a view past the end of its resource copies what is there");
     refuse_tex = 1; ti.width = 33; { UINT32 used = g_tvs_used; unsigned n = g_tvs_n;
-    EXPECT(mad_tvs_view(&d, &up, &ti, 4, 8, 4, &gpu) == 0 && ti.width == 33 && g_tvs_used == used && g_tvs_n == n,
+    EXPECT(mad_tvs_view(&d, &up, &ti, 4, 8, 4, &gpu, &rec) == 0 && ti.width == 33 && g_tvs_used == used && g_tvs_n == n,
            "Metal refuses the texture: nothing kept, the caller makes the view as before"); }
     refuse_tex = 0;
     g_tvs_used = MAD_TVS_CHUNK - 8; ti.width = 4;
-    EXPECT(mad_tvs_view(&d, &up, &ti, 4, 4, 4, &gpu) != 0 && chunks == 2 && gpu == 0x200000000ull && last_off == 0,
+    EXPECT(mad_tvs_view(&d, &up, &ti, 4, 4, 4, &gpu, &rec) != 0 && chunks == 2 && gpu == 0x200000000ull && last_off == 0,
            "a full chunk: the copy goes to a new one");
 
     /* vis-trace and readback-far */
