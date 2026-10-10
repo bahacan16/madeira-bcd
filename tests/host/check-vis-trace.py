@@ -98,20 +98,33 @@ check('vis-trace hooks: draws, dispatches and copies (by queue type) counted onl
 check('readbacks: looked at only with vis-trace or readback-far on; a filled one encodes no copy',
       'if ((g_vt_on > 0 || g_rbf_on > 0) && mad_vt_copy(e, c)) return;   /* madeira-bcd vis-trace / readback-far */' in pe)
 check('Queue::Wait: calls, fast-path passes and passes before the awaited batch was committed are counted (vis-trace on)',
-      'if ((UINT64)f->committed < value && f->value < value) InterlockedIncrement(&g_vt_qw_early);' in pe and
+      'if (sq && (UINT64)f->sig_value == value && __atomic_load_n(&sq->batches, __ATOMIC_ACQUIRE) < (UINT64)f->sig_batch && f->value < value)\n'
+      '                InterlockedIncrement(&g_vt_qw_early);' in pe and
       pe.index('InterlockedIncrement(&g_vt_qw_early)') < pe.index('/* madeira-bcd: fence-strict. "submitted" is set by queue_Signal'))
+sig = block(pe, 'static HRESULT STDMETHODCALLTYPE queue_Signal(', '\n}\n')
+check('Queue::Signal records its queue, value and the batch it needs committed before it publishes the value (vis-trace on)',
+      'sf->sig_batch = (LONG64)(__atomic_load_n(&q->batches, __ATOMIC_ACQUIRE) + (q->open_cb ? 1 : 0));\n        sf->sig_q = q; sf->sig_value = (LONG64)value;' in sig
+      and sig.index('sf->sig_value = (LONG64)value;') < sig.index('InterlockedCompareExchange64(&sf->submitted'))
+flush = body('static void mad_queue_flush(struct mad_queue *q) {')
+rew = body('static void mad_list_rings_rewind(struct mad_list *l) {')
+check('a batch is counted (release) only after its serial is stored; readers without the lock load the count first (acquire)',
+      flush.index('q->batch_serial[(q->batches + 1) & 63] = serial;') < flush.index('__atomic_store_n(&q->batches, q->batches + 1, __ATOMIC_RELEASE);') and
+      'q->batches++' not in flush and
+      'UINT64 nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);' in rew and
+      '(nb - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;' in rew and
+      'serial = nb - b->batch < 64 ? q->batch_serial[b->batch & 63] : q->last_serial;' in pe)
 check('a line per present, after the present is counted',
       's->presents++;\n    mad_perf_present();   /* ml1108 */\n    if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);' in pe)
 for key in ('typed-view-shadow', 'vis-trace', 'readback-far'):
     check('settings catalog: ' + key, 'ConfigOption(key: "%s"' % key in catalog)
 hzd = block(recs, 'static let horizonZeroDawn = GameRecommendation(', 'avx: false')
-check('Horizon Zero Dawn (v11): shadow, fence-strict and vis-trace on, readback-far not',
-      'version: 11' in hzd and 'typed-view-shadow = 1' in hzd and 'fence-strict = 1' in hzd and 'vis-trace = 1' in hzd and
-      'readback-far' not in hzd)
+check('Horizon Zero Dawn (v12): shadow, fence-strict, vis-trace and desc-guard on, readback-far not',
+      'version: 12' in hzd and 'typed-view-shadow = 1' in hzd and 'fence-strict = 1' in hzd and 'vis-trace = 1' in hzd and
+      'desc-guard = 1' in hzd and 'readback-far' not in hzd)
 configs = [c.split('"""')[0] for c in recs.split('config: """')[1:]]
 others = [c for c in configs if 'typed-view-shadow = 1' not in c]
 check('no other game list has them', len(configs) == 6 and len(others) == 5 and
-      not any(k in c for c in others for k in ('typed-view-shadow', 'vis-trace', 'readback-far', 'fence-strict')))
+      not any(k in c for c in others for k in ('typed-view-shadow', 'vis-trace', 'readback-far', 'fence-strict', 'desc-guard')))
 
 harness = r'''
 #include <stdio.h>
@@ -162,6 +175,7 @@ static int mad_grow(void **arr, unsigned *cap, unsigned need, size_t elem) {
 #define MAD_TVS_MAX_VIEW (64u << 10)
 #define MAD_TVS_MAX_BYTES (64u << 20)
 #define MAD_TVS_MAX_N 16384u
+#define MAD_TVS_ALL_BYTES (2u << 20)
 struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len; volatile LONG64 seen; };
 static struct mad_tvs **g_tvs; static unsigned g_tvs_n, g_tvs_cap;
 static volatile LONG64 g_presents_now;
@@ -208,12 +222,18 @@ int main(void) {
     upmem[4 + 100] ^= 0xff; mad_tvs_refresh();
     EXPECT(g_tvs_copies == 1 && g_tvs_cpu[100] == upmem[104], "refresh: the CPU rewrote the range, the copy follows");
     g_presents_now = 30; rec->seen = 10; rec2->seen = 25; g_tvs_copies = 0;
-    mad_tvs_refresh();   /* the first refresh in a new 64-present period sweeps everything */
-    upmem[4 + 101] ^= 0xff; upmem[2000] ^= 0xff; mad_tvs_refresh();
-    EXPECT(g_tvs_copies == 1 && g_tvs_cpu[101] != upmem[105] && g_tvs_cpu[1232] == upmem[2000],
-           "refresh: a copy whose view was last used more than 16 presents ago waits for the sweep, a recent one is refreshed");
-    g_presents_now = 64; mad_tvs_refresh();
-    EXPECT(g_tvs_copies == 2 && g_tvs_cpu[101] == upmem[105], "refresh: the sweep every 64 presents brings the old copy up to date");
+    upmem[4 + 101] ^= 0xff; mad_tvs_refresh();
+    EXPECT(g_tvs_copies == 1 && g_tvs_cpu[101] == upmem[105],
+           "refresh, 2 MB or less in all: a copy whose view was last used long ago is compared every time too");
+    g_tvs_bytes += MAD_TVS_ALL_BYTES;   /* as if there were many more copies */
+    upmem[4 + 102] ^= 0xff; upmem[2000] ^= 0xff; g_tvs_copies = 0; mad_tvs_refresh();
+    EXPECT(g_tvs_copies == 1 && g_tvs_cpu[102] != upmem[106] && g_tvs_cpu[1232] == upmem[2000],
+           "refresh, over 2 MB: within a present, a copy whose view was last used more than 16 presents ago waits, a recent one is refreshed");
+    g_presents_now = 31; mad_tvs_refresh();
+    EXPECT(g_tvs_copies == 2 && g_tvs_cpu[102] == upmem[106], "refresh, over 2 MB: the first ExecuteCommandLists after a Present compares them all");
+    upmem[4 + 103] ^= 0xff; mad_tvs_refresh();
+    EXPECT(g_tvs_copies == 2 && g_tvs_cpu[103] != upmem[107], "refresh, over 2 MB: the next ones in the same present compare only the recent ones");
+    g_tvs_bytes -= MAD_TVS_ALL_BYTES;
     {   /* forgotten with its resource */
         static unsigned char other[256]; struct mad_resource o = { other, sizeof other, 0, 0 };
         UINT64 g3 = 0; unsigned char *dst;

@@ -1232,6 +1232,7 @@ struct mad_fence {
     UINT64 value;
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
+    struct mad_queue *volatile sig_q; volatile LONG64 sig_value, sig_batch;   /* madeira-bcd vis-trace: the newest Signal, its queue and the batch it needs committed */
     struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
     unsigned nwaiters;
 };
@@ -8882,7 +8883,8 @@ static void mad_queue_flush(struct mad_queue *q) {
         if (q->nring_parked) mad_ring_unpark(q, serial);   /* madeira-bcd ring-share */
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
-    q->open_cb = 0; q->open_lists = 0; q->batches++;
+    q->open_cb = 0; q->open_lists = 0;
+    __atomic_store_n(&q->batches, q->batches + 1, __ATOMIC_RELEASE);   /* madeira-bcd: after batch_serial, for readers without submit_lock (ARM64 reorders stores) */
     if (q->batches <= 3 || (q->batches % 500) == 0)
         d3d12_log("[madeira-d3d12] batch #%llu committed (%llu lists so far)\n",
                   (unsigned long long)q->batches, (unsigned long long)q->executed);
@@ -8909,9 +8911,12 @@ static void mad_list_rings_rewind(struct mad_list *l) {
     struct mad_queue *q = l->ring_q;
     l->ring_used = 0;
     if (!q || !l->nrings || !q->device || !q->device->gpu_event) return;   /* never replayed, or no GPU timeline */
-    if (l->ring_batch > q->batches) mad_queue_flush(q);                     /* its batch is still open: commit it so it HAS a serial */
+    if (l->ring_batch > __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE)) mad_queue_flush(q);   /* its batch is still open: commit it so it HAS a serial */
     {
-        UINT64 serial = (q->batches - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;
+        /* madeira-bcd: an acquire load, so batch_serial is read after the count it
+         * goes with (another thread's flush stores the serial, then the count). */
+        UINT64 nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);
+        UINT64 serial = (nb - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;
         if (!serial) serial = q->last_serial;
         if (serial && mad_gpu_completed(q->device) < serial) mad_ring_retire(q->device, l, serial);
         else if (mad_ring_share_on()) mad_ring_pool_put(q->device, l);   /* madeira-bcd: ring-share */
@@ -9038,9 +9043,14 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
     if (g_sd_state > 0 && g_qtrace) mad_qtrace("Wait", (struct mad_queue *)This, f, value, 0);
     if (g_vt_on > 0) {   /* madeira-bcd vis-trace: how often a wait passes before the work it waits for is committed */
         InterlockedIncrement(&g_vt_qw);
-        if ((UINT64)f->submitted >= value) {
+        if ((UINT64)__atomic_load_n(&f->submitted, __ATOMIC_ACQUIRE) >= value) {
+            struct mad_queue *sq = f->sig_q;
             InterlockedIncrement(&g_vt_qw_fast);
-            if ((UINT64)f->committed < value && f->value < value) InterlockedIncrement(&g_vt_qw_early);
+            /* early: the newest Signal is the awaited one, and its queue has not
+             * committed the batch it covers (the flush above commits any batch
+             * that was open, so this is another thread's work in flight) */
+            if (sq && (UINT64)f->sig_value == value && __atomic_load_n(&sq->batches, __ATOMIC_ACQUIRE) < (UINT64)f->sig_batch && f->value < value)
+                InterlockedIncrement(&g_vt_qw_early);
         }
     }
     if ((UINT64)f->submitted >= value) {
@@ -9079,6 +9089,11 @@ static HRESULT STDMETHODCALLTYPE queue_Signal(ID3D12CommandQueue *This, ID3D12Fe
     struct mad_queue *q = (struct mad_queue *)This;
     if (!fence) return E_INVALIDARG;
     if (g_sd_state > 0 && g_qtrace) mad_qtrace("Signal", q, (const struct mad_fence *)fence, value, 0);   /* madeira-bcd */
+    if (g_vt_on > 0) {   /* madeira-bcd vis-trace: the batch a Queue::Wait for this value needs committed (published by the exchange below) */
+        struct mad_fence *sf = (struct mad_fence *)fence;
+        sf->sig_batch = (LONG64)(__atomic_load_n(&q->batches, __ATOMIC_ACQUIRE) + (q->open_cb ? 1 : 0));
+        sf->sig_q = q; sf->sig_value = (LONG64)value;
+    }
     {   /* ml1061 */
         struct mad_fence *sf = (struct mad_fence *)fence; LONG64 cur;
         do { cur = sf->submitted; } while ((UINT64)cur < value && InterlockedCompareExchange64(&sf->submitted, (LONG64)value, cur) != cur);
@@ -10368,6 +10383,7 @@ static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element 
 #define MAD_TVS_MAX_VIEW (64u << 10)
 #define MAD_TVS_MAX_BYTES (64u << 20)
 #define MAD_TVS_MAX_N 16384u
+#define MAD_TVS_ALL_BYTES (2u << 20)   /* up to this much in all, every copy is compared at every ExecuteCommandLists */
 struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len; volatile LONG64 seen; };   /* seen: the present its view was last made or looked up */
 static struct mad_tvs **g_tvs; static unsigned g_tvs_n, g_tvs_cap;
 static SRWLOCK g_tvs_lock = SRWLOCK_INIT;
@@ -10655,17 +10671,22 @@ full:
                   g_tvs_n, (long long)(g_tvs_bytes >> 10));
     return 0;
 }
-/* At every ExecuteCommandLists, before its lists are replayed. A game that
- * sub-allocates a ring makes one view per frame and range, so copies pile up
- * (a few thousand an hour): the ones whose view was made or looked up in the
- * last 16 presents are compared every time, the rest once every 64 presents. */
+/* At every ExecuteCommandLists, before its lists are replayed. While the copies
+ * add up to 2 MB or less (Horizon Zero Dawn made 137 such views in a 486 run,
+ * about 170 KB) every one is compared every time: a view made once and then
+ * only copied between descriptor heaps is never looked up again. Past that (a
+ * game that sub-allocates a ring makes one view per frame and range, so copies
+ * pile up) the ones whose view was made or looked up in the last 16 presents
+ * are compared every time and the rest at the first ExecuteCommandLists after
+ * each Present. */
 static void mad_tvs_refresh(void) {
     static LONG64 last_sweep = -1;
     LONG64 now = g_presents_now;
-    unsigned i; LONG n = 0; int sweep = 0;
+    unsigned i; LONG n = 0; int sweep;
     if (!g_tvs_n) return;
     AcquireSRWLockExclusive(&g_tvs_lock);
-    if (now / 64 != last_sweep) { last_sweep = now / 64; sweep = 1; }
+    sweep = g_tvs_bytes <= (LONG64)MAD_TVS_ALL_BYTES || now != last_sweep;
+    last_sweep = now;
     for (i = 0; i < g_tvs_n; i++) {
         struct mad_tvs *t = g_tvs[i];
         if (!sweep && now - t->seen > 16) continue;
@@ -18288,11 +18309,11 @@ static void mad_vt_present(struct mad_device *d, UINT64 presents) {
     for (i = w = 0; i < g_vt_rb_n; i++) {
         struct mad_vt_rb *b = &g_vt_rb[i];
         struct mad_queue *q = b->q;
-        UINT64 serial = 0;
+        UINT64 serial = 0, nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);
         int ready;
-        if (q->batches < b->batch) ready = 0;   /* its batch is still open */
+        if (nb < b->batch) ready = 0;   /* its batch is still open */
         else {
-            serial = q->batches - b->batch < 64 ? q->batch_serial[b->batch & 63] : q->last_serial;
+            serial = nb - b->batch < 64 ? q->batch_serial[b->batch & 63] : q->last_serial;
             ready = !serial || serial <= done;
         }
         if (!ready && (LONG64)presents - b->frame < 8) { if (w != i) g_vt_rb[w] = *b; w++; continue; }

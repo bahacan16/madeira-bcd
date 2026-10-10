@@ -343,9 +343,11 @@ enum GameRecommendations {
     /// 16-byte boundary an aligned copy of their bytes (typed-view-shadow),
     /// holds a queue's wait until the work it waits for is committed
     /// (fence-strict), and logs every frame's draws and the pyramid as the GPU
-    /// wrote it (vis-trace).
+    /// wrote it (vis-trace). Build 489's list adds desc-guard, which logs the
+    /// game rewriting a descriptor that a batch still running on the GPU uses
+    /// (another one-frame cause: that draw reads another object's data).
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 11,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 12,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -360,6 +362,7 @@ enum GameRecommendations {
         fence-strict = 1
         view-census = 1
         vis-trace = 1
+        desc-guard = 1
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1
