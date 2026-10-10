@@ -7403,10 +7403,13 @@ static UINT mad_aspect_bpp(const struct mad_resource *r, UINT plane) {
  * vis-trace logs one line per present (the HUD's frame number is the present
  * number, so a frame of a screen recording finds its line): draws (depth-only
  * passes, passes with 3+ targets), indices x instances, dispatches, pyramid
- * copies, new typed views with an element offset and shadowed ones; and, once
- * the GPU has finished them, the 11x5 and 5x2 mips of the pyramid as the GPU
- * wrote them, with the present they belong to. A vanishing frame with fewer
- * draws was culled by the game; with the same draws, the GPU lost them.
+ * copies, new typed views with an element offset and shadowed ones, and
+ * Queue::Wait calls with how many passed before the batch they wait for was
+ * committed (the race fence-strict closes); and, once the GPU has finished
+ * them, every value of the 22x10, 11x5 and 5x2 mips of the pyramid as the GPU
+ * wrote them, with the present they belong to (each mip can be checked against
+ * the next). A vanishing frame with fewer draws was culled by the game; with
+ * the same draws, the GPU lost them.
  *
  * readback-far: those copies are not made; their destination rows are filled
  * with 4096 on the CPU when the copy is replayed, so nothing in the pyramid
@@ -7415,6 +7418,7 @@ static UINT mad_aspect_bpp(const struct mad_resource *r, UINT plane) {
  * (everything is drawn). */
 static int g_vt_on = -1, g_rbf_on = -1;
 static volatile LONG g_vt_draws, g_vt_depth, g_vt_mrt, g_vt_disp, g_vt_pyr, g_vt_rbf;
+static volatile LONG g_vt_qw, g_vt_qw_fast, g_vt_qw_early;   /* Queue::Wait calls; on the fast path; of those, before the signalling batch was committed */
 static volatile LONG64 g_vt_idx, g_vt_presents;
 struct mad_vt_rb { struct mad_queue *q; UINT64 batch; const unsigned char *cpu; UINT32 row, w, h, level; LONG64 frame; };
 #define MAD_VT_RB 16u
@@ -7458,7 +7462,7 @@ static int mad_vt_copy(struct mad_exec *e, const struct mad_cmd *c) {
         InterlockedIncrement(&g_vt_rbf);
         return 1;
     }
-    if (g_vt_on > 0 && c->u.bt.w * c->u.bt.h <= 64) {   /* the 11x5 and 5x2 mips */
+    if (g_vt_on > 0 && c->u.bt.w * c->u.bt.h <= 256) {   /* the 22x10, 11x5 and 5x2 mips */
         struct mad_vt_rb *r;
         AcquireSRWLockExclusive(&g_vt_lock);
         if (g_vt_rb_n == MAD_VT_RB) { memmove(&g_vt_rb[0], &g_vt_rb[1], (MAD_VT_RB - 1) * sizeof g_vt_rb[0]); g_vt_rb_n--; }
@@ -9029,6 +9033,13 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
      * signal that has not been submitted yet still needs the CPU-side wait. */
     if (g_sd_state < 0) mad_sync_diag_load();   /* madeira-bcd */
     if (g_sd_state > 0 && g_qtrace) mad_qtrace("Wait", (struct mad_queue *)This, f, value, 0);
+    if (g_vt_on > 0) {   /* madeira-bcd vis-trace: how often a wait passes before the work it waits for is committed */
+        InterlockedIncrement(&g_vt_qw);
+        if ((UINT64)f->submitted >= value) {
+            InterlockedIncrement(&g_vt_qw_fast);
+            if ((UINT64)f->committed < value && f->value < value) InterlockedIncrement(&g_vt_qw_early);
+        }
+    }
     if ((UINT64)f->submitted >= value) {
         /* madeira-bcd: fence-strict. "submitted" is set by queue_Signal BEFORE
          * its batch is committed (mad_signal_run flushes after), so a Wait on
@@ -18239,15 +18250,18 @@ static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags);
 /* madeira-bcd vis-trace: at the end of present #presents. */
 static void mad_vt_present(struct mad_device *d, UINT64 presents) {
     static LONG eoff_last, tvs_last;
-    char line[900]; int n; unsigned i, w, x, y;
-    LONG eoff = g_tv_eoff_views, tvs = g_tvs_views;
+    static LONG strict_last;
+    char line[3200]; int n; unsigned i, w, x, y;
+    LONG eoff = g_tv_eoff_views, tvs = g_tvs_views, strict = g_sd_strict_waits;
     UINT64 done;
     d3d12_log("[vis-trace] present #%llu: draws %ld (depth-only %ld, 3+ targets %ld), indices %.2fM, dispatches %ld, pyramid copies %ld%s, "
-              "offset views +%ld, shadowed +%ld\n", (unsigned long long)presents, (long)InterlockedExchange(&g_vt_draws, 0),
+              "offset views +%ld, shadowed +%ld; Queue::Wait %ld (fast path %ld, before the awaited batch was committed %ld; fence-strict "
+              "waits +%ld)\n", (unsigned long long)presents, (long)InterlockedExchange(&g_vt_draws, 0),
               (long)InterlockedExchange(&g_vt_depth, 0), (long)InterlockedExchange(&g_vt_mrt, 0), (double)InterlockedExchange64(&g_vt_idx, 0) / 1e6,
               (long)InterlockedExchange(&g_vt_disp, 0), (long)InterlockedExchange(&g_vt_pyr, 0), g_rbf_on > 0 ? " (filled with 4096)" : "",
-              (long)(eoff - eoff_last), (long)(tvs - tvs_last));
-    eoff_last = eoff; tvs_last = tvs;
+              (long)(eoff - eoff_last), (long)(tvs - tvs_last), (long)InterlockedExchange(&g_vt_qw, 0), (long)InterlockedExchange(&g_vt_qw_fast, 0),
+              (long)InterlockedExchange(&g_vt_qw_early, 0), (long)(strict - strict_last));
+    eoff_last = eoff; tvs_last = tvs; strict_last = strict;
     g_vt_presents = (LONG64)presents;
     AcquireSRWLockExclusive(&g_vt_lock);
     done = mad_gpu_completed(d);
@@ -18264,16 +18278,10 @@ static void mad_vt_present(struct mad_device *d, UINT64 presents) {
         if (!ready && (LONG64)presents - b->frame < 8) { if (w != i) g_vt_rb[w] = *b; w++; continue; }
         n = snprintf(line, sizeof line, "[vis-trace] pyramid mip %u (%ux%u) of present #%lld, queue type %u%s:", b->level, b->w, b->h,
                      (long long)b->frame, (unsigned)q->type, ready ? "" : " (GPU NOT DONE after 8 presents)");
-        for (y = 0; y < b->h && n < (int)sizeof line - 40; y++) {
+        for (y = 0; y < b->h && n < (int)sizeof line - 40; y++) {   /* every value, rows split by | (the mips can be checked against each other) */
             const float *row = (const float *)(b->cpu + (size_t)y * b->row);
-            if (b->w * b->h <= 10) {   /* 5x2: every value */
-                n += snprintf(line + n, sizeof line - (size_t)n, "%s", y ? " |" : "");
-                for (x = 0; x < b->w; x++) n += snprintf(line + n, sizeof line - (size_t)n, " %g", row[x]);
-            } else {                   /* 11x5: each row's nearest and farthest */
-                float lo = row[0], hi = row[0];
-                for (x = 1; x < b->w; x++) { if (row[x] < lo) lo = row[x]; if (row[x] > hi) hi = row[x]; }
-                n += snprintf(line + n, sizeof line - (size_t)n, " %g-%g", lo, hi);
-            }
+            n += snprintf(line + n, sizeof line - (size_t)n, "%s", y ? " |" : "");
+            for (x = 0; x < b->w && n < (int)sizeof line - 16; x++) n += snprintf(line + n, sizeof line - (size_t)n, " %.4g", row[x]);
         }
         d3d12_log("%s\n", line);
     }

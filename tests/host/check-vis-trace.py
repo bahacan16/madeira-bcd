@@ -95,6 +95,9 @@ check('vis-trace hooks: draws and dispatches counted only when on',
       'case MC_DISPATCH: exec_dispatch(&e, c); if (g_vt_on > 0) InterlockedIncrement(&g_vt_disp); break;' in pe)
 check('readbacks: looked at only with vis-trace or readback-far on; a filled one encodes no copy',
       'if ((g_vt_on > 0 || g_rbf_on > 0) && mad_vt_copy(e, c)) return;   /* madeira-bcd vis-trace / readback-far */' in pe)
+check('Queue::Wait: calls, fast-path passes and passes before the awaited batch was committed are counted (vis-trace on)',
+      'if ((UINT64)f->committed < value && f->value < value) InterlockedIncrement(&g_vt_qw_early);' in pe and
+      pe.index('InterlockedIncrement(&g_vt_qw_early)') < pe.index('/* madeira-bcd: fence-strict. "submitted" is set by queue_Signal'))
 check('a line per present, after the present is counted',
       's->presents++;\n    mad_perf_present();   /* ml1108 */\n    if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);' in pe)
 for key in ('typed-view-shadow', 'vis-trace', 'readback-far'):
@@ -163,7 +166,7 @@ static SRWLOCK g_tvs_lock = SRWLOCK_INIT;
 static obj_handle_t g_tvs_buf; static unsigned char *g_tvs_cpu; static UINT64 g_tvs_gpu; static UINT32 g_tvs_used;
 static volatile LONG64 g_tvs_bytes;
 static volatile LONG g_tvs_views, g_tvs_copies, g_tvs_other, g_tvs_full;
-static volatile LONG g_tv_eoff_views;
+static volatile LONG g_tv_eoff_views, g_sd_strict_waits;
 ''' + body('static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,') + '\n' + \
     body('static void mad_tvs_refresh(void) {') + '\n' + body('static void mad_tvs_forget(struct mad_resource *r) {') + r'''
 /* vis-trace */
@@ -223,7 +226,7 @@ int main(void) {
 
     /* vis-trace and readback-far */
     {
-        static unsigned char rb[4096]; static float tex_dummy;
+        static unsigned char rb[8192]; static float tex_dummy;
         struct mad_resource pyr = { &tex_dummy, 0, WMTPixelFormatR32Float, 6 }, dst = { rb, sizeof rb, 0, 1 };
         struct mad_queue q = { 0 };
         struct mad_exec e = { &q, 0, 0, NULL };
@@ -265,8 +268,14 @@ int main(void) {
         for (k = 0; k < 55; k++) ((float *)(rb + 1024 + (k / 11) * 256))[k % 11] = (float)(100 + k);
         mad_vt_copy(&e, &c);
         for (k = 4; k < 13; k++) mad_vt_present(&d, (UINT64)k);
-        EXPECT(strstr(logbuf, "pyramid mip 4 (11x5) of present #4, queue type 3 (GPU NOT DONE after 8 presents): 100-110 111-121 122-132 133-143 144-154") != NULL,
-               "an 11x5 mip: each row's nearest and farthest; a batch never finished is printed after 8 presents, flagged");
+        EXPECT(strstr(logbuf, "pyramid mip 4 (11x5) of present #4, queue type 3 (GPU NOT DONE after 8 presents): 100 101 102 103 104 105 "
+                              "106 107 108 109 110 | 111 112") != NULL && strstr(logbuf, "| 144 145 146 147 148 149 150 151 152 153 154\n") != NULL,
+               "an 11x5 mip: every value, rows split; a batch never finished is printed after 8 presents, flagged");
+        c.u.bt.w = 22; c.u.bt.h = 10; c.u.bt.level = 3; g_vt_rb_n = 0;
+        EXPECT(mad_vt_copy(&e, &c) == 0 && g_vt_rb_n == 1 && g_vt_rb[0].w == 22, "the 22x10 mip is recorded too (the mips can be checked against each other)");
+        c.u.bt.w = 44; c.u.bt.h = 20; c.u.bt.level = 2; g_vt_rb_n = 0;
+        EXPECT(mad_vt_copy(&e, &c) == 0 && g_vt_rb_n == 0, "the 44x20 mip is counted, not recorded");
+        g_vt_rb_n = 0;
         {
             struct mad_cmd dc; memset(&dc, 0, sizeof dc);
             struct mad_resource depth;
@@ -274,10 +283,17 @@ int main(void) {
             e.renc = 1; e.enc_nrt = 0; e.enc_depth = &depth; mad_vt_draw(&e, &dc);
             e.enc_nrt = 5; e.enc_depth = &depth; mad_vt_draw(&e, &dc);
             dc.kind = MC_DRAW; dc.u.draw.vcount = 6; dc.u.draw.icount = 0; e.enc_nrt = 1; mad_vt_draw(&e, &dc);
-            g_tv_eoff_views += 2; g_tvs_views += 1; loglen = 0; logbuf[0] = 0;
+            g_tv_eoff_views += 2; g_tvs_views += 1; g_vt_qw = 5; g_vt_qw_fast = 4; g_vt_qw_early = 1; g_sd_strict_waits += 3;
+            loglen = 0; logbuf[0] = 0;
             mad_vt_present(&d, 20);
-            EXPECT(strstr(logbuf, "[vis-trace] present #20: draws 3 (depth-only 1, 3+ targets 1), indices 0.00M, dispatches 0, pyramid copies 0, "
-                                  "offset views +2, shadowed +1") != NULL, "the per-present counts, reset after each line");
+            EXPECT(strstr(logbuf, "[vis-trace] present #20: draws 3 (depth-only 1, 3+ targets 1), indices 0.00M, dispatches 0, pyramid copies 2, "
+                                  "offset views +2, shadowed +1; Queue::Wait 5 (fast path 4, before the awaited batch was committed 1; "
+                                  "fence-strict waits +3)") != NULL, "the per-present counts, reset after each line");
+            if (bad) printf("%s", logbuf);
+            loglen = 0; logbuf[0] = 0; mad_vt_present(&d, 21);
+            EXPECT(strstr(logbuf, "present #21: draws 0 (depth-only 0, 3+ targets 0), indices 0.00M, dispatches 0, pyramid copies 0, offset views +0, "
+                                  "shadowed +0; Queue::Wait 0 (fast path 0, before the awaited batch was committed 0; fence-strict waits +0)") != NULL,
+                   "and the next present starts from zero");
         }
     }
     printf("%s\n", bad ? "harness FAILED" : "harness ok");

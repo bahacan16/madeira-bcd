@@ -247,8 +247,9 @@ OVERLAY = {
     "vis-trace": {"category": "Direct3D 12", "title": "Diagnostic: per-frame draws and culling readback",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: one log line per present (the HUD's frame number): draws, depth-only and "
-                        "3+-target draws, indices, dispatches, depth-pyramid readback copies and new offset typed views; "
-                        "and the 11x5 and 5x2 mips of the pyramid a game culls with, as the GPU wrote them. Read once per "
+                        "3+-target draws, indices, dispatches, depth-pyramid readback copies, new offset typed views, and "
+                        "Queue::Wait calls (how many passed before the awaited batch was committed); and every value of the "
+                        "22x10, 11x5 and 5x2 mips of the pyramid a game culls with, as the GPU wrote them. Read once per "
                         "game start."},
     "readback-far": {"category": "Direct3D 12", "title": "Experiment: empty culling readback",
                 "kind": "bool", "default": "0",
