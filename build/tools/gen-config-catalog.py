@@ -249,14 +249,22 @@ OVERLAY = {
                 "note": "Default off. 1: one log line per present (the HUD's frame number): draws, depth-only and "
                         "3+-target draws, indices, dispatches, depth-pyramid readback copies, new offset typed views, and "
                         "Queue::Wait calls (how many passed before the awaited batch was committed); and every value of the "
-                        "22x10, 11x5 and 5x2 mips of the pyramid a game culls with, as the GPU wrote them. Read once per "
-                        "game start."},
+                        "22x10, 11x5 and 5x2 mips of the pyramid a game culls with, as the GPU wrote them. The GPU also "
+                        "copies each of those mips into Madeira's own memory, and a mip whose readback memory holds "
+                        "something else is flagged (an earlier frame's values: STALE). Read once per game start."},
     "readback-far": {"category": "Direct3D 12", "title": "Experiment: empty culling readback",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: a readback of a depth pyramid (an R32_FLOAT mip of 1 or more of a texture with 4+ "
                         "mips, up to 64x64) is not copied; the CPU fills it with 4096, so a game that culls on the CPU "
                         "against it culls nothing (everything is drawn: slower). A test, not a fix. Read once per game "
                         "start."},
+    "readback-swap": {"category": "Direct3D 12", "title": "D3D12 readback buffers on file-backed memory",
+                "kind": "bool", "default": "1",
+                "note": "Default on: like upload buffers (upload-swap), READBACK buffers of 8 MB or more live on "
+                        "file-backed storage, off the memory footprint. 0: READBACK buffers get Metal's own memory "
+                        "(Horizon Zero Dawn: two 32 MB buffers), so what the GPU writes into them reaches the CPU "
+                        "without the file tier between; upload buffers stay where upload-swap puts them. Read once per "
+                        "game start."},
     # madeira-bcd: A/B switches for the Sony ports' corrupted meshes (Horizon Zero Dawn, Ghost of Tsushima).
     "d3d12-wave-ops": {"category": "Direct3D 12", "title": "Report wave operations",
                 "kind": "bool", "default": "1",

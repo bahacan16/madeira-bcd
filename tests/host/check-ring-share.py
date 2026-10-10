@@ -40,7 +40,8 @@ park_site = 'if (l->nrings && q->device->gpu_event && mad_ring_share_on()) mad_r
 assert replay.rstrip().endswith(park_site + '\n}'), 'the last thing a replay does'
 flush = function('static void mad_queue_flush(struct mad_queue *q) {')
 unpark_site = 'if (q->nring_parked) mad_ring_unpark(q, serial);'
-assert flush.index('q->batch_serial[(q->batches + 1) & 63] = serial;') < flush.index(unpark_site) < flush.index('q->batches++;')
+assert flush.index('q->batch_serial[(q->batches + 1) & 63] = serial;') < flush.index(unpark_site) < \
+    flush.index('__atomic_store_n(&q->batches, q->batches + 1, __ATOMIC_RELEASE);')
 share = function('static int mad_ring_share_on(void) {')
 assert 'mad_cfg_int_pe("ring-share", 0)' in share, 'off by default'
 release = function('static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {')

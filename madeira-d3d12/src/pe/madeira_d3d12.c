@@ -2863,6 +2863,19 @@ static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (defa
                   d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
     return on;
 }
+/* madeira-bcd readback-swap = 0 (opt-in): READBACK buffers stay on Metal-owned
+ * storage while upload-swap keeps UPLOAD buffers on the file tier. The GPU
+ * writes READBACK memory and the CPU reads it; with the file tier between them
+ * the CPU's view may not have the GPU's writes (vis-trace's readback check
+ * counts that). Horizon Zero Dawn has two 32 MB READBACK buffers. */
+static int mad_readback_swap_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = mad_cfg_int_pe("readback-swap", 1) ? 1 : 0;   /* fix attempt: 0 = READBACK buffers on Metal-owned storage, not the file tier (UPLOAD buffers stay there) */
+        if (!on) d3d12_log("[madeira-d3d12] madeira-bcd readback-swap = 0: READBACK buffers on Metal-owned storage, UPLOAD buffers as upload-swap says\n");
+    }
+    return on;
+}
 
 static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {
     return a->level == b->level && a->slice == b->slice && a->layers == b->layers && a->plane == b->plane;
@@ -7422,10 +7435,29 @@ static volatile LONG g_vt_draws, g_vt_depth, g_vt_mrt, g_vt_disp, g_vt_pyr, g_vt
 static volatile LONG g_vt_qw, g_vt_qw_fast, g_vt_qw_early;   /* Queue::Wait calls; on the fast path; of those, before the signalling batch was committed */
 static volatile LONG g_vt_disp_q[4], g_vt_copy_q[4];   /* dispatches and copies by queue type (direct, bundle, compute, copy) */
 static volatile LONG64 g_vt_idx, g_vt_presents;
-struct mad_vt_rb { struct mad_queue *q; UINT64 batch; const unsigned char *cpu; UINT32 row, w, h, level; LONG64 frame; };
+struct mad_vt_rb { struct mad_queue *q; UINT64 batch; const unsigned char *cpu; UINT32 row, w, h, level; LONG64 frame; int mslot; };
 #define MAD_VT_RB 16u
 static struct mad_vt_rb g_vt_rb[MAD_VT_RB]; static unsigned g_vt_rb_n;
 static SRWLOCK g_vt_lock = SRWLOCK_INIT;
+/* The GPU also copies every recorded mip into a buffer of ours (Metal's own
+ * memory; the game's readback heap may sit on the file-backed swap tier), so
+ * the print can compare what the game's memory holds with what the GPU wrote.
+ * 64 slots of up to 256 values; a slot is reused after 64 recorded mips (about
+ * 21 presents of HZD's three), long after its batch was printed. */
+#define MAD_VT_MSLOTS 64u
+#define MAD_VT_MSLOT_BYTES 1024u
+static obj_handle_t g_vt_mbuf; static unsigned char *g_vt_mcpu; static unsigned g_vt_mnext;
+static struct { struct mad_queue *q; UINT64 batch; LONG64 frame; UINT32 level, w, h; } g_vt_mmeta[MAD_VT_MSLOTS];
+static volatile LONG g_vt_chk[4];   /* compared: equal, overwritten by a later readback, an earlier readback (stale), neither */
+/* Has the GPU finished batch `batch` of q? (done: the device's completed serial) */
+static int mad_vt_done(struct mad_queue *q, UINT64 batch, UINT64 done) {
+    UINT64 serial, nb;
+    if (!q) return 0;
+    nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);
+    if (nb < batch) return 0;   /* still open */
+    serial = nb - batch < 64 ? q->batch_serial[batch & 63] : q->last_serial;
+    return !serial || serial <= done;
+}
 static void mad_vt_load(void) {
     if (g_vt_on >= 0) return;
     g_rbf_on = mad_cfg_int_pe("readback-far", 0) ? 1 : 0;   /* experiment: the CPU-culling depth readback (R32_FLOAT mip >= 1 of a 4+-mip texture, at most 64x64) is filled with 4096 instead of copied: the game culls nothing */
@@ -7466,12 +7498,39 @@ static int mad_vt_copy(struct mad_exec *e, const struct mad_cmd *c) {
     }
     if (g_vt_on > 0 && c->u.bt.w * c->u.bt.h <= 256) {   /* the 22x10, 11x5 and 5x2 mips */
         struct mad_vt_rb *r;
+        int ms = -1;
         AcquireSRWLockExclusive(&g_vt_lock);
+        if (!g_vt_mbuf) {   /* once: 64 KB of Metal's own memory */
+            struct WMTBufferInfo bi;
+            obj_handle_t nb;
+            memset(&bi, 0, sizeof bi);
+            bi.length = MAD_VT_MSLOTS * MAD_VT_MSLOT_BYTES; bi.options = WMTResourceStorageModeShared; bi.memory.ptr = NULL;
+            nb = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
+            if (nb && bi.memory.ptr) { mad_resident(e->q->device, nb); g_vt_mcpu = (unsigned char *)bi.memory.ptr; g_vt_mbuf = nb; }
+            else if (nb) NSObject_release(nb);
+        }
+        if (g_vt_mbuf && t->texture) {
+            ms = (int)(g_vt_mnext++ % MAD_VT_MSLOTS);
+            g_vt_mmeta[ms].q = e->q; g_vt_mmeta[ms].batch = e->q->batches + 1; g_vt_mmeta[ms].frame = g_vt_presents + 1;
+            g_vt_mmeta[ms].level = c->u.bt.level; g_vt_mmeta[ms].w = c->u.bt.w; g_vt_mmeta[ms].h = c->u.bt.h;
+        }
         if (g_vt_rb_n == MAD_VT_RB) { memmove(&g_vt_rb[0], &g_vt_rb[1], (MAD_VT_RB - 1) * sizeof g_vt_rb[0]); g_vt_rb_n--; }
         r = &g_vt_rb[g_vt_rb_n++];
         r->q = e->q; r->batch = e->q->batches + 1; r->cpu = cpu;   /* the open batch; submit_lock is held */
-        r->row = c->u.bt.row; r->w = c->u.bt.w; r->h = c->u.bt.h; r->level = c->u.bt.level; r->frame = g_vt_presents + 1;
+        r->row = c->u.bt.row; r->w = c->u.bt.w; r->h = c->u.bt.h; r->level = c->u.bt.level; r->frame = g_vt_presents + 1; r->mslot = ms;
         ReleaseSRWLockExclusive(&g_vt_lock);
+        if (ms >= 0) {   /* the GPU's own copy, in the same blit pass as the game's */
+            struct wmtcmd_blit_copy_from_texture_to_buffer k;
+            memset(&k, 0, sizeof k);
+            k.type = WMTBlitCommandCopyFromTextureToBuffer;
+            k.src = t->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
+            k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
+            k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = 1;
+            k.dst = g_vt_mbuf; k.offset = (UINT64)ms * MAD_VT_MSLOT_BYTES;
+            k.bytes_per_row = c->u.bt.w * 4u; k.bytes_per_image = c->u.bt.w * 4u * c->u.bt.h;
+            k.options = mad_aspect_opt(t, c->u.bt.plane);
+            MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        }
     }
     return 0;
 }
@@ -12055,7 +12114,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * 0.4-0.9 GB of UPLOAD buffers live (ph-valley08-13), and its load-time
          * peak is what kills the Lumen runs. Metal-allocated shared storage is
          * charged in full. madeira.cfg upload-swap = 0 turns it off. */
-        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on()) {
+        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&
+            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {   /* madeira-bcd readback-swap */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
             void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (mem) {
@@ -18309,13 +18369,7 @@ static void mad_vt_present(struct mad_device *d, UINT64 presents) {
     for (i = w = 0; i < g_vt_rb_n; i++) {
         struct mad_vt_rb *b = &g_vt_rb[i];
         struct mad_queue *q = b->q;
-        UINT64 serial = 0, nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);
-        int ready;
-        if (nb < b->batch) ready = 0;   /* its batch is still open */
-        else {
-            serial = nb - b->batch < 64 ? q->batch_serial[b->batch & 63] : q->last_serial;
-            ready = !serial || serial <= done;
-        }
+        int ready = mad_vt_done(q, b->batch, done);
         if (!ready && (LONG64)presents - b->frame < 8) { if (w != i) g_vt_rb[w] = *b; w++; continue; }
         n = snprintf(line, sizeof line, "[vis-trace] pyramid mip %u (%ux%u) of present #%lld, queue type %u%s:", b->level, b->w, b->h,
                      (long long)b->frame, (unsigned)q->type, ready ? "" : " (GPU NOT DONE after 8 presents)");
@@ -18324,10 +18378,46 @@ static void mad_vt_present(struct mad_device *d, UINT64 presents) {
             n += snprintf(line + n, sizeof line - (size_t)n, "%s", y ? " |" : "");
             for (x = 0; x < b->w && n < (int)sizeof line - 16; x++) n += snprintf(line + n, sizeof line - (size_t)n, " %.4g", row[x]);
         }
+        if (ready && b->mslot >= 0 && g_vt_mcpu) {   /* the game's memory against the GPU's own copy */
+            const unsigned char *m = g_vt_mcpu + (size_t)b->mslot * MAD_VT_MSLOT_BYTES;
+            unsigned diff = 0, k; int same = -1;
+            for (y = 0; y < b->h; y++)
+                for (x = 0; x < b->w; x++)
+                    diff += ((const UINT32 *)(b->cpu + (size_t)y * b->row))[x] != ((const UINT32 *)(m + (size_t)y * b->w * 4))[x];
+            if (!diff) InterlockedIncrement(&g_vt_chk[0]);
+            else {
+                for (k = 0; k < MAD_VT_MSLOTS && same < 0; k++) {   /* does it hold another present's readback of this mip? */
+                    const unsigned char *o = g_vt_mcpu + (size_t)k * MAD_VT_MSLOT_BYTES;
+                    int eq = 1;
+                    if ((int)k == b->mslot || g_vt_mmeta[k].level != b->level || g_vt_mmeta[k].w != b->w || g_vt_mmeta[k].h != b->h ||
+                        !mad_vt_done(g_vt_mmeta[k].q, g_vt_mmeta[k].batch, done)) continue;
+                    for (y = 0; y < b->h && eq; y++) eq = !memcmp(b->cpu + (size_t)y * b->row, o + (size_t)y * b->w * 4, (size_t)b->w * 4);
+                    if (eq) same = (int)k;
+                }
+                InterlockedIncrement(&g_vt_chk[same < 0 ? 3 : g_vt_mmeta[same].frame > b->frame ? 1 : 2]);
+                if (same < 0)
+                    n += snprintf(line + n, sizeof line - (size_t)n, " -- the game's memory differs from the GPU's own copy in %u of %u values "
+                                  "(not any recent readback)", diff, b->w * b->h);
+                else
+                    n += snprintf(line + n, sizeof line - (size_t)n, " -- the game's memory differs from the GPU's own copy in %u of %u values "
+                                  "(it holds the readback of present #%lld: %s)", diff, b->w * b->h, (long long)g_vt_mmeta[same].frame,
+                                  g_vt_mmeta[same].frame > b->frame ? "a later one, the slot was reused" : "STALE, the GPU's write did not reach it");
+                d3d12_log("%s\n", line);
+                n = snprintf(line, sizeof line, "[vis-trace]   the GPU's own copy:");
+                for (y = 0; y < b->h && n < (int)sizeof line - 40; y++) {
+                    const float *row = (const float *)(m + (size_t)y * b->w * 4);
+                    n += snprintf(line + n, sizeof line - (size_t)n, "%s", y ? " |" : "");
+                    for (x = 0; x < b->w && n < (int)sizeof line - 16; x++) n += snprintf(line + n, sizeof line - (size_t)n, " %.4g", row[x]);
+                }
+            }
+        }
         d3d12_log("%s\n", line);
     }
     g_vt_rb_n = w;
     ReleaseSRWLockExclusive(&g_vt_lock);
+    if (presents % 300 == 0 && g_vt_mcpu)
+        d3d12_log("[vis-trace] readback check so far: %ld mips equal to the GPU's own copy, %ld overwritten by a later readback, "
+                  "%ld STALE (an earlier readback), %ld different\n", (long)g_vt_chk[0], (long)g_vt_chk[1], (long)g_vt_chk[2], (long)g_vt_chk[3]);
 }
 static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;

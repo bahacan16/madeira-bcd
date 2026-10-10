@@ -11,7 +11,8 @@ that readback with 4096 instead (the game then culls nothing).
 
 Checks: all three off by default and every hook guarded; the copy is made,
 refreshed, forgotten with its resource and refused past its limits; the
-readback is recognised, filled, recorded and logged once the GPU is done; the
+readback is recognised, filled, recorded and logged once the GPU is done, and
+compared with the GPU's own copy of the same mip (build 490); the
 settings catalog has the keys; Horizon Zero Dawn's list turns on the shadow and
 the trace (not the experiment). The helpers are compiled and run against stubs.
 """
@@ -112,19 +113,26 @@ check('a batch is counted (release) only after its serial is stored; readers wit
       'q->batches++' not in flush and
       'UINT64 nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);' in rew and
       '(nb - l->ring_batch < 64) ? q->batch_serial[l->ring_batch & 63] : q->last_serial;' in rew and
-      'serial = nb - b->batch < 64 ? q->batch_serial[b->batch & 63] : q->last_serial;' in pe)
+      'serial = nb - batch < 64 ? q->batch_serial[batch & 63] : q->last_serial;' in body('static int mad_vt_done(struct mad_queue *q, UINT64 batch, UINT64 done) {') and
+      'nb = __atomic_load_n(&q->batches, __ATOMIC_ACQUIRE);' in body('static int mad_vt_done(struct mad_queue *q, UINT64 batch, UINT64 done) {'))
 check('a line per present, after the present is counted',
       's->presents++;\n    mad_perf_present();   /* ml1108 */\n    if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);' in pe)
 for key in ('typed-view-shadow', 'vis-trace', 'readback-far'):
     check('settings catalog: ' + key, 'ConfigOption(key: "%s"' % key in catalog)
 hzd = block(recs, 'static let horizonZeroDawn = GameRecommendation(', 'avx: false')
-check('Horizon Zero Dawn (v12): shadow, fence-strict, vis-trace and desc-guard on, readback-far not',
-      'version: 12' in hzd and 'typed-view-shadow = 1' in hzd and 'fence-strict = 1' in hzd and 'vis-trace = 1' in hzd and
-      'desc-guard = 1' in hzd and 'readback-far' not in hzd)
+check('Horizon Zero Dawn (v13): shadow, fence-strict, vis-trace, desc-guard and readback-swap = 0 on, readback-far not',
+      'version: 13' in hzd and 'typed-view-shadow = 1' in hzd and 'fence-strict = 1' in hzd and 'vis-trace = 1' in hzd and
+      'desc-guard = 1' in hzd and 'readback-swap = 0' in hzd and 'readback-far' not in hzd)
+rbs = body('static int mad_readback_swap_on(void) {')
+check('readback-swap: on by default (as before); off keeps only READBACK buffers off the file tier',
+      'mad_cfg_int_pe("readback-swap", 1)' in rbs and
+      'if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on() &&\n'
+      '            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {' in pe and
+      'ConfigOption(key: "readback-swap"' in catalog)
 configs = [c.split('"""')[0] for c in recs.split('config: """')[1:]]
 others = [c for c in configs if 'typed-view-shadow = 1' not in c]
 check('no other game list has them', len(configs) == 6 and len(others) == 5 and
-      not any(k in c for c in others for k in ('typed-view-shadow', 'vis-trace', 'readback-far', 'fence-strict', 'desc-guard')))
+      not any(k in c for c in others for k in ('typed-view-shadow', 'vis-trace', 'readback-far', 'fence-strict', 'desc-guard', 'readback-swap')))
 
 harness = r'''
 #include <stdio.h>
@@ -157,7 +165,7 @@ enum { WMTResourceStorageModeShared = 0 };
 struct WMTTextureInfo { uint32_t width; UINT64 gpu_resource_id; };
 struct WMTBufferInfo { UINT64 length; int options; struct { void *ptr; } memory; UINT64 gpu_address; };
 struct mad_device { void *mtl_device; };
-struct mad_resource { void *cpu; UINT64 size; enum WMTPixelFormat tex_pf; UINT tex_mips; };
+struct mad_resource { void *cpu; UINT64 size; enum WMTPixelFormat tex_pf; UINT tex_mips; obj_handle_t texture; };
 static int chunks, residents, refuse_tex; static UINT64 next_id = 1, last_off;
 static obj_handle_t MTLDevice_newBuffer(void *dev, struct WMTBufferInfo *bi) {
     (void)dev; bi->memory.ptr = calloc(1, (size_t)bi->length); bi->gpu_address = 0x100000000ull * (UINT64)++chunks; return (obj_handle_t)chunks;
@@ -188,10 +196,20 @@ static volatile LONG g_tv_eoff_views, g_sd_strict_waits;
     body('static void mad_tvs_refresh(void) {') + '\n' + body('static void mad_tvs_forget(struct mad_resource *r) {') + r'''
 /* vis-trace */
 enum { MC_DRAW = 1, MC_DRAW_INDEXED = 2 };
-struct mad_queue { UINT64 batches, last_serial, batch_serial[64]; UINT type; };
-struct mad_cmd { int kind; union { struct { struct mad_resource *tex, *buf; UINT level, slice, plane, w, h, d, row, rows; UINT64 off; } bt;
+struct mad_queue { UINT64 batches, last_serial, batch_serial[64]; UINT type; struct mad_device *device; };
+struct mad_cmd { int kind; union { struct { struct mad_resource *tex, *buf; UINT level, slice, plane, w, h, d, row, rows; UINT64 off; UINT x, y, z; } bt;
                                     struct { UINT icount, inst; } drawi; struct { UINT vcount, icount; } draw; } u; };
-struct mad_exec { struct mad_queue *q; obj_handle_t renc; UINT enc_nrt; struct mad_resource *enc_depth; };
+struct mad_exec { struct mad_queue *q; obj_handle_t renc; UINT enc_nrt; struct mad_resource *enc_depth; obj_handle_t benc; };
+enum { WMTBlitCommandCopyFromTextureToBuffer = 7 };
+struct wmtcmd_base { int type; };
+struct WMTOrigin { UINT64 x, y, z; }; struct WMTSize { UINT64 width, height, depth; };
+struct wmtcmd_blit_copy_from_texture_to_buffer { int type; obj_handle_t src; UINT32 slice, level; struct WMTOrigin origin; struct WMTSize size;
+                                                 obj_handle_t dst; UINT64 offset; UINT32 bytes_per_row, bytes_per_image, options; };
+static struct wmtcmd_blit_copy_from_texture_to_buffer last_blit; static int nblits;
+static void MTLBlitCommandEncoder_encodeCommands(obj_handle_t enc, const struct wmtcmd_base *k) {
+    (void)enc; last_blit = *(const struct wmtcmd_blit_copy_from_texture_to_buffer *)k; nblits++;
+}
+static UINT mad_aspect_opt(const struct mad_resource *r, UINT plane) { (void)r; (void)plane; return 0; }
 static UINT64 gpu_done;
 static UINT64 mad_gpu_completed(struct mad_device *d) { (void)d; return gpu_done; }
 ''' + block(pe, 'static int g_vt_on = -1, g_rbf_on = -1;', 'static void mad_vt_load(void) {') + \
@@ -261,9 +279,10 @@ int main(void) {
         static unsigned char rb[8192]; static float tex_dummy;
         struct mad_resource pyr = { &tex_dummy, 0, WMTPixelFormatR32Float, 6 }, dst = { rb, sizeof rb, 0, 1 };
         struct mad_queue q = { 0 };
-        struct mad_exec e = { &q, 0, 0, NULL };
+        struct mad_exec e = { &q, 0, 0, NULL, 0 };
         struct mad_cmd c; float *f; int k;
         (void)tex_dummy;
+        q.device = &d; pyr.texture = 77;
         cfg_rbf = 1; cfg_vt = 1; mad_vt_load();
         memset(&c, 0, sizeof c);
         c.u.bt.tex = &pyr; c.u.bt.buf = &dst; c.u.bt.level = 5; c.u.bt.w = 5; c.u.bt.h = 2; c.u.bt.d = 1; c.u.bt.row = 256; c.u.bt.off = 512;
@@ -329,6 +348,53 @@ int main(void) {
                                   "shadowed +0; Queue::Wait 0 (fast path 0, before the awaited batch was committed 0; fence-strict waits +0); "
                                   "dispatches by queue: direct 0, compute 0; copies by queue: direct 0, compute 0, copy 0") != NULL,
                    "and the next present starts from zero");
+        }
+        {   /* the GPU's own copy of each recorded mip: equal, stale, neither, overwritten later */
+            unsigned sl;
+            c.u.bt.w = 5; c.u.bt.h = 2; c.u.bt.level = 5; c.u.bt.off = 2048; c.u.bt.row = 256;
+            g_vt_rb_n = 0; g_vt_mnext = 0; memset(g_vt_mmeta, 0, sizeof g_vt_mmeta); memset((void *)g_vt_chk, 0, sizeof g_vt_chk);
+            q.batches = 30; gpu_done = 1000; for (sl = 0; sl < 64; sl++) q.batch_serial[sl] = 0;
+            g_vt_presents = 29;
+            for (k = 0; k < 10; k++) ((float *)(rb + 2048 + (k / 5) * 256))[k % 5] = (float)(k + 1);
+            nblits = 0;
+            EXPECT(mad_vt_copy(&e, &c) == 0 && nblits == 1 && last_blit.dst == g_vt_mbuf && g_vt_mbuf && last_blit.src == 77 && last_blit.offset == 0 &&
+                   last_blit.level == 5 && last_blit.size.width == 5 && last_blit.size.height == 2 && last_blit.bytes_per_row == 20 &&
+                   g_vt_rb_n == 1 && g_vt_rb[0].mslot == 0,
+                   "vis-trace: the GPU also copies the mip, tightly packed, into a slot of a buffer of ours");
+            for (k = 0; k < 10; k++) ((float *)g_vt_mcpu)[k] = (float)(k + 1);   /* what that copy wrote */
+            q.batches = 31; q.batch_serial[31] = 500;
+            loglen = 0; logbuf[0] = 0; mad_vt_present(&d, 30);
+            EXPECT(strstr(logbuf, "pyramid mip 5 (5x2) of present #30, queue type 3: 1 2 3 4 5 | 6 7 8 9 10\n") != NULL && g_vt_chk[0] == 1,
+                   "the game's memory holds what the GPU wrote: nothing added, counted as equal");
+            g_vt_presents = 30; mad_vt_copy(&e, &c);   /* present 31: the GPU writes 11..20, the game's memory keeps 1..10 */
+            for (k = 0; k < 10; k++) ((float *)(g_vt_mcpu + 1024))[k] = (float)(k + 11);
+            q.batches = 32; q.batch_serial[32] = 501;
+            loglen = 0; logbuf[0] = 0; mad_vt_present(&d, 31);
+            EXPECT(strstr(logbuf, "of present #31, queue type 3: 1 2 3 4 5 | 6 7 8 9 10 -- the game's memory differs from the GPU's own copy in 10 of "
+                                  "10 values (it holds the readback of present #30: STALE, the GPU's write did not reach it)\n") != NULL &&
+                   strstr(logbuf, "[vis-trace]   the GPU's own copy: 11 12 13 14 15 | 16 17 18 19 20\n") != NULL && g_vt_chk[2] == 1,
+                   "an earlier present's readback in the game's memory: STALE, with the GPU's own copy printed");
+            g_vt_presents = 31; mad_vt_copy(&e, &c);   /* present 32: neither */
+            for (k = 0; k < 10; k++) ((float *)(g_vt_mcpu + 2048))[k] = (float)(k + 21);
+            ((float *)(rb + 2048))[0] = 99.0f;
+            q.batches = 33; q.batch_serial[33] = 502;
+            loglen = 0; logbuf[0] = 0; mad_vt_present(&d, 32);
+            EXPECT(strstr(logbuf, "differs from the GPU's own copy in 10 of 10 values (not any recent readback)") != NULL && g_vt_chk[3] == 1,
+                   "values that are no recent readback: counted as different");
+            g_vt_presents = 32; mad_vt_copy(&e, &c);   /* presents 33 and 34, printed together: 34's readback already overwrote the slot */
+            for (k = 0; k < 10; k++) ((float *)(g_vt_mcpu + 3072))[k] = (float)(k + 31);
+            g_vt_presents = 33; mad_vt_copy(&e, &c);
+            for (k = 0; k < 10; k++) { ((float *)(g_vt_mcpu + 4096))[k] = (float)(k + 41); ((float *)(rb + 2048 + (k / 5) * 256))[k % 5] = (float)(k + 41); }
+            q.batches = 35; q.batch_serial[34] = 503; q.batch_serial[35] = 504;
+            loglen = 0; logbuf[0] = 0; mad_vt_present(&d, 34);
+            EXPECT(strstr(logbuf, "of present #33, queue type 3: 41 42 43 44 45 | 46 47 48 49 50 -- the game's memory differs from the GPU's own copy in "
+                                  "10 of 10 values (it holds the readback of present #34: a later one, the slot was reused)") != NULL &&
+                   strstr(logbuf, "of present #34, queue type 3: 41 42 43 44 45 | 46 47 48 49 50\n") != NULL && g_vt_chk[1] == 1 && g_vt_chk[0] == 2,
+                   "a later readback into the same memory: reported as reused, not stale");
+            loglen = 0; logbuf[0] = 0; mad_vt_present(&d, 300);
+            EXPECT(strstr(logbuf, "[vis-trace] readback check so far: 2 mips equal to the GPU's own copy, 1 overwritten by a later readback, "
+                                  "1 STALE (an earlier readback), 1 different\n") != NULL, "a summary every 300 presents");
+            g_vt_presents = 0;
         }
     }
     printf("%s\n", bad ? "harness FAILED" : "harness ok");

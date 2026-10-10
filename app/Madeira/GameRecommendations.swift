@@ -346,8 +346,12 @@ enum GameRecommendations {
     /// wrote it (vis-trace). Build 489's list adds desc-guard, which logs the
     /// game rewriting a descriptor that a batch still running on the GPU uses
     /// (another one-frame cause: that draw reads another object's data).
+    /// Build 490's list keeps the game's two 32 MB readback buffers, where the
+    /// GPU writes the depth pyramid the CPU culls with, on Metal's own memory
+    /// instead of the file-backed swap tier (readback-swap = 0); vis-trace now
+    /// also compares every pyramid readback with the GPU's own copy.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 12,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 13,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -366,6 +370,7 @@ enum GameRecommendations {
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1
+        readback-swap = 0
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_INPUT_FOREGROUND = 1
