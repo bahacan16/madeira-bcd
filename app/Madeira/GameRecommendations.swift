@@ -320,8 +320,16 @@ enum GameRecommendations {
     /// and memcpy accesses as x86 does and ignores the volatile metadata of
     /// concrt140.dll and mfc140.dll. If the characters come out whole, the lines
     /// are halved to find the one that matters; skin-check stays on either way.
+    /// None of them helped (484, 2026-10-10 07:32), so build 485's list drops
+    /// them again. Its skinning dispatches gave the same vertex a different
+    /// extreme depending on which of the game's two upload heaps the frame
+    /// used, so the list now starts typed buffer views at the 16-byte boundary
+    /// Apple's converter documents (a bone palette then has no padding
+    /// elements), and skin-check traces whole frames, keeps the vertex shaders
+    /// of meshes skinned there, dumps the compute skinning's data and compares
+    /// what the GPU read with what the CPU had written.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 8,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 9,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -331,18 +339,14 @@ enum GameRecommendations {
         pso-placeholder = 1
         pso-lazy-libs = 1
         clear-rects = 1
+        typed-view-align = 16
         skin-check = 1
+        skin-check-trace = 1
+        skin-dump = 1
         view-census = 1
-        d3d12-wave-ops = 0
-        d3d12-raw-typed-views = 1
-        typed-uav-atomic = 1
-        ignore-volatile-metadata = 1
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1
-        env.FEX_VECTORTSOENABLED = 1
-        env.FEX_MEMCPYSETTSOENABLED = 1
-        env.FEX_STRICTINPROCESSSPLITLOCKS = 1
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_INPUT_FOREGROUND = 1

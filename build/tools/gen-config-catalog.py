@@ -215,7 +215,26 @@ OVERLAY = {
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: typed buffer views that cannot become a Metal texture buffer (the shader then "
                         "sees no data), views cut short at the end of their resource, and views or constant buffer "
-                        "views past their resource are counted and named in the log. Changes nothing else."},
+                        "views past their resource are counted and named in the log, with Metal's minimum alignment "
+                        "for each pixel format typed views use. Changes nothing else."},
+    "skin-check-trace": {"category": "Direct3D 12", "title": "Diagnostic: skin-check traces whole frames",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1, with skin-check on: the first frame of the first two windows logs every draw "
+                        "in one line (shaders, counts, streams, input layout); a pipeline with integer vertex inputs "
+                        "(a mesh skinned in its vertex shader) also gets its vertex-stage bindings, copies of its "
+                        "CPU-written inputs and first vertices, and its vertex shader's bytecode (32 such draws)."},
+    "skin-dump": {"category": "Direct3D 12", "title": "Diagnostic: skin-check dumps the skinning data",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1, with skin-check on: in the first window's first two frames the compute "
+                        "shaders that skin a mesh have their inputs and the stream they wrote copied whole (up to 256 KB "
+                        "each) and logged as base64 (4 MB at most), so the skinning can be recomputed on a PC. Uses a "
+                        "24 MB capture buffer."},
+    "typed-view-align": {"category": "Direct3D 12", "title": "Typed buffer view alignment",
+                "kind": "int", "default": "0",
+                "note": "Default 0 (64 bytes, as before). 16 or 256: a typed buffer view's texture starts at that "
+                        "boundary, never below Metal's minimum for its format (logged once per format); 16 is what "
+                        "Apple's converter documents, so a float4 view has no padding elements. A view Metal refuses "
+                        "there is made at 64. Read once per game start."},
     # madeira-bcd: A/B switches for the Sony ports' corrupted meshes (Horizon Zero Dawn, Ghost of Tsushima).
     "d3d12-wave-ops": {"category": "Direct3D 12", "title": "Report wave operations",
                 "kind": "bool", "default": "1",

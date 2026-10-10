@@ -129,10 +129,14 @@ check('per-frame limits: 64 draws, 96 copies of at most 32 KB',
       'if (nd > 64)' in sd and 'InterlockedIncrement(&g_skin_caps_frame) > 96' in sd and 'if (len > 32768) len = 32768;' in sd)
 check('the writer of a stream is looked up among this frame\'s dispatches only',
       'w->frame == g_skin_frame && w->r == r && w->off <= e->vb[sl].off' in sd)
-cap = body('static int mad_skin_capture(struct mad_exec *e, const char *label, struct mad_resource *r, UINT64 off, UINT len, UINT kind, UINT stride)')
-check('copies stay inside the resource and the 4 MB buffer, and remember their queue',
-      'if (off + len > r->size) len = (UINT)(r->size - off) & ~3u;' in cap and 'g_sk_used + len <= MAD_SK_BYTES' in cap and
-      'c->q = e->q;' in cap and 'g_sk_n < MAD_SK_N' in cap)
+cap = body('static int mad_skin_capture(struct mad_exec *e, const char *label, struct mad_resource *r, UINT64 off, UINT len, UINT kind, UINT stride, UINT dump)')
+check('copies stay inside the resource and the capture buffer (4 MB, 24 with skin-dump), and remember their queue',
+      'if (off + len > r->size) len = (UINT)(r->size - off) & ~3u;' in cap and 'g_sk_used + len <= g_sk_bytes' in cap and
+      'c->q = e->q;' in cap and 'g_sk_n < MAD_SK_N' in cap and 'bi.length = g_sk_bytes;' in cap and
+      'static UINT g_sk_bytes = MAD_SK_BYTES;' in pe and 'if (g_skin_dump) g_sk_bytes = 24u << 20;' in pe)
+check('485: a copy of CPU-written memory keeps the CPU\'s bytes at replay and holds its resource until printed',
+      'r->cpu && (r->heap == D3D12_HEAP_TYPE_UPLOAD || r->heap == D3D12_HEAP_TYPE_CUSTOM) && (c->snap = malloc(len))' in cap and
+      'c->src = r; ID3D12Resource_AddRef((ID3D12Resource *)r);' in cap)
 tbv = body('static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,')
 check('typed views: every refusal names its reason, the cut-short view is still made',
       all(('*why = %d' % k) in tbv for k in (1, 2, 3, 4, 5, 7, 8, 9)) and '*why = width ? 6 : 5;' in tbv)
@@ -150,12 +154,38 @@ check('CBV: checked only with view-census, before the descriptor is written',
       cbv.index('if (g_view_census && mad_vc_on()) mad_vc_cbv(') < cbv.index('mad_set_buffer_descriptor(e, desc->BufferLocation, desc->SizeInBytes);'))
 
 for key, kind, default in (('skin-check', 'int', '0'), ('skin-check-every', 'int', '300'),
-                           ('skin-check-capture', 'bool', '1'), ('view-census', 'bool', '0')):
+                           ('skin-check-capture', 'bool', '1'), ('view-census', 'bool', '0'),
+                           ('skin-check-trace', 'bool', '0'), ('skin-dump', 'bool', '0'), ('typed-view-align', 'int', '0')):
     m = re.search(r'key: "' + re.escape(key) + r'".*?kind: \.(\w+), defaultValue: "([^"]*)"', catalog)
     check('catalog: ' + key + ' (' + kind + ', default ' + default + ')', m is not None and m.group(1) == kind and m.group(2) == default)
 hzd = recs[recs.index('static let horizonZeroDawn = GameRecommendation('):]
 hzd = hzd[:hzd.index('""",')]
 check('Horizon Zero Dawn\'s list turns both on', 'skin-check = 1' in hzd and 'view-census = 1' in hzd)
+# build 485
+check('485: skin-check-trace, skin-dump and typed-view-align off by default',
+      'mad_cfg_int_pe("skin-check-trace", 0)' in pe and 'mad_cfg_int_pe("skin-dump", 0)' in pe and
+      'mad_cfg_int_pe("typed-view-align", 0)' in pe)
+check('typed-view-align: anything but 16 or 256 is 64, and 64 without view-census asks Metal nothing',
+      'g_tv_align = v == 16 || v == 256 ? (int)v : 64;' in pe and 'if (want == 64 && g_view_census <= 0) return 64;' in pe and
+      'if (want == 64) return 64;   /* view-census alone: logged, nothing changes */' in pe and 'if (fl > 256) fl = 256;' in pe)
+check('typed-view-align: the element offset is the one the view was made with', 'elem_off = r->tview[k].eoff;' in tbv and
+      'r->tview[k].eoff = (UINT8)elem_off;' in tbv and '& ~(UINT64)63; elem_off = (r->tview[k].off' not in tbv)
+check('skin-check-trace: every draw of the trace frame, before anything else in the hook',
+      'if (s && mad_skin_trace_frame()) mad_skin_trace(e, c);' in sd and
+      sd.index('mad_skin_trace(e, c);') < sd.index('if (!gpu) { if (s) s->ncs = s->ndl = 0; return; }') and
+      'return g_skin_trace && g_skin_window <= 2 && g_skin_frame == g_skin_win_first;' in pe)
+check('skin-dump: the first window\'s first two frames, once per shader or stream a frame',
+      'return g_skin_dump && g_skin_window == 1 && g_skin_frame - g_skin_win_first < 2;' in pe and
+      'UINT dump = mad_skin_dump_frame() && mad_skin_dump_once(h);' in pe and
+      'dump = mad_skin_dump_frame() && mad_skin_dump_once(((UINT64)r->serial << 40) ^ off);' in sd)
+check('a window records its first frame',
+      'InterlockedIncrement(&g_skin_window); InterlockedExchange(&g_skin_win_first, InterlockedIncrement(&g_skin_frame));' in pe)
+check('pipelines: the input layout tag only with skin-check-trace, freed with the pipeline',
+      'if (g_skin_trace <= 0 || !il || !il->NumElements || !il->pInputElementDescs) return;' in pe and
+      'free(p->il_tag);   /* madeira-bcd skin-check-trace */' in pe and
+      'mad_bc_keep_ex(p->vs_hash, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, p->il_int);' in gp)
+check('Horizon Zero Dawn\'s list: typed-view-align 16, trace and dump on',
+      'typed-view-align = 16' in hzd and 'skin-check-trace = 1' in hzd and 'skin-dump = 1' in hzd)
 
 harness = r'''
 #include <stdio.h>
@@ -181,13 +211,28 @@ static void d3d12_log(const char *fmt, ...) {
 }
 #define MAD_SKIN_CAP_BUDGET 8000
 #define MAD_SKIN_WIN_CAPS 1000
-#define MAD_SK_N 256u
-static volatile LONG g_skin_cap_lines, g_skin_win_caps;
+#define MAD_SK_N 512u
+#define MAD_SK_DUMP_BUDGET (4u << 20)
+typedef int64_t LONG64;
+static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { LONG64 o = *p; *p += v; return o; }
+static LONG InterlockedExchange(volatile LONG *p, LONG v) { LONG o = *p; *p = v; return o; }
+struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id; };
+struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; };
+typedef struct mad_resource ID3D12Resource;
+static int released;
+static void ID3D12Resource_Release(ID3D12Resource *r) { (void)r; released++; }
+static unsigned b64_bytes; static int b64_lines; static UINT64 b64_last;
+static void mad_log_b64(UINT64 hash, const void *bc, UINT len) { (void)bc; b64_bytes += len; b64_lines++; b64_last = hash; }
+static volatile LONG g_skin_cap_lines, g_skin_win_caps, g_skin_cmp_n, g_skin_dumps;
+static volatile LONG64 g_skin_dump_bytes;
 static SRWLOCK g_sk_lock = SRWLOCK_INIT;
 static unsigned char *g_sk_cpu; static UINT g_sk_used;
-static struct mad_skcap { char label[120]; UINT off, len, kind, stride; const void *q; } g_sk_cap[MAD_SK_N];
+static struct mad_skcap { char label[120]; UINT off, len, kind, stride; const void *q;
+                          UINT dump; unsigned char *snap; struct mad_resource *src; UINT64 src_off; } g_sk_cap[MAD_SK_N];
 static volatile unsigned g_sk_n;
 ''' + body('static void mad_sk_cat(char *o, size_t cap, int *n, const char *fmt, ...)') + '\n' + \
+    body('static void mad_skin_cmp(const struct mad_skcap *c, const unsigned char *gpu)') + '\n' + \
+    body('static void mad_skin_dumpcap(const struct mad_skcap *c, const unsigned char *gpu)') + '\n' + \
     body('static void mad_skin_print(const struct mad_skcap *c)') + '\n' + body('static void mad_skin_flush(const void *q)') + r'''
 /* typed views */
 enum WMTPixelFormat { WMTPixelFormatInvalid = 0, WMTPixelFormatR32Uint = 53, WMTPixelFormatR32Sint = 54, WMTPixelFormatRGBA32Float = 125,
@@ -197,11 +242,11 @@ enum { WMTTextureTypeTextureBuffer = 9, WMTResourceStorageModeShared = 0, WMTRes
 struct WMTTextureInfo { int pixel_format; uint32_t width, height, depth, array_length; int type; uint32_t mipmap_level_count, sample_count;
                         enum WMTTextureUsage usage; int options; UINT64 gpu_resource_id; };
 struct mad_descriptor { UINT64 gpu_va, texture_view_id, metadata; };
-struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav; obj_handle_t tex; UINT64 id; };
-struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; };
 struct mad_device { CRITICAL_SECTION view_lock; };
 static LONG g_tview_live, g_tview_made, g_typed_atomic_views;
-static int metal_refuses, grow_fails;
+static int metal_refuses, grow_fails, refuse_unaligned64;
+static UINT tv_align = 64; static volatile LONG g_tv_fallback;
+static UINT mad_tv_align(struct mad_device *d, enum WMTPixelFormat pf) { (void)d; (void)pf; return tv_align; }
 static UINT64 next_id = 100;
 static int mad_map_texture_format(DXGI_FORMAT f, int flags, enum WMTPixelFormat *out, int *is_depth) {
     (void)flags; *is_depth = 0;
@@ -215,8 +260,8 @@ static void mad_format_info(DXGI_FORMAT f, UINT *bytes, UINT *block) {
 }
 static int mad_typed_uav_atomic(void) { return 0; }
 static obj_handle_t MTLBuffer_newTexture(obj_handle_t b, struct WMTTextureInfo *ti, UINT64 off, UINT64 bpr) {
-    (void)b; (void)off; (void)bpr;
-    if (metal_refuses) return NULL;
+    (void)b; (void)bpr;
+    if (metal_refuses || (refuse_unaligned64 && (off & 63))) return NULL;
     ti->gpu_resource_id = next_id++;
     return (obj_handle_t)(uintptr_t)ti->gpu_resource_id;
 }
@@ -293,6 +338,67 @@ int main(void) {
         why = 0; EXPECT(mad_typed_buffer_view(&d, &buf32, 41, 16, 8, 0, &e, &why) == 0 && why == 8, "the view list cannot grow: reason 8");
         grow_fails = 0;
         EXPECT(mad_typed_buffer_view(&d, &buf32, 41, 24, 8, 0, &e, NULL) == 1, "no reason pointer: still works");
+        tv_align = 64;
+        why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 2, 2, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 2 &&
+                         e.gpu_va == buf32.gpu_address + 32 && last_vmap_b == 2,
+                         "64 (the default): element 2 of a float4 view sits 2 elements past the texture's start");
+        tv_align = 16;
+        why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 2, 1, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 0 &&
+                         e.gpu_va == buf32.gpu_address + 16 && last_vmap_b == 0,
+                         "typed-view-align 16: a float4 view at element 1 starts there, no padding elements");
+        why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 42, 5, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 1,
+                         "typed-view-align 16: an R32 view at element 5 starts at byte 16, one element in");
+        refuse_unaligned64 = 1;
+        why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 2, 3, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 3 &&
+                         g_tv_fallback == 1 && why == -1,
+                         "Metal refuses the 16-byte start: the view is made at 64 as before, and counted");
+        refuse_unaligned64 = 0; tv_align = 64;
+        why = -1; EXPECT(mad_typed_buffer_view(&d, &buf32, 2, 1, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 0,
+                         "a cached view keeps the element offset it was made with");
+    }
+    {   /* 485: copies of CPU-written memory against the CPU's bytes; skin-dump */
+        unsigned char nowb[64];
+        struct mad_resource src = { (obj_handle_t)9, nowb, 64, 0, NULL, 0, 0 };
+        g_sk_cpu = buf;
+        memset(buf + 1024, 1, 64); memset(nowb, 1, 64);
+        g_sk_cap[0] = (struct mad_skcap){ "E pal", 1024, 64, 21, 0, &qa, 0, malloc(64), &src, 0 };
+        memset(g_sk_cap[0].snap, 1, 64);
+        g_sk_n = 1; g_sk_used = 1088; loglen = 0; logbuf[0] = 0; released = 0;
+        mad_skin_flush(&qa);
+        EXPECT(strstr(logbuf, "[skin-cmp] E pal: 64 bytes; the GPU read what the CPU had written at submission, unchanged since") != NULL &&
+               released == 1 && g_sk_n == 0, "the GPU read the CPU's bytes: one line, the resource released after printing");
+        g_sk_cap[0] = (struct mad_skcap){ "F pal", 1024, 64, 21, 0, &qa, 0, malloc(64), &src, 0 };
+        memset(g_sk_cap[0].snap, 1, 64); buf[1024 + 8] = 7; nowb[8] = 7;
+        g_sk_n = 1; g_sk_used = 1088; loglen = 0; logbuf[0] = 0;
+        mad_skin_flush(&qa);
+        EXPECT(strstr(logbuf, "the GPU read the CPU's LATER bytes (rewritten after submission) (1 of 16 words differ, the first at +8); "
+                              "the CPU rewrote them since (1 words, the first at +8)") != NULL,
+               "bytes rewritten while the work was in flight: the GPU read the later ones");
+        g_sk_cap[0] = (struct mad_skcap){ "G pal", 1024, 64, 21, 0, &qa, 0, malloc(64), &src, 0 };
+        memset(g_sk_cap[0].snap, 1, 64); memset(nowb, 1, 64); memset(buf + 1024, 1, 64); buf[1024 + 12] = 9;
+        g_sk_n = 1; g_sk_used = 1088; loglen = 0; logbuf[0] = 0;
+        mad_skin_flush(&qa);
+        EXPECT(strstr(logbuf, "the GPU read BYTES THE CPU DID NOT HAVE THERE at submission or now (1 of 16 words differ, the first at +12); "
+                              "the CPU left them since (0 words") != NULL,
+               "the GPU's view differs from what the CPU wrote and still has");
+        g_sk_cap[0] = (struct mad_skcap){ "H dump", 1024, 64, 21, 0, &qa, 1, NULL, NULL, 0 };
+        g_sk_n = 1; g_sk_used = 1088; loglen = 0; logbuf[0] = 0; b64_lines = 0;
+        mad_skin_flush(&qa);
+        EXPECT(strstr(logbuf, "[skin-dump] 5d00000000000001: H dump, 64 bytes as the GPU read them (kind 21, stride 0); base64 follows") != NULL &&
+               strstr(logbuf, "[skin-dump] 5d00000000000001: end") != NULL && b64_lines == 1 && b64_last == 0x5d00000000000001ull &&
+               strstr(logbuf, "[skin-cmp] H dump") == NULL, "skin-dump: header, the bytes, end; no comparison without the CPU's copy");
+        g_sk_cap[0] = (struct mad_skcap){ "I dump", 1024, 64, 21, 0, &qa, 1, malloc(64), &src, 0 };
+        memset(g_sk_cap[0].snap, 2, 64);
+        g_sk_n = 1; g_sk_used = 1088; loglen = 0; logbuf[0] = 0; b64_lines = 0;
+        mad_skin_flush(&qa);
+        EXPECT(b64_lines == 2 && b64_last == 0x5d80000000000002ull && strstr(logbuf, "as the CPU had written them at submission") != NULL,
+               "skin-dump: the CPU's bytes too when the GPU read others");
+        g_skin_dump_bytes = MAD_SK_DUMP_BUDGET;
+        g_sk_cap[0] = (struct mad_skcap){ "J dump", 1024, 64, 21, 0, &qa, 1, NULL, NULL, 0 };
+        g_sk_n = 1; g_sk_used = 1088; loglen = 0; logbuf[0] = 0; b64_lines = 0;
+        mad_skin_flush(&qa);
+        EXPECT(b64_lines == 0 && strstr(logbuf, "dump budget is spent; J dump") != NULL && strstr(logbuf, "[skin-cap] J dump") != NULL,
+               "skin-dump: past the 4 MB budget only the summary");
     }
     printf("%s\n", bad ? "harness FAILED" : "harness ok");
     return bad;
@@ -330,6 +436,7 @@ struct mad_resource { unsigned serial; UINT64 gpu_address, size; };
 struct mad_device { int x; };
 struct mad_queue { struct mad_device *device; };
 struct mad_pso { UINT64 cs_hash; };
+#define MAD_SK_IN 12u
 """ + src_block('struct mad_skinx {') + r"""
 struct mad_exec { struct mad_queue *q; struct mad_heap *srv; struct mad_pso *cpso; struct mad_skinx *sk; };
 static volatile LONG g_skin_frame = 7;
@@ -344,6 +451,7 @@ static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 va,
 }
 """ + body('static void mad_sk_cat(char *o, size_t cap, int *n, const char *fmt, ...)') + '\n' + \
     body('static void mad_skin_where(struct mad_device *d, UINT64 va, char *o, size_t cap, int *n, struct mad_resource **out, UINT64 *out_off)') + '\n' + \
+    body('static void mad_skin_in(struct mad_skinx *s, struct mad_resource *r, UINT64 off, UINT64 size)') + '\n' + \
     body('static void mad_skin_note_write(struct mad_exec *e, const struct mad_resource *r, UINT64 off)') + '\n' + \
     body('static void mad_skin_desc(struct mad_exec *e, const struct mad_descriptor *de, UINT range_type, char *t, size_t cap, int *n)') + '\n' + \
     body('static void mad_skin_rs_tok(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root, const UINT32 (*consts)[64], unsigned vis_mask)') + r"""
@@ -383,6 +491,8 @@ int main(void) {
     EXPECT(strstr(s->tok, "p3:") != NULL, "compute sees pixel-only parameters too (all visibilities)");
     EXPECT(s->nin == 4 && s->in[0].off == 256 && s->in[1].off == 512 && s->in[2].off == 8192 && s->in[3].off == 0,
            "inputs: the SRVs and the CBVs (table and root)");
+    EXPECT(s->in[0].len == 1048576 && s->in[1].len == 4096 && s->in[2].len == 256 && s->in[3].len == 256,
+           "inputs: each view's size from its descriptor (a root descriptor's is unknown: 256)");
     EXPECT(g_skin_wn == 1 && g_skin_w[0].r == &res[0] && g_skin_w[0].off == 4096 && g_skin_w[0].cs == 0xabcdef && g_skin_w[0].frame == 7,
            "writes: the root UAV (the unresolved table UAV cannot be)");
     s->ntok = 0; s->tok[0] = 0; s->nin = 0; s->tab_cs = 0;

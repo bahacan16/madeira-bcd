@@ -250,7 +250,7 @@ draw = function(dsrc, 'static void mad_skin_draw(struct mad_exec *e, const struc
 check('skin-check captures an indexed draw\'s indices within the per-frame capture budget',
       'if (g_skin_cap_on && c->kind == MC_DRAW_INDEXED && e->ib && e->ib->buffer && c->u.drawi.icount &&' in draw
       and 'InterlockedIncrement(&g_skin_caps_frame) <= 96) {' in draw
-      and 'mad_skin_capture(e, lab, e->ib, off, (UINT)len, lead ? 23 : 22, isz | (tail ? 16u : 0u));' in draw)
+      and 'mad_skin_capture(e, lab, e->ib, off, (UINT)len, lead ? 23 : 22, isz | (tail ? 16u : 0u), 0);' in draw)
 pr = function(dsrc, 'static void mad_skin_print(const struct mad_skcap *c) {')
 blk = pr[pr.index('} else if (c->kind == 22 || c->kind == 23) {'):pr.index('} else {   /* 21: the start of a shader input */')]
 body = blk[blk.index('{') + 1:]
