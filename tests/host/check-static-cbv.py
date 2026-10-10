@@ -74,9 +74,9 @@ check('the copies are made right before the argument slot (modes 1 and 2), after
 check('a report every 300 presents', 'if (g_scbv_on > 0 && s->presents % 300 == 0) mad_scbv_report(s->presents);' in pe)
 check('settings catalog', 'ConfigOption(key: "static-cbv"' in catalog)
 hzd = block(recs, 'static let horizonZeroDawn = GameRecommendation(', 'avx: false')
-check("Horizon Zero Dawn's list has static-cbv = 1", 'static-cbv = 1' in hzd)
+check("no game list has it (HZD's v15 dropped it: on 491 it found nothing to latch differently)", 'static-cbv' not in hzd)
 configs = [c.split('"""')[0] for c in recs.split('config: """')[1:]]
-check('no other game list has it', sum('static-cbv' in c for c in configs) == 1)
+check('no other game list has it', sum('static-cbv' in c for c in configs) == 0)
 
 harness = r'''
 #include <stdio.h>

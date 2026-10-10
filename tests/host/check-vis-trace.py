@@ -120,9 +120,9 @@ check('a line per present, after the present is counted',
 for key in ('typed-view-shadow', 'vis-trace', 'readback-far'):
     check('settings catalog: ' + key, 'ConfigOption(key: "%s"' % key in catalog)
 hzd = block(recs, 'static let horizonZeroDawn = GameRecommendation(', 'avx: false')
-check('Horizon Zero Dawn (v14): shadow, fence-strict, vis-trace, desc-guard and readback-swap = 0 on, readback-far not',
-      'version: 14' in hzd and 'typed-view-shadow = 1' in hzd and 'fence-strict = 1' in hzd and 'vis-trace = 1' in hzd and
-      'desc-guard = 1' in hzd and 'readback-swap = 0' in hzd and 'readback-far' not in hzd)
+check('Horizon Zero Dawn (v15, proven): typed-view-shadow on; the trace, fence-strict, desc-guard, readback-swap and readback-far not',
+      'version: 15' in hzd and 'typed-view-shadow = 1' in hzd and not any(k in hzd for k in ('fence-strict', 'vis-trace', 'desc-guard',
+                                                                                           'readback-swap', 'readback-far')))
 rbs = body('static int mad_readback_swap_on(void) {')
 check('readback-swap: on by default (as before); off keeps only READBACK buffers off the file tier',
       'mad_cfg_int_pe("readback-swap", 1)' in rbs and
@@ -130,9 +130,9 @@ check('readback-swap: on by default (as before); off keeps only READBACK buffers
       '            (heap_type != D3D12_HEAP_TYPE_READBACK || mad_readback_swap_on())) {' in pe and
       'ConfigOption(key: "readback-swap"' in catalog)
 configs = [c.split('"""')[0] for c in recs.split('config: """')[1:]]
-others = [c for c in configs if 'typed-view-shadow = 1' not in c]
-check('no other game list has them', len(configs) == 6 and len(others) == 5 and
-      not any(k in c for c in others for k in ('typed-view-shadow', 'vis-trace', 'readback-far', 'fence-strict', 'desc-guard', 'readback-swap')))
+check('typed-view-shadow is in Horizon Zero Dawn\'s and Ghost of Tsushima\'s lists only; the experiments in none',
+      len(configs) == 6 and sum('typed-view-shadow = 1' in c for c in configs) == 2 and
+      not any(k in c for c in configs for k in ('vis-trace', 'readback-far', 'fence-strict', 'desc-guard', 'readback-swap')))
 
 harness = r'''
 #include <stdio.h>

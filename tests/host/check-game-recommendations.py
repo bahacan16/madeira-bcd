@@ -175,24 +175,33 @@ assert 'resolution: "1920x1080"' in presets['god-of-war']['switches']
 # Version 12 (build 489): desc-guard logs descriptors rewritten while a batch on the GPU uses them.
 # Version 13 (build 490): the readback buffers (the culling pyramid) on Metal's own memory, not the swap tier.
 # Version 14 (build 491): single constant buffers of descriptor tables read when the draw is recorded.
+# Version 15 (build 492): the game rendered right on 491; the list without fence-strict, static-cbv,
+# readback-swap and the trace diagnostics stayed clean, and without typed-view-shadow it broke again.
 hzd = presets['horizon-zero-dawn']
 assert hzd['lines'][2:] == ['dxbc-register-spaces = 1', 'msc-unbounded-retry = 1', 'msc-fail-memo = 1',
                             'pso-placeholder = 1', 'pso-lazy-libs = 1', 'clear-rects = 1',
-                            'typed-view-align = 16', 'typed-view-shadow = 1', 'fence-strict = 1',
-                            'view-census = 1', 'vis-trace = 1', 'desc-guard = 1', 'static-cbv = 1',
-                            'swap-mb = 6144', 'swap-mode = 2', 'swap-min-mb = 1', 'readback-swap = 0',
+                            'typed-view-align = 16', 'typed-view-shadow = 1', 'view-census = 1',
+                            'swap-mb = 6144', 'swap-mode = 2', 'swap-min-mb = 1',
                             'env.DXMT_WSI_MONITOR_IDENTITY = 1', 'env.DXMT_WSI_MODE_TABLE = 1',
                             'env.MADEIRA_INPUT_FOREGROUND = 1', 'env.MADEIRA_WGI_HOST_PADS = 1',
                             'env.MADEIRA_LOCK_ORPHAN = stamped', 'env.WINEDEBUG = fixme-input'], hzd['lines']
-assert hzd['version'] == 14 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
+assert hzd['version'] == 15 and hzd['switches'] == 'avx: false, nvidia: false, wineVCRT: false, fastSync: true, display: "fit"', hzd
 assert not any(line.startswith(('d3d12-wave-ops', 'd3d12-raw-typed-views', 'typed-uav-atomic', 'ignore-volatile-metadata',
                                  'env.FEX_MEMCPYSETTSOENABLED', 'env.FEX_STRICTINPROCESSSPLITLOCKS'))
                for p in presets.values() for line in p['lines']), 'the build 484 experiment is in no list'
-assert not any(line.startswith(('pso-lazy-libs', 'clear-rects', 'skin-check', 'skin-dump', 'view-census', 'typed-view-align',
-                                 'typed-view-shadow', 'fence-strict', 'vis-trace', 'readback-far', 'desc-guard', 'readback-swap',
+assert not any(line.startswith(('pso-lazy-libs', 'clear-rects'))
+               for p in presets.values() if p is not hzd for line in p['lines']), 'the build 481 switches are Horizon Zero Dawn\'s only'
+assert not any(line.startswith(('skin-check', 'skin-dump', 'fence-strict', 'vis-trace', 'readback-far', 'desc-guard', 'readback-swap',
                                  'static-cbv', 'env.FEX_VECTORTSOENABLED = 1'))
-               for p in presets.values() if p is not hzd for line in p['lines']), 'the build 481-491 switches are Horizon Zero Dawn\'s only'
-print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 480 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced, GoT and GoW keep their tested lines; Horizon Zero Dawn has build 491\'s test list')
+               for p in presets.values() for line in p['lines']), 'the build 482-491 experiments are in no list'
+# Ghost of Tsushima, version 2 (build 492): Horizon Zero Dawn's proven typed-view fix, with the census.
+got = presets['ghost-of-tsushima']
+assert got['lines'][2:] == ['dxil-tess = 0', 'sampler-reduction = 3', 'ind-count = 6000', 'typed-view-align = 16',
+                            'typed-view-shadow = 1', 'view-census = 1', 'env.MADEIRA_PAD_MODE = hid', 'swap-mb = 3072'], got['lines']
+assert got['version'] == 2, got['version']
+assert not any(line.startswith(('view-census', 'typed-view-align', 'typed-view-shadow'))
+               for p in presets.values() if p is not hzd and p is not got for line in p['lines']), 'the typed-view fix is HZD\'s and GoT\'s only'
+print('PASS: RDR2 (Steam) is the owner\'s 463 list plus the 466, 467, 470, 472, 475, 476 and 480 test lines, line for line with its switches (720 lines of this screen); GTA V Enhanced and GoW keep their tested lines; Horizon Zero Dawn has build 491\'s proven list (v15), GoT the typed-view fix (v2)')
 
 # Recognition: Steam by App ID or steamapps\common folder; everything else by the program's name.
 match = block(lists_src, 'static func match(', '\n    }\n')

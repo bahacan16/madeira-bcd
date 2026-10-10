@@ -245,14 +245,23 @@ enum GameRecommendations {
         avx: false, nvidia: true, wineVCRT: false, fastSync: true, resolution: "1280x720", display: "fit")
 
     /// Ghost of Tsushima (build 336: DualSense input, rumble, triggers and light work).
+    /// Build 492 adds Horizon Zero Dawn's proven fix for typed buffer views that
+    /// start off a 16-byte boundary: the GPU reads such a texture from its start
+    /// rounded down, so the shader saw data shifted by a few elements in the frames
+    /// where a view landed there (HZD: walls, trees and plants missing for one
+    /// frame). GoT's one-frame "shapes in the air" are the same kind of fault.
+    /// view-census counts such views, so its first run shows whether GoT makes any.
     static let ghostOfTsushima = GameRecommendation(
-        id: "ghost-of-tsushima", title: "Ghost of Tsushima", version: 1,
+        id: "ghost-of-tsushima", title: "Ghost of Tsushima", version: 2,
         config: """
         # Madeira's recommended settings for Ghost of Tsushima.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
         dxil-tess = 0
         sampler-reduction = 3
         ind-count = 6000
+        typed-view-align = 16
+        typed-view-shadow = 1
+        view-census = 1
         env.MADEIRA_PAD_MODE = hid
         swap-mb = 3072
         """,
@@ -353,9 +362,13 @@ enum GameRecommendations {
     /// 491's list reads a table's single constant buffers when the draw is
     /// recorded, as NVIDIA's driver and vkd3d-proton do (static-cbv): with
     /// vkd3d-proton, Horizon Zero Dawn Remastered's foliage flicker stops when
-    /// that is extended to every such constant buffer.
+    /// that is extended to every such constant buffer. On build 491 the game
+    /// rendered without a fault (19:28). Two runs then showed what matters: the
+    /// list without fence-strict, static-cbv, readback-swap and the trace
+    /// diagnostics stayed clean (19:58), and without typed-view-shadow the
+    /// vanishing came back (20:01). That list is version 15.
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 14,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 15,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -367,15 +380,10 @@ enum GameRecommendations {
         clear-rects = 1
         typed-view-align = 16
         typed-view-shadow = 1
-        fence-strict = 1
         view-census = 1
-        vis-trace = 1
-        desc-guard = 1
-        static-cbv = 1
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1
-        readback-swap = 0
         env.DXMT_WSI_MONITOR_IDENTITY = 1
         env.DXMT_WSI_MODE_TABLE = 1
         env.MADEIRA_INPUT_FOREGROUND = 1
