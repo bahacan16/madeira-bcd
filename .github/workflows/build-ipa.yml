@@ -1283,6 +1283,10 @@ jobs:
       - name: Check static-cbv
         run: python3 tests/host/check-static-cbv.py
 
+      # madeira-bcd: ucrtbase-x64math.dll (env.MADEIRA_UCRT_X64_MATH): floor and sqrt as x64 code.
+      - name: Check ucrt-x64-math
+        run: python3 tests/host/check-ucrt-x64-math.py
+
       # The native D3D12 runtime is ours to fix now, so build it from
       # madeira-d3d12 instead of shipping upstream's binary as is.
       # madeira-bcd: a failed build FAILS the run. It used to keep the tracked
@@ -1394,6 +1398,14 @@ jobs:
             echo "::notice::d3d11-src.dll present ($(wc -c < app/Madeira/arm64ec-windows/d3d11-src.dll | tr -d ' ') bytes): env.MADEIRA_D3D11_SRC = 1 selects it"
           else
             echo "::warning::d3d11-src.dll missing: this IPA has only upstream's d3d11.dll (no SwapDeviceContextState); env.MADEIRA_D3D11_SRC = 1 does nothing"
+          fi
+          # And tools/build-wine-extra-dlls.sh's ucrtbase-x64math.dll
+          # (env.MADEIRA_UCRT_X64_MATH): never ship one whose four exports are
+          # not the x64 bodies.
+          if [ -f app/Madeira/arm64ec-windows/ucrtbase-x64math.dll ]; then
+            python3 tools/patch-wine-ucrtbase-x64-math.py --verify app/Madeira/arm64ec-windows/ucrtbase-x64math.dll
+          else
+            echo "::warning::ucrtbase-x64math.dll missing: env.MADEIRA_UCRT_X64_MATH = 1 does nothing in this IPA"
           fi
 
       # tools/fetch-vcruntime.md: the VC++ runtime DLLs (twelve, and since

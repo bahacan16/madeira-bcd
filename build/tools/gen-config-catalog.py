@@ -542,6 +542,15 @@ OVERLAY = {
                         "upstream's DXMT d3d11 plus SwapDeviceContextState, which Wine's Direct2D (d2d1) calls and "
                         "upstream's aborts in (Rockstar Games Launcher exited with code 3). Off (default): upstream's "
                         "committed d3d11.dll. Set it in the game's own file, not for every game; read at session start."},
+    # madeira-bcd: ucrtbase-x64math.dll (tools/patch-wine-ucrtbase-x64-math.py, linked by WineProcessBridge.m).
+    "env.MADEIRA_UCRT_X64_MATH": {"category": "Wine core (ntdll)", "title": "floor and sqrt as x64 code (ucrtbase)",
+                "kind": "bool", "default": "0",
+                "sources": ["app/Madeira/WineProcessBridge.m", "tools/patch-wine-ucrtbase-x64-math.py"],
+                "note": "1: the game runs ucrtbase-x64math.dll as ucrtbase.dll, Wine's ucrtbase whose floor and sqrt "
+                        "exports are x64 code, so a 64-bit game's calls to them stay in the emulator instead of "
+                        "crossing to the native code and back (Horizon Zero Dawn: 2-4 million such calls a second). "
+                        "Same results; a negative or NaN sqrt still goes to Wine's native sqrt. Off (default): the "
+                        "shipped ucrtbase.dll. Set it in the game's own file; read at session start."},
     # madeira-bcd: small staging rings in d3d11-src.dll (tools/patch-d3d11-src-small-rings.py).
     "env.MADEIRA_LOCK_ORPHAN": {"category": "Wine core (ntdll)", "title": "Orphan-lock reaper mode",
                 "kind": "choice", "default": "", "sources": ["tools/patch-wine-lock-orphan.py"],

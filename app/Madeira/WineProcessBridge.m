@@ -1516,6 +1516,34 @@ static void *wine_process_thread(void *arg) {
                 }
             }
 
+            /* madeira-bcd: env.MADEIRA_UCRT_X64_MATH = 1 (the game's own file) runs
+             * ucrtbase-x64math.dll as ucrtbase.dll: Wine's ucrtbase built from the
+             * submodule with tools/patch-wine-ucrtbase-x64-math.py, whose floor and
+             * sqrt exports are x64 code, so an x64 caller stays in the emulator
+             * instead of crossing to the native body and back. Horizon Zero Dawn
+             * (build 492) makes 2-4 million such calls a second, about half of all
+             * its x64->ARM64EC calls. Off by default: every other game keeps the
+             * shipped ucrtbase.dll, and dropping the line restores it at the next
+             * start (the farms above are relinked from the bundle every session).
+             * ARM64EC sessions only, linked like xtajit64-avx.dll. */
+            {
+                const char *ucrtX64 = getenv("MADEIRA_UCRT_X64_MATH");
+                if (use_arm64ec && ucrtX64 && ucrtX64[0] == '1') {
+                    NSString *mathDll = [[bundlePath stringByAppendingPathComponent:@"arm64ec-windows"]
+                                         stringByAppendingPathComponent:@"ucrtbase-x64math.dll"];
+                    if ([fm fileExistsAtPath:mathDll]) {
+                        for (NSString *dir in @[ sys32Dir, [prefix stringByAppendingPathComponent:@"drive_c/windows/sysx64"] ]) {
+                            NSString *dst = [dir stringByAppendingPathComponent:@"ucrtbase.dll"];
+                            [fm removeItemAtPath:dst error:nil];
+                            [fm createSymbolicLinkAtPath:dst withDestinationPath:mathDll error:nil];
+                        }
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_UCRT_X64_MATH=1: ucrtbase.dll -> ucrtbase-x64math.dll (floor and sqrt as x64 code for x64 callers)\n");
+                    } else {
+                        dprintf(STDERR_FILENO, "[WineProc] MADEIRA_UCRT_X64_MATH=1 but this build has no ucrtbase-x64math.dll -- the shipped ucrtbase.dll stays\n");
+                    }
+                }
+            }
+
             /* ml719: REPAIR THE SHELL FOLDERS. They ship as symlinks to the BUILD
              * MACHINE's home directory.
              *

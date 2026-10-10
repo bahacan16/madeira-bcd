@@ -5,6 +5,7 @@
 # Rockstar Games SDK / Launcher installers load Msftedit.dll and gdiplus.dll). Configured the way
 # upstream's build/wine-pe/build-ntdll.sh configures wine/build-arm64ec;
 # stripped and padded by 64 KB past SizeOfImage like the shipped builtins.
+# Also ucrtbase-x64math.dll, an opt-in variant of ucrtbase (see UCX below).
 # A DLL upstream already ships is never replaced. Run from the repository
 # root; needs llvm-mingw on PATH (or MINGW) and the native wine tools.
 #   usage: build-wine-extra-dlls.sh [native tools dir]
@@ -63,7 +64,17 @@ WGI=""
 if [ "${MADEIRA_WGI_HOST_PADS_BUILD:-1}" != 0 ] && [ -d "$R/wine/dlls/windows.gaming.input" ]; then
     targets="$targets dlls/windows.gaming.input/arm64ec-windows/windows.gaming.input.dll"; WGI=windows.gaming.input
 fi
-[ -n "$todo$XI$WGI" ] || { echo "nothing to build"; exit 0; }
+# madeira-bcd: not an exception, a new file. ucrtbase-x64math.dll is Wine's
+# ucrtbase built with tools/patch-wine-ucrtbase-x64-math.py (floor and sqrt as
+# x64 code for x64 callers) and ships NEXT TO the shipped ucrtbase.dll, which
+# stays; only a game with env.MADEIRA_UCRT_X64_MATH = 1 runs it. Built in a make
+# of its own after the patches above are undone (see below).
+# MADEIRA_UCRT_X64_MATH_BUILD=0 skips it.
+UCX=""
+if [ "${MADEIRA_UCRT_X64_MATH_BUILD:-1}" != 0 ] && [ -f "$R/wine/dlls/ucrtbase/Makefile.in" ]; then
+    UCX=ucrtbase
+fi
+[ -n "$todo$XI$WGI$UCX" ] || { echo "nothing to build"; exit 0; }
 
 # The cached tree may have disabled winegstreamer because macOS has no
 # GStreamer headers. Only its real PE frontend is needed here; the iOS unix
@@ -117,11 +128,45 @@ for d in $todo; do
     sed -i.bak -e '/^DELAYIMPORTS[[:space:]]*=/d' -e "s/^\(IMPORTS[[:space:]]*=.*\)\$/\1 $delayed/" "$mk" && rm -f "$mk.bak"
     undelayed="$undelayed $d"
 done
-make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
+[ -n "$targets" ] && make -C "$B" -k -j"$JOBS" $targets > "$B.build.log" 2>&1
 git -C "$R/wine" checkout -- dlls/msvcrt/main.c dlls/xinput1_3/main.c dlls/d2d1/dc_render_target.c \
     dlls/windows.gaming.input/provider.c dlls/windows.gaming.input/main.c
 for d in $undelayed; do git -C "$R/wine" checkout -- "dlls/$d/Makefile.in"; done
 [ -n "$undelayed" ] && echo "::notice::delay imports linked as plain imports:$undelayed"
+# madeira-bcd: ucrtbase-x64math.dll (see UCX above), from the restored tree:
+# msvcrt/main.c no longer carries the data-sync patch, so the DLL differs from a
+# plain ucrtbase build only by dlls/ucrtbase/x64math.c. Its delay imports stay,
+# as in the shipped ucrtbase.dll. The four exports are checked to be x64 bodies
+# before anything ships; the tree is restored afterwards.
+if [ -n "$UCX" ]; then
+    uc="$B/dlls/ucrtbase/arm64ec-windows/ucrtbase.dll"
+    if python3 "$R/tools/patch-wine-ucrtbase-x64-math.py" "$R/wine"; then
+        rm -f "$uc" "$B/dlls/ucrtbase/arm64ec-windows/x64math.o"
+        make -C "$B" -j"$JOBS" dlls/ucrtbase/arm64ec-windows/ucrtbase.dll > "$B.ucrt.log" 2>&1
+        if [ -f "$uc" ] && python3 "$R/tools/patch-wine-ucrtbase-x64-math.py" --verify "$uc"; then
+            cp "$uc" "$SHIP/ucrtbase-x64math.dll.tmp"
+            "$MINGW/llvm-strip" "$SHIP/ucrtbase-x64math.dll.tmp"
+            python3 - "$SHIP/ucrtbase-x64math.dll.tmp" <<'PY'
+import struct, sys
+p = sys.argv[1]; d = open(p, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+target = struct.unpack_from('<I', d, pe + 24 + 56)[0] + 0x10000
+if len(d) < target:
+    open(p, 'ab').write(b'\0' * (target - len(d)))
+PY
+            mv "$SHIP/ucrtbase-x64math.dll.tmp" "$SHIP/ucrtbase-x64math.dll"
+            echo "::notice::ucrtbase-x64math.dll (floor and sqrt as x64 code; env.MADEIRA_UCRT_X64_MATH = 1): built next to the shipped ucrtbase.dll"
+        else
+            echo "::warning::ucrtbase-x64math.dll did not build or failed its check; not shipped"
+            grep -m 10 "error" "$B.ucrt.log"
+        fi
+        rm -f "$uc"
+    else
+        echo "::warning::ucrtbase x64-math patch did not apply; ucrtbase-x64math.dll not shipped"
+    fi
+    git -C "$R/wine" checkout -- dlls/ucrtbase/Makefile.in
+    rm -f "$R/wine/dlls/ucrtbase/x64math.c"
+fi
 xi_built=0; xi_failed=""
 if [ "$xi_patched" = 1 ]; then
     for d in $XI; do
