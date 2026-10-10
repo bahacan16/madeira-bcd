@@ -185,7 +185,8 @@ check('pipelines: the input layout tag only with skin-check-trace, freed with th
       'if (g_skin_trace <= 0 || !il || !il->NumElements || !il->pInputElementDescs) return;' in pe and
       'free(p->il_tag);   /* madeira-bcd skin-check-trace */' in pe and
       'mad_bc_keep_ex(p->vs_hash, desc->VS.pShaderBytecode, desc->VS.BytecodeLength, p->il_int);' in gp)
-check('Horizon Zero Dawn\'s list: typed-view-align 4', 'typed-view-align = 4' in hzd and 'typed-view-align = 16' not in hzd)
+check('Horizon Zero Dawn\'s list: typed-view-align 16 with typed-view-shadow (487; the probe showed 4 behaves as 16)',
+      'typed-view-align = 16' in hzd and 'typed-view-shadow = 1' in hzd and 'typed-view-align = 4' not in hzd)
 # build 486: typed-view-align = 4
 kern = (root / 'madeira-d3d12/src/pe/mad_kernels.metal').read_text()
 probe = body('static int mad_tv_probe(struct mad_device *d) {')
@@ -246,8 +247,8 @@ static void d3d12_log(const char *fmt, ...) {
 typedef int64_t LONG64;
 static LONG64 InterlockedExchangeAdd64(volatile LONG64 *p, LONG64 v) { LONG64 o = *p; *p += v; return o; }
 static LONG InterlockedExchange(volatile LONG *p, LONG v) { LONG o = *p; *p = v; return o; }
-struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id; };
-struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; };
+struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; };
+struct mad_resource { obj_handle_t buffer; void *cpu; UINT64 size, gpu_address; struct mad_tview *tview; unsigned ntview, tview_cap; int heap; };
 typedef struct mad_resource ID3D12Resource;
 static int released;
 static void ID3D12Resource_Release(ID3D12Resource *r) { (void)r; released++; }
@@ -309,6 +310,15 @@ static int mad_view_grow(struct mad_resource *r, void **arr, unsigned *cap, unsi
 static UINT64 last_vmap_id; static UINT32 last_vmap_a, last_vmap_b;
 static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b) { (void)d; last_vmap_id = id; last_vmap_a = a; last_vmap_b = b; }
 static void mad_view_census(const char *kind, struct mad_resource *r, unsigned n) { (void)kind; (void)r; (void)n; }
+#define D3D12_HEAP_TYPE_UPLOAD 2
+static volatile LONG g_tvs_other; static int tvs_on, tvs_made;
+static int mad_tvs_on(void) { return tvs_on; }
+static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
+                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu) {
+    (void)d; (void)r; (void)byte_off; (void)bytes;
+    ti->width = (uint32_t)num; ti->gpu_resource_id = next_id++; *gpu = 0x70000000ull + 16u * (unsigned)tvs_made++;
+    return (obj_handle_t)(uintptr_t)ti->gpu_resource_id;
+}
 ''' + body('static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,') + r'''
 static int bad;
 #define EXPECT(c, what) do { if (!(c)) { printf("FAIL %s\n", what); bad = 1; } else printf("ok   %s\n", what); } while (0)
@@ -404,6 +414,30 @@ int main(void) {
                          "Metal refuses the exact start: made at 16, one element in, and counted");
         refuse_unaligned16 = 0; tv_mode = 64; tv_align = 64;
         EXPECT(probes == 3, "the probe hook runs for every view made while the switch is 4 (it probes once itself)");
+        {   /* 487: typed-view-shadow */
+            static unsigned char upmem[4096];
+            struct mad_resource up = { (obj_handle_t)5, upmem, 4096, 0x5000, NULL, 0, 0, D3D12_HEAP_TYPE_UPLOAD };
+            struct mad_resource gm = { (obj_handle_t)6, NULL, 4096, 0x6000, NULL, 0, 0, 1 };
+            LONG eoff0 = g_tv_eoff_views;
+            tv_mode = 16; tv_align = 16;
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 5, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 1 &&
+                             e.gpu_va == 0x5000 + 20 && tvs_made == 0 && g_tvs_other == 0 && g_tv_eoff_views == eoff0 + 1,
+                             "487: typed-view-shadow off: an R32 view one element past 16 keeps its offset, nothing copied");
+            tvs_on = 1;
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 6, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 0 &&
+                             e.gpu_va == 0x70000000ull && tvs_made == 1 && up.tview[up.ntview - 1].sh_gpu == 0x70000000ull &&
+                             g_tv_eoff_views == eoff0 + 1, "487: on: an R32 view of UPLOAD memory off 16 bytes reads its aligned copy, no offset");
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 6, 4, 0, &e, &why) == 1 && e.gpu_va == 0x70000000ull && tvs_made == 1,
+                             "487: the cached view keeps pointing at its copy");
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 8, 4, 0, &e, &why) == 1 && e.gpu_va == 0x5000 + 32 && tvs_made == 1 &&
+                             ((e.metadata >> 32) & 0xff) == 0, "487: a view on a 16-byte boundary needs no copy");
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &up, 42, 9, 4, 1, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 1 &&
+                             tvs_made == 1 && g_tvs_other == 1, "487: a UAV keeps its offset and is counted");
+            why = -1; EXPECT(mad_typed_buffer_view(&d, &gm, 42, 7, 4, 0, &e, &why) == 1 && ((e.metadata >> 32) & 0xff) == 3 &&
+                             e.gpu_va == 0x6000 + 28 && tvs_made == 1 && g_tvs_other == 2,
+                             "487: a view of GPU memory keeps its offset and is counted");
+            tvs_on = 0; tv_mode = 64; tv_align = 64;
+        }
     }
     {   /* 485: copies of CPU-written memory against the CPU's bytes; skin-dump */
         unsigned char nowb[64];

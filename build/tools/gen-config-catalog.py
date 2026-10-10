@@ -237,6 +237,25 @@ OVERLAY = {
                         "starts exactly at its first element, for the element sizes a GPU probe at the first view shows "
                         "read right (logged); the others start at 16. A view Metal refuses there is made at 16, then 64. "
                         "Read once per game start."},
+    "typed-view-shadow": {"category": "Direct3D 12", "title": "Aligned copies of offset typed views",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a typed shader-resource view of UPLOAD memory whose first element is not on a "
+                        "16-byte boundary reads a 16-byte-aligned copy of its bytes, made when the view is made and "
+                        "refreshed at every ExecuteCommandLists (the GPU rounds a texture buffer's start down to 16 bytes "
+                        "and the shader converter ignores the element offset). view-census counts them. Read once per "
+                        "game start."},
+    "vis-trace": {"category": "Direct3D 12", "title": "Diagnostic: per-frame draws and culling readback",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: one log line per present (the HUD's frame number): draws, depth-only and "
+                        "3+-target draws, indices, dispatches, depth-pyramid readback copies and new offset typed views; "
+                        "and the 11x5 and 5x2 mips of the pyramid a game culls with, as the GPU wrote them. Read once per "
+                        "game start."},
+    "readback-far": {"category": "Direct3D 12", "title": "Experiment: empty culling readback",
+                "kind": "bool", "default": "0",
+                "note": "Default off. 1: a readback of a depth pyramid (an R32_FLOAT mip of 1 or more of a texture with 4+ "
+                        "mips, up to 64x64) is not copied; the CPU fills it with 4096, so a game that culls on the CPU "
+                        "against it culls nothing (everything is drawn: slower). A test, not a fix. Read once per game "
+                        "start."},
     # madeira-bcd: A/B switches for the Sony ports' corrupted meshes (Horizon Zero Dawn, Ghost of Tsushima).
     "d3d12-wave-ops": {"category": "Direct3D 12", "title": "Report wave operations",
                 "kind": "bool", "default": "1",

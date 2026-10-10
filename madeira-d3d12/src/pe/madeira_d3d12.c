@@ -831,7 +831,7 @@ struct mad_resource {
      * resource; released with it. */
     /* ml1049: growable, never evicted. The 16-entry ring released a Metal view
      * that descriptors still named as soon as a 17th distinct view appeared. */
-    struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id; } *tview;   /* eoff: elements before the view's first (madeira-bcd typed-view-align) */
+    struct mad_tview { UINT fmt; UINT64 off, num; UINT8 uav, eoff; obj_handle_t tex; UINT64 id, sh_gpu; } *tview;   /* eoff: elements before the view's first (madeira-bcd typed-view-align); sh_gpu: its typed-view-shadow copy, 0 = none */
     unsigned ntview, tview_cap;
     void *view_old[24]; unsigned nview_old;   /* outgrown arrays, freed with the resource */
     unsigned srv_slot, uav_slot;              /* index + 1 in the device's srv_res / uav_res, 0 = absent (list_lock) */
@@ -5381,6 +5381,7 @@ static struct mad_bcrec { UINT64 hash; void *bc; UINT len; } *g_bc;
 static SRWLOCK g_bc_lock = SRWLOCK_INIT;
 static SIZE_T g_bc_bytes; static LONG g_bc_n, g_bc_refused;
 static void mad_vc_report(void);
+static void mad_tvs_refresh(void);   /* madeira-bcd typed-view-shadow */
 
 static void mad_skin_load(void) {
     static volatile LONG once;
@@ -7390,6 +7391,84 @@ static UINT mad_aspect_bpp(const struct mad_resource *r, UINT plane) {
     mad_format_info(r->desc.Format, &bytes, &block);
     return block == 1 ? bytes : 0;
 }
+/* madeira-bcd vis-trace (madeira.cfg vis-trace = 1, diagnostic) and
+ * readback-far (madeira.cfg readback-far = 1, an experiment).
+ *
+ * Horizon Zero Dawn culls on the CPU: every frame it copies mips 2-5 of a
+ * 176x81 R32_FLOAT depth pyramid (linear metres, far = 4096) to a READBACK
+ * buffer and later tests its objects against what it reads there. In the 486
+ * recordings whole walls, trees and plants are missing for one frame every few
+ * seconds, at the moments the [rb-tex] census saw near depths in that readback.
+ *
+ * vis-trace logs one line per present (the HUD's frame number is the present
+ * number, so a frame of a screen recording finds its line): draws (depth-only
+ * passes, passes with 3+ targets), indices x instances, dispatches, pyramid
+ * copies, new typed views with an element offset and shadowed ones; and, once
+ * the GPU has finished them, the 11x5 and 5x2 mips of the pyramid as the GPU
+ * wrote them, with the present they belong to. A vanishing frame with fewer
+ * draws was culled by the game; with the same draws, the GPU lost them.
+ *
+ * readback-far: those copies are not made; their destination rows are filled
+ * with 4096 on the CPU when the copy is replayed, so nothing in the pyramid
+ * hides anything and the game's occlusion culling culls nothing. If walls and
+ * plants stop vanishing, the culling input is what goes wrong. Costs GPU time
+ * (everything is drawn). */
+static int g_vt_on = -1, g_rbf_on = -1;
+static volatile LONG g_vt_draws, g_vt_depth, g_vt_mrt, g_vt_disp, g_vt_pyr, g_vt_rbf;
+static volatile LONG64 g_vt_idx, g_vt_presents;
+struct mad_vt_rb { struct mad_queue *q; UINT64 batch; const unsigned char *cpu; UINT32 row, w, h, level; LONG64 frame; };
+#define MAD_VT_RB 16u
+static struct mad_vt_rb g_vt_rb[MAD_VT_RB]; static unsigned g_vt_rb_n;
+static SRWLOCK g_vt_lock = SRWLOCK_INIT;
+static void mad_vt_load(void) {
+    if (g_vt_on >= 0) return;
+    g_rbf_on = mad_cfg_int_pe("readback-far", 0) ? 1 : 0;   /* experiment: the CPU-culling depth readback (R32_FLOAT mip >= 1 of a 4+-mip texture, at most 64x64) is filled with 4096 instead of copied: the game culls nothing */
+    if (g_rbf_on)
+        d3d12_log("[vis-trace] madeira-bcd readback-far = 1 (EXPERIMENT): depth-pyramid readbacks are filled with 4096, so the game's "
+                  "occlusion culling culls nothing\n");
+    MemoryBarrier();
+    g_vt_on = mad_cfg_int_pe("vis-trace", 0) ? 1 : 0;   /* diagnostic: per present, draws / dispatches / indices, and the depth-pyramid readback the game culls with as the GPU wrote it */
+    if (g_vt_on)
+        d3d12_log("[vis-trace] madeira-bcd DIAGNOSTIC vis-trace = 1: one line per present (draws, dispatches, pyramid readbacks)\n");
+}
+static void mad_vt_draw(const struct mad_exec *e, const struct mad_cmd *c) {
+    UINT64 n;
+    InterlockedIncrement(&g_vt_draws);
+    if (e->renc && !e->enc_nrt && e->enc_depth) InterlockedIncrement(&g_vt_depth);
+    else if (e->renc && e->enc_nrt >= 3) InterlockedIncrement(&g_vt_mrt);
+    n = c->kind == MC_DRAW_INDEXED ? (UINT64)c->u.drawi.icount * (c->u.drawi.inst ? c->u.drawi.inst : 1)
+                                   : (UINT64)c->u.draw.vcount * (c->u.draw.icount ? c->u.draw.icount : 1);
+    InterlockedExchangeAdd64(&g_vt_idx, (LONG64)n);
+}
+/* A texture-to-buffer copy about to be replayed: a depth-pyramid readback?
+ * Returns 1 when readback-far handled it (no GPU copy). */
+static int mad_vt_copy(struct mad_exec *e, const struct mad_cmd *c) {
+    const struct mad_resource *t = c->u.bt.tex, *b = c->u.bt.buf;
+    unsigned char *cpu;
+    UINT x, y;
+    if (!t || !b || !b->cpu || t->tex_pf != WMTPixelFormatR32Float || c->u.bt.level < 1 || t->tex_mips < 4 ||
+        !c->u.bt.w || !c->u.bt.h || c->u.bt.w > 64 || c->u.bt.h > 64 || c->u.bt.d != 1 || c->u.bt.row < c->u.bt.w * 4u)
+        return 0;
+    if (c->u.bt.off + (UINT64)c->u.bt.row * (c->u.bt.h - 1) + (UINT64)c->u.bt.w * 4 > b->size) return 0;
+    cpu = (unsigned char *)b->cpu + c->u.bt.off;
+    InterlockedIncrement(&g_vt_pyr);
+    if (g_rbf_on > 0) {
+        for (y = 0; y < c->u.bt.h; y++)
+            for (x = 0; x < c->u.bt.w; x++) ((float *)(cpu + (size_t)y * c->u.bt.row))[x] = 4096.0f;
+        InterlockedIncrement(&g_vt_rbf);
+        return 1;
+    }
+    if (g_vt_on > 0 && c->u.bt.w * c->u.bt.h <= 64) {   /* the 11x5 and 5x2 mips */
+        struct mad_vt_rb *r;
+        AcquireSRWLockExclusive(&g_vt_lock);
+        if (g_vt_rb_n == MAD_VT_RB) { memmove(&g_vt_rb[0], &g_vt_rb[1], (MAD_VT_RB - 1) * sizeof g_vt_rb[0]); g_vt_rb_n--; }
+        r = &g_vt_rb[g_vt_rb_n++];
+        r->q = e->q; r->batch = e->q->batches + 1; r->cpu = cpu;   /* the open batch; submit_lock is held */
+        r->row = c->u.bt.row; r->w = c->u.bt.w; r->h = c->u.bt.h; r->level = c->u.bt.level; r->frame = g_vt_presents + 1;
+        ReleaseSRWLockExclusive(&g_vt_lock);
+    }
+    return 0;
+}
 static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     const struct mad_resource *s = c->u.tt.src, *d = c->u.tt.dst;
     struct mad_device *dev = e->q->device;
@@ -7527,6 +7606,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_COPY_T2B: {
         struct wmtcmd_blit_copy_from_texture_to_buffer k;
         if (!c->u.bt.tex->texture || !c->u.bt.buf->buffer) { MAD_SKIP(e); return; }
+        if ((g_vt_on > 0 || g_rbf_on > 0) && mad_vt_copy(e, c)) return;   /* madeira-bcd vis-trace / readback-far */
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToBuffer;
         k.src = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
@@ -8324,7 +8404,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_QUERY_BEGIN: exec_query_begin(&e, c); break;     /* ml1088 */
         case MC_QUERY_END: exec_query_end(&e, c); break;
         case MC_QUERY_RESOLVE: exec_query_resolve(&e, c); break;
-        case MC_DRAW: case MC_DRAW_INDEXED: exec_draw(&e, c); break;
+        case MC_DRAW: case MC_DRAW_INDEXED: exec_draw(&e, c); if (g_vt_on > 0) mad_vt_draw(&e, c); break;   /* madeira-bcd vis-trace */
         case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: {
             struct mad_cmd t = *c; UINT k; UINT64 toff = 0;
             int tess = 0;
@@ -8351,7 +8431,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         }
         case MC_COPY_BB: case MC_COPY_B2T: case MC_COPY_T2B: case MC_COPY_T2T: case MC_FILL_BB: case MC_FILL_TEX: exec_copy(&e, c); break;
         case MC_BLEND_FACTOR: memcpy(e.blend, c->u.blend.rgba, sizeof e.blend); e.has_blend = 1; break;
-        case MC_DISPATCH: exec_dispatch(&e, c); break;
+        case MC_DISPATCH: exec_dispatch(&e, c); if (g_vt_on > 0) InterlockedIncrement(&g_vt_disp); break;   /* madeira-bcd vis-trace */
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
         if (rs) {   /* madeira-bcd: replay split, summed per list */
@@ -8532,6 +8612,8 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
     QueryPerformanceCounter(&t0);   /* ml1119: caller-thread time in here */
     InterlockedIncrement(&g_perf_ecl);   /* ml1109 */
     mad_xp_role('E'); InterlockedIncrement64(&g_xp.ecl_calls);   /* ml1128 */
+    mad_tvs_refresh();   /* madeira-bcd typed-view-shadow: the game wrote this submission's UPLOAD data by now */
+    if (g_vt_on < 0) mad_vt_load();   /* madeira-bcd vis-trace / readback-far */
     if (g_sd_state > 0 && g_qtrace) mad_qtrace("ExecuteCommandLists", q, NULL, 0, count);   /* madeira-bcd */
     if (q && q->sub_thread) {   /* ml1120: validate here, replay on the worker */
         struct mad_subjob *j = calloc(1, sizeof *j + (count ? count : 1) * sizeof(struct mad_list *));
@@ -10267,6 +10349,18 @@ static SRWLOCK g_tv_probe_lock = SRWLOCK_INIT;
 static UINT16 g_tv_floor[1024];   /* Metal's minimum per pixel format; 0 = not asked yet */
 static volatile LONG g_tv_said, g_tv_fallback, g_tv_eoff_views, g_tv_exact_views;
 static volatile LONG g_tv_eoff_pf[1024];   /* views made with a nonzero element offset, by pixel format (view-census) */
+/* madeira-bcd typed-view-shadow (see mad_tvs_view) */
+#define MAD_TVS_CHUNK (4u << 20)
+#define MAD_TVS_MAX_VIEW (64u << 10)
+#define MAD_TVS_MAX_BYTES (64u << 20)
+#define MAD_TVS_MAX_N 16384u
+struct mad_tvs { struct mad_resource *r; const unsigned char *src; unsigned char *dst; UINT32 len; };
+static struct mad_tvs *g_tvs; static unsigned g_tvs_n, g_tvs_cap;
+static SRWLOCK g_tvs_lock = SRWLOCK_INIT;
+static obj_handle_t g_tvs_buf; static unsigned char *g_tvs_cpu; static UINT64 g_tvs_gpu; static UINT32 g_tvs_used;
+static volatile LONG64 g_tvs_bytes;
+static volatile LONG g_tvs_views, g_tvs_copies, g_tvs_other, g_tvs_full;
+static int g_tvs_on = -1;
 static int mad_tv_mode(void) {
     if (g_tv_align < 0) {
         long long v = mad_cfg_int_pe("typed-view-align", 0);   /* fix: texture-buffer views start at their first element (4, probed) or at a 16- or 256-byte boundary, instead of 64 */
@@ -10464,13 +10558,111 @@ static void mad_vc_report(void) {
                   "below a 16-byte boundary: %ld (typed-view-align %d)\n", (long)g_tv_eoff_views, n ? ", by pixel format:" : "", by,
                   (long)g_tv_exact_views, mad_tv_mode());
     }
+    if (g_tvs_on > 0)   /* madeira-bcd typed-view-shadow */
+        d3d12_log("[view-census] typed-view-shadow: %ld views read an aligned copy (%u refreshed, %lld KB), %ld copies made at "
+                  "ExecuteCommandLists; %ld offset views not copied (UAV or not UPLOAD memory), %ld refused (too big or full)\n",
+                  (long)g_tvs_views, g_tvs_n, (long long)(g_tvs_bytes >> 10), (long)g_tvs_copies, (long)g_tvs_other, (long)g_tvs_full);
+}
+/* madeira-bcd typed-view-shadow (madeira.cfg typed-view-shadow = 1, opt-in).
+ * Build 486's probe (Horizon Zero Dawn, 2026-10-10 11:52): Metal makes a
+ * texture buffer that starts off a 16-byte boundary but reads it from the start
+ * rounded down, and the converted shaders ignore a typed buffer's element
+ * offset (the float4 palettes of 484/485). So a typed view of a 1-, 2-, 4- or
+ * 8-byte format whose first element is not on a 16-byte boundary is read 1 to 15
+ * bytes early. Horizon Zero Dawn has one in its per-frame UPLOAD ring: a
+ * 307-element R32 array that dozens of compute dispatches read every frame,
+ * misaligned in some frames (137 such views in the 486 run).
+ *
+ * UPLOAD memory is written by the CPU only, before ExecuteCommandLists. Such a
+ * view gets a 16-byte-aligned copy of its bytes in a buffer of ours: its texture
+ * and its descriptor's address point at the copy, made when the view is made and
+ * brought up to date at every ExecuteCommandLists (compare, then copy). The game
+ * rewrites a ring range only once the GPU is done with it, so it never changes
+ * under a running command buffer. Views over GPU-written memory keep their
+ * offset and are counted (view-census). */
+static int mad_tvs_on(void) {
+    if (g_tvs_on < 0) {
+        g_tvs_on = mad_cfg_int_pe("typed-view-shadow", 0) ? 1 : 0;   /* fix: a typed SRV of UPLOAD memory that starts off a 16-byte boundary reads a 16-byte-aligned copy of its bytes, refreshed at every ExecuteCommandLists */
+        if (g_tvs_on)
+            d3d12_log("[typed-view] madeira-bcd typed-view-shadow = 1: typed SRVs of UPLOAD memory that start off a 16-byte boundary read an aligned "
+                      "copy of their bytes, refreshed at every ExecuteCommandLists\n");
+    }
+    return g_tvs_on;
+}
+/* The shadow for one view: its texture (or 0, and the caller makes the view as
+ * before), the copy's GPU address in *gpu. view_lock held. */
+static obj_handle_t mad_tvs_view(struct mad_device *d, struct mad_resource *r, struct WMTTextureInfo *ti,
+                                 UINT64 byte_off, UINT64 num, UINT bytes, UINT64 *gpu) {
+    UINT64 len = num * bytes, al;
+    uint32_t w0 = ti->width;
+    obj_handle_t tex = 0;
+    if (byte_off >= r->size || !bytes) return 0;
+    if (len > r->size - byte_off) len = r->size - byte_off;   /* past the end: what is there, as the plain view is cut short */
+    len -= len % bytes;
+    if (!len || len > MAD_TVS_MAX_VIEW) { InterlockedIncrement(&g_tvs_full); return 0; }
+    al = (len + 15) & ~(UINT64)15;
+    AcquireSRWLockExclusive(&g_tvs_lock);
+    if (g_tvs_n >= MAD_TVS_MAX_N || g_tvs_bytes + (LONG64)al > (LONG64)MAD_TVS_MAX_BYTES) goto full;
+    if (!g_tvs_buf || g_tvs_used + al > MAD_TVS_CHUNK) {   /* chunks are never freed: their views live as long as their resources */
+        struct WMTBufferInfo bi;
+        obj_handle_t nb;
+        memset(&bi, 0, sizeof bi);
+        bi.length = MAD_TVS_CHUNK; bi.options = WMTResourceStorageModeShared; bi.memory.ptr = NULL;
+        nb = MTLDevice_newBuffer(d->mtl_device, &bi);
+        if (!nb || !bi.memory.ptr) { if (nb) NSObject_release(nb); goto full; }
+        mad_resident(d, nb);
+        g_tvs_buf = nb; g_tvs_cpu = (unsigned char *)bi.memory.ptr; g_tvs_gpu = bi.gpu_address; g_tvs_used = 0;
+    }
+    if (!mad_grow((void **)&g_tvs, &g_tvs_cap, g_tvs_n + 1, sizeof *g_tvs)) goto full;
+    memcpy(g_tvs_cpu + g_tvs_used, (const unsigned char *)r->cpu + byte_off, (size_t)len);
+    ti->width = (uint32_t)(len / bytes);
+    tex = MTLBuffer_newTexture(g_tvs_buf, ti, g_tvs_used, len);
+    if (!tex || !ti->gpu_resource_id) {
+        if (tex) NSObject_release(tex);
+        ti->gpu_resource_id = 0; ti->width = w0;
+        ReleaseSRWLockExclusive(&g_tvs_lock);
+        return 0;
+    }
+    g_tvs[g_tvs_n].r = r; g_tvs[g_tvs_n].src = (const unsigned char *)r->cpu + byte_off;
+    g_tvs[g_tvs_n].dst = g_tvs_cpu + g_tvs_used; g_tvs[g_tvs_n].len = (UINT32)len;
+    g_tvs_n++;
+    *gpu = g_tvs_gpu + g_tvs_used;
+    g_tvs_used += (UINT32)al; g_tvs_bytes += (LONG64)al;
+    ReleaseSRWLockExclusive(&g_tvs_lock);
+    InterlockedIncrement(&g_tvs_views);
+    return tex;
+full:
+    ReleaseSRWLockExclusive(&g_tvs_lock);
+    if (InterlockedIncrement(&g_tvs_full) <= 4)
+        d3d12_log("[typed-view] typed-view-shadow: no room for another copy (%u views, %lld KB); this view keeps its element offset\n",
+                  g_tvs_n, (long long)(g_tvs_bytes >> 10));
+    return 0;
+}
+/* At every ExecuteCommandLists, before its lists are replayed. */
+static void mad_tvs_refresh(void) {
+    unsigned i; LONG n = 0;
+    if (!g_tvs_n) return;
+    AcquireSRWLockExclusive(&g_tvs_lock);
+    for (i = 0; i < g_tvs_n; i++)
+        if (memcmp(g_tvs[i].dst, g_tvs[i].src, g_tvs[i].len)) { memcpy(g_tvs[i].dst, g_tvs[i].src, g_tvs[i].len); n++; }
+    ReleaseSRWLockExclusive(&g_tvs_lock);
+    if (n) InterlockedExchangeAdd(&g_tvs_copies, n);
+}
+/* A resource going away: its copies stop being refreshed (their bytes stay). */
+static void mad_tvs_forget(struct mad_resource *r) {
+    unsigned i, w = 0;
+    if (!g_tvs_n) return;
+    AcquireSRWLockExclusive(&g_tvs_lock);
+    for (i = 0; i < g_tvs_n; i++) if (g_tvs[i].r != r) g_tvs[w++] = g_tvs[i];
+    g_tvs_n = w;
+    ReleaseSRWLockExclusive(&g_tvs_lock);
 }
 /* why (may be NULL): 0, or the g_vc_why index of a refusal (1-8) or of a view
  * cut short (9, still made). */
 static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,
                                  UINT64 first, UINT64 num, int uav, struct mad_descriptor *e, int *why) {
     enum WMTPixelFormat pf; int is_depth = 0; UINT bytes, block; unsigned k;
-    UINT64 byte_off, aligned, elem_off, width, bpr;
+    UINT64 byte_off, aligned, elem_off, width, bpr, sh_gpu = 0;
     struct WMTTextureInfo ti;
     obj_handle_t tex;
     static unsigned said_fail, said_ok;
@@ -10503,7 +10695,13 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         ti.options = r->cpu ? WMTResourceStorageModeShared : WMTResourceStorageModePrivate;
         if (uav && (pf == WMTPixelFormatR32Uint || pf == WMTPixelFormatR32Sint) && mad_typed_uav_atomic())   /* madeira-bcd, opt-in */
             ti.usage = (enum WMTTextureUsage)(ti.usage | WMTTextureUsageShaderAtomic);
-        tex = MTLBuffer_newTexture(r->buffer, &ti, aligned, bpr);
+        sh_gpu = 0; tex = 0;
+        if (elem_off && mad_tvs_on()) {   /* madeira-bcd typed-view-shadow: an aligned copy instead of an element offset */
+            if (!uav && r->cpu && r->heap == D3D12_HEAP_TYPE_UPLOAD) tex = mad_tvs_view(d, r, &ti, byte_off, num, bytes, &sh_gpu);
+            if (!tex) InterlockedIncrement(&g_tvs_other);
+        }
+        if (tex) elem_off = 0;
+        else tex = MTLBuffer_newTexture(r->buffer, &ti, aligned, bpr);
         if ((ti.usage & WMTTextureUsageShaderAtomic) && (!tex || !ti.gpu_resource_id)) {   /* refused with it: as before */
             static unsigned said_atomic;
             if (said_atomic++ < 4) d3d12_log("[madeira-d3d12] typed-uav-atomic: Metal refused ShaderAtomic on an R32 texture buffer; created without it\n");
@@ -10545,7 +10743,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         InterlockedIncrement(&g_tview_live); InterlockedIncrement(&g_tview_made);
         k = r->ntview;
         r->tview[k].fmt = (UINT)fmt; r->tview[k].off = byte_off; r->tview[k].num = num; r->tview[k].uav = (UINT8)uav;
-        r->tview[k].eoff = (UINT8)elem_off;
+        r->tview[k].eoff = (UINT8)elem_off; r->tview[k].sh_gpu = sh_gpu;
         r->tview[k].tex = tex; r->tview[k].id = ti.gpu_resource_id;
         r->ntview = k + 1;   /* published last: a reader never sees a half-written entry */
         if (elem_off) {   /* madeira-bcd: what typed-view-align leaves to the converter (view-census reports it) */
@@ -10561,7 +10759,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
                       (unsigned)width, (unsigned long long)elem_off);
     }
     elem_off = r->tview[k].eoff;   /* as the view was made (madeira-bcd typed-view-align may have moved its start) */
-    e->gpu_va = r->gpu_address + r->tview[k].off;
+    e->gpu_va = r->tview[k].sh_gpu ? r->tview[k].sh_gpu : r->gpu_address + r->tview[k].off;   /* madeira-bcd typed-view-shadow: the copy */
     e->texture_view_id = r->tview[k].id;
     e->metadata = ((num * bytes) & 0xffffffffull) | ((elem_off & 0x7fffffffull) << 32) | (1ull << 63);
     LeaveCriticalSection(&d->view_lock);
@@ -11395,6 +11593,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
             mad_uavtex_forget(r, r->gpu_resource_id);
             for (k = 0; k < r->nxview; k++) mad_uavtex_forget(r, r->xview[k].id);
         }
+        if (r->cpu) mad_tvs_forget(r);   /* madeira-bcd typed-view-shadow: before its memory goes */
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
         { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
         if (r->metal_bytes) {   /* madeira-bcd metal-gap */
@@ -18037,6 +18236,50 @@ static HRESULT STDMETHODCALLTYPE swap_GetDevice(IDXGISwapChain4 *T, REFIID riid,
  * It also stops leaking one command buffer per frame. */
 static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags);
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags);
+/* madeira-bcd vis-trace: at the end of present #presents. */
+static void mad_vt_present(struct mad_device *d, UINT64 presents) {
+    static LONG eoff_last, tvs_last;
+    char line[900]; int n; unsigned i, w, x, y;
+    LONG eoff = g_tv_eoff_views, tvs = g_tvs_views;
+    UINT64 done;
+    d3d12_log("[vis-trace] present #%llu: draws %ld (depth-only %ld, 3+ targets %ld), indices %.2fM, dispatches %ld, pyramid copies %ld%s, "
+              "offset views +%ld, shadowed +%ld\n", (unsigned long long)presents, (long)InterlockedExchange(&g_vt_draws, 0),
+              (long)InterlockedExchange(&g_vt_depth, 0), (long)InterlockedExchange(&g_vt_mrt, 0), (double)InterlockedExchange64(&g_vt_idx, 0) / 1e6,
+              (long)InterlockedExchange(&g_vt_disp, 0), (long)InterlockedExchange(&g_vt_pyr, 0), g_rbf_on > 0 ? " (filled with 4096)" : "",
+              (long)(eoff - eoff_last), (long)(tvs - tvs_last));
+    eoff_last = eoff; tvs_last = tvs;
+    g_vt_presents = (LONG64)presents;
+    AcquireSRWLockExclusive(&g_vt_lock);
+    done = mad_gpu_completed(d);
+    for (i = w = 0; i < g_vt_rb_n; i++) {
+        struct mad_vt_rb *b = &g_vt_rb[i];
+        struct mad_queue *q = b->q;
+        UINT64 serial = 0;
+        int ready;
+        if (q->batches < b->batch) ready = 0;   /* its batch is still open */
+        else {
+            serial = q->batches - b->batch < 64 ? q->batch_serial[b->batch & 63] : q->last_serial;
+            ready = !serial || serial <= done;
+        }
+        if (!ready && (LONG64)presents - b->frame < 8) { if (w != i) g_vt_rb[w] = *b; w++; continue; }
+        n = snprintf(line, sizeof line, "[vis-trace] pyramid mip %u (%ux%u) of present #%lld, queue type %u%s:", b->level, b->w, b->h,
+                     (long long)b->frame, (unsigned)q->type, ready ? "" : " (GPU NOT DONE after 8 presents)");
+        for (y = 0; y < b->h && n < (int)sizeof line - 40; y++) {
+            const float *row = (const float *)(b->cpu + (size_t)y * b->row);
+            if (b->w * b->h <= 10) {   /* 5x2: every value */
+                n += snprintf(line + n, sizeof line - (size_t)n, "%s", y ? " |" : "");
+                for (x = 0; x < b->w; x++) n += snprintf(line + n, sizeof line - (size_t)n, " %g", row[x]);
+            } else {                   /* 11x5: each row's nearest and farthest */
+                float lo = row[0], hi = row[0];
+                for (x = 1; x < b->w; x++) { if (row[x] < lo) lo = row[x]; if (row[x] > hi) hi = row[x]; }
+                n += snprintf(line + n, sizeof line - (size_t)n, " %g-%g", lo, hi);
+            }
+        }
+        d3d12_log("%s\n", line);
+    }
+    g_vt_rb_n = w;
+    ReleaseSRWLockExclusive(&g_vt_lock);
+}
 static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
@@ -18246,6 +18489,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     /* ml1056: no release -- the drawable was never ours (see swap_Present). */
     s->presents++;
     mad_perf_present();   /* ml1108 */
+    if (g_vt_on > 0) mad_vt_present(s->queue->device, s->presents);   /* madeira-bcd vis-trace */
     g_census_on = (s->presents >= 1500 && s->presents < 3000 && (s->presents % 200) == 0);   /* ml899 */
     if (g_capture_on) g_census_on = 1;   /* ml1098 */
     if (mad_skin_on()) mad_skin_present(s->presents);   /* madeira-bcd skin-check */

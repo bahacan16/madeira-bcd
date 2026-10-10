@@ -1246,6 +1246,14 @@ jobs:
       - name: Check the skin-check and view-census diagnostics
         run: python3 tests/host/check-skin-check.py
 
+      # madeira-bcd: Horizon Zero Dawn's walls, trees and plants vanish for
+      # single frames on build 486: aligned copies of offset typed views
+      # (typed-view-shadow), the per-frame draw and culling-readback trace
+      # (vis-trace) and the empty-readback experiment (readback-far). All off
+      # by default.
+      - name: Check typed-view-shadow, vis-trace and readback-far
+        run: python3 tests/host/check-vis-trace.py
+
       # madeira-bcd: A/B switches for the same corruption, all off by default:
       # d3d12-wave-ops = 0, d3d12-binding-tier = 3, d3d12-raw-typed-views = 1,
       # and ignore-volatile-metadata = 1 (FEX's x86 ordering for whole images).

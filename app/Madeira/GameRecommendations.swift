@@ -335,8 +335,17 @@ enum GameRecommendations {
     /// 486's list starts every typed view exactly at its first element where a
     /// probe shows the GPU reads such textures right, and drops the skinning
     /// diagnostics (view-census stays: it counts the views that keep an offset).
+    /// On build 486 (11:52) nothing changed: the probe showed the GPU reads such
+    /// a texture from its start rounded down to 16 bytes, and whole walls,
+    /// trees and plants went missing for one frame every few seconds, at the
+    /// moments the depth pyramid the game culls with read back near depths.
+    /// Build 487's list gives typed views of upload memory that start off a
+    /// 16-byte boundary an aligned copy of their bytes (typed-view-shadow),
+    /// holds a queue's wait until the work it waits for is committed
+    /// (fence-strict), and logs every frame's draws and the pyramid as the GPU
+    /// wrote it (vis-trace).
     static let horizonZeroDawn = GameRecommendation(
-        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 10,
+        id: "horizon-zero-dawn", title: "Horizon Zero Dawn", version: 11,
         config: """
         # Madeira's recommended settings for Horizon Zero Dawn.
         # Reset to Recommended, at the bottom of the game's settings, brings them back.
@@ -346,8 +355,11 @@ enum GameRecommendations {
         pso-placeholder = 1
         pso-lazy-libs = 1
         clear-rects = 1
-        typed-view-align = 4
+        typed-view-align = 16
+        typed-view-shadow = 1
+        fence-strict = 1
         view-census = 1
+        vis-trace = 1
         swap-mb = 6144
         swap-mode = 2
         swap-min-mb = 1
